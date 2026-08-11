@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/agentic-analytics/contracts/schemas.json",
+  "title": "Agentic Analytics Canonical Schemas",
+  "version": "0.1.0",
+  "$defs": {
+    "EntityId": {"type": "string", "minLength": 5},
+    "EvidenceClassification": {
+      "type": "string",
+      "enum": ["source_fact", "derived_fact", "interpretation", "recommendation"]
+    },
+    "Severity": {
+      "type": "string",
+      "enum": ["info", "warning", "error", "blocking"]
+    },
+    "EvidenceItem": {
+      "type": "object",
+      "required": ["id", "session_id", "classification", "claim", "material", "source_ids", "execution_ids", "artifact_ids", "evidence_ids", "created_at"],
+      "properties": {
+        "id": {"$ref": "#/$defs/EntityId"},
+        "session_id": {"$ref": "#/$defs/EntityId"},
+        "classification": {"$ref": "#/$defs/EvidenceClassification"},
+        "claim": {"type": "string", "minLength": 1},
+        "material": {"type": "boolean"},
+        "source_ids": {"type": "array", "items": {"$ref": "#/$defs/EntityId"}, "uniqueItems": true},
+        "execution_ids": {"type": "array", "items": {"$ref": "#/$defs/EntityId"}, "uniqueItems": true},
+        "artifact_ids": {"type": "array", "items": {"$ref": "#/$defs/EntityId"}, "uniqueItems": true},
+        "evidence_ids": {"type": "array", "items": {"$ref": "#/$defs/EntityId"}, "uniqueItems": true},
+        "value": {},
+        "units": {"type": ["string", "null"]},
+        "method_summary": {"type": ["string", "null"]},
+        "created_at": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    "ValidationFinding": {
+      "type": "object",
+      "required": ["id", "session_id", "code", "severity", "status", "message", "entity_refs", "check", "created_at"],
+      "properties": {
+        "id": {"$ref": "#/$defs/EntityId"},
+        "session_id": {"$ref": "#/$defs/EntityId"},
+        "code": {"type": "string", "pattern": "^[A-Z0-9_]+$"},
+        "severity": {"$ref": "#/$defs/Severity"},
+        "status": {"type": "string", "enum": ["open", "resolved", "accepted"]},
+        "message": {"type": "string", "minLength": 1},
+        "entity_refs": {"type": "array", "items": {"type": "object"}},
+        "check": {"type": "string", "minLength": 1},
+        "details": {"type": "object"},
+        "remediation": {"type": ["string", "null"]},
+        "created_at": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    }
+  }
+}
