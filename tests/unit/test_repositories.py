@@ -27,3 +27,11 @@ def test_repository_is_create_once_and_session_scoped(state_root) -> None:
 
     with pytest.raises(SessionScopeError):
         repo.get(session_b, source.id)
+
+
+def test_repository_rejects_noncanonical_session_scope(state_root) -> None:
+    repo = SourceRepository(state_root)
+    source_id = new_id(EntityType.SOURCE)
+
+    with pytest.raises(ValueError, match="canonical ses_"):
+        repo.get("../outside", source_id)
