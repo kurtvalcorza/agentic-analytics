@@ -21,6 +21,20 @@ class SessionScopeError(PermissionError):
     pass
 
 
+def require_session_scope(session_id: str, *records: BaseModel) -> None:
+    """Reject records that do not belong to the requested analysis session."""
+
+    if not is_canonical_id(session_id, EntityType.SESSION):
+        raise ValueError("session_id must use the canonical ses_ ID format")
+    for record in records:
+        data = record.model_dump(mode="python")
+        owner = str(data.get("session_id") or data.get("id") or "")
+        if owner != session_id:
+            raise SessionScopeError(
+                f"record {data.get('id', '<unknown>')} does not belong to session {session_id}"
+            )
+
+
 class JsonRecordRepository[RecordT: BaseModel]:
     """Append-only JSON record store scoped by session and record type.
 

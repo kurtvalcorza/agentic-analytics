@@ -2,8 +2,12 @@ import pytest
 
 from agentic_analytics.ids import EntityType, new_id
 from agentic_analytics.models import DataSource, SourceKind
-from agentic_analytics.repositories.base import RecordAlreadyExists, SessionScopeError
-from agentic_analytics.repositories.records import SourceRepository
+from agentic_analytics.repositories import (
+    RecordAlreadyExists,
+    SessionScopeError,
+    SourceRepository,
+    require_session_scope,
+)
 
 
 def test_repository_is_create_once_and_session_scoped(state_root) -> None:
@@ -35,3 +39,17 @@ def test_repository_rejects_noncanonical_session_scope(state_root) -> None:
 
     with pytest.raises(ValueError, match="canonical ses_"):
         repo.get("../outside", source_id)
+
+
+def test_reference_scope_rejects_record_owned_by_other_session() -> None:
+    requested_session = new_id(EntityType.SESSION)
+    source = DataSource(
+        session_id=new_id(EntityType.SESSION),
+        kind=SourceKind.CSV,
+        display_name="other.csv",
+        relative_path="other.csv",
+        fingerprint={"sha256": "0" * 64},
+    )
+
+    with pytest.raises(SessionScopeError):
+        require_session_scope(requested_session, source)
