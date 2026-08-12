@@ -1,0 +1,7 @@
+FROM python:3.12.7-slim
+COPY docker/requirements-exec.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt
+RUN useradd --create-home --uid 65532 analyst
+USER analyst
+WORKDIR /workspace
+CMD ["python", "-I"]

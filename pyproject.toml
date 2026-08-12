@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentic-analytics"
+version = "0.1.0"
+description = "An agent-agnostic, MCP-native analytical runtime"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["duckdb>=1.1", "mcp>=1.9", "pydantic>=2.9", "typer>=0.12"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.8", "mypy>=1.13", "jsonschema>=4.23"]
+
+[project.scripts]
+agentic-analytics = "agentic_analytics.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentic_analytics"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
