@@ -7,6 +7,8 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
+from agentic_analytics.ids import EntityType, is_canonical_id
+
 RecordT = TypeVar("RecordT", bound=BaseModel)
 
 
@@ -30,29 +32,32 @@ class JsonRecordRepository(Generic[RecordT]):
     """
 
     def __init__(self, root: Path, namespace: str, model_type: type[RecordT]) -> None:
-        self.root = root
+        self.root = root.resolve(strict=False)
         self.namespace = namespace
         self.model_type = model_type
 
     def _session_dir(self, session_id: str) -> Path:
-        safe = session_id.replace("/", "_").replace("\\", "_")
-        return self.root / safe / self.namespace
+        if not is_canonical_id(session_id, EntityType.SESSION):
+            raise ValueError("session_id must use the canonical ses_ ID format")
+        return self.root / session_id / self.namespace
 
     def _path(self, session_id: str, record_id: str) -> Path:
-        safe = record_id.replace("/", "_").replace("\\", "_")
-        return self._session_dir(session_id) / f"{safe}.json"
+        if not is_canonical_id(record_id):
+            raise ValueError("record_id must use a canonical typed ID format")
+        return self._session_dir(session_id) / f"{record_id}.json"
 
     def add(self, record: RecordT) -> RecordT:
         session_id = str(getattr(record, "session_id", getattr(record, "id", "")))
-        if not session_id:
-            raise ValueError("record must expose session_id or be a session record")
-        target = self._path(session_id, str(getattr(record, "id")))
+        if not is_canonical_id(session_id, EntityType.SESSION):
+            raise ValueError("record must expose a canonical session_id or be a session record")
+        record_id = str(getattr(record, "id"))
+        target = self._path(session_id, record_id)
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = record.model_dump_json(by_alias=True, indent=2).encode("utf-8") + b"\n"
         try:
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as exc:
-            raise RecordAlreadyExists(str(getattr(record, "id"))) from exc
+            raise RecordAlreadyExists(record_id) from exc
         try:
             with os.fdopen(fd, "wb") as stream:
                 stream.write(payload)
@@ -82,5 +87,6 @@ class JsonRecordRepository(Generic[RecordT]):
         ]
 
     def _record_exists_elsewhere(self, record_id: str) -> bool:
-        filename = f"{record_id.replace('/', '_').replace(chr(92), '_')}.json"
-        return any(self.root.glob(f"*/{self.namespace}/{filename}"))
+        if not is_canonical_id(record_id):
+            return False
+        return any(self.root.glob(f"*/{self.namespace}/{record_id}.json"))
