@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentic-analytics"
+version = "0.1.0a0"
+description = "Agent-agnostic, MCP-native analytical runtime with evidence provenance and deterministic validation."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Kurt Valcorza" }]
+dependencies = [
+  "mcp>=2,<3",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.10,<3",
+  "duckdb>=1.3,<2",
+  "pyarrow>=20,<24",
+  "pandas>=2.3,<4",
+  "typer>=0.16,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "jsonschema>=4.25,<5",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "pytest-cov>=6.2,<8",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+agentic-analytics = "agentic_analytics.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentic_analytics"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["agentic_analytics"]
+
+[tool.coverage.run]
+source = ["agentic_analytics"]
+branch = true
