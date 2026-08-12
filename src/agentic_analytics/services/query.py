@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
+
+import duckdb
+
+from agentic_analytics.models import (
+    AnalysisSession,
+    ExecutionRecord,
+    ExecutionStatus,
+    ExecutionType,
+    SourceKind,
+)
+from agentic_analytics.repositories import ExecutionRepository, SourceRepository
+from agentic_analytics.settings import Settings
+
+from .workspace import WorkspaceService
+
+_SOURCE_REF = re.compile(r"source\(\s*['\"](?P<id>src_[0-9a-f]{32})['\"]\s*\)", re.IGNORECASE)
+_FORBIDDEN = re.compile(
+    r"\b(insert|update|delete|create|drop|alter|copy|attach|detach|install|load|call|pragma|set|"
+    r"export|import|vacuum|read_csv|read_csv_auto|read_parquet|parquet_scan|csv_scan|read_json|"
+    r"glob|sqlite_scan|postgres_scan|httpfs)\b",
+    re.IGNORECASE,
+)
+_ALLOWED_START = re.compile(r"^\s*(select|with|explain)\b", re.IGNORECASE)
+
+
+def _json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+class QueryRejected(ValueError):
+    pass
+
+
+class QueryService:
+    def __init__(
+        self,
+        sources: SourceRepository,
+        executions: ExecutionRepository,
+        workspace: WorkspaceService,
+        settings: Settings,
+    ) -> None:
+        self.sources = sources
+        self.executions = executions
+        self.workspace = workspace
+        self.settings = settings
+
+    @staticmethod
+    def _validate_sql(sql: str) -> str:
+        normalized = sql.strip()
+        if normalized.endswith(";"):
+            normalized = normalized[:-1].rstrip()
+        if not normalized or not _ALLOWED_START.search(normalized):
+            raise QueryRejected("only SELECT, WITH, or EXPLAIN analytical queries are allowed")
+        if ";" in normalized:
+            raise QueryRejected("multiple SQL statements are not allowed")
+        if _FORBIDDEN.search(normalized):
+            raise QueryRejected("query contains a forbidden command or external access function")
+        return normalized
+
+    def execute(
+        self, session: AnalysisSession, sql: str, max_rows: int | None = None
+    ) -> dict[str, Any]:
+        normalized = self._validate_sql(sql)
+        requested_limit = max_rows if max_rows is not None else self.settings.max_query_rows
+        limit = min(max(requested_limit, 1), self.settings.max_query_rows)
+        source_ids = list(
+            dict.fromkeys(match.group("id") for match in _SOURCE_REF.finditer(normalized))
+        )
+        if not source_ids:
+            raise QueryRejected("query must reference at least one registered source('src_...')")
+        connection = duckdb.connect(database=":memory:")
+        fingerprints: dict[str, Any] = {}
+        rewritten = normalized
+        try:
+            for index, source_id in enumerate(source_ids):
+                source = self.sources.get(session.id, source_id)
+                if source.relative_path is None:
+                    raise QueryRejected("URI/database sources are not supported by local query")
+                path = self.workspace.resolve_file(session.workspace_root, source.relative_path)
+                view_name = f"_source_{index}"
+                if source.kind is SourceKind.CSV:
+                    reader = "read_csv_auto(?)"
+                elif source.kind is SourceKind.PARQUET:
+                    reader = "read_parquet(?)"
+                else:
+                    raise QueryRejected(f"unsupported source kind: {source.kind}")
+                connection.execute(
+                    f'CREATE TEMP VIEW "{view_name}" AS SELECT * FROM {reader}', [str(path)]
+                )
+                pattern = re.compile(
+                    rf"source\(\s*['\"]{re.escape(source_id)}['\"]\s*\)", re.IGNORECASE
+                )
+                rewritten = pattern.sub(f'"{view_name}"', rewritten)
+                fingerprints[source_id] = source.fingerprint
+            started = datetime.now(UTC)
+            cursor = connection.execute(f"SELECT * FROM ({rewritten}) AS _bounded LIMIT {limit + 1}")
+            columns = [str(item[0]) for item in (cursor.description or [])]
+            raw_rows = cursor.fetchall()
+            truncated = len(raw_rows) > limit
+            serial_rows = [[_json_value(value) for value in row] for row in raw_rows[:limit]]
+            execution = ExecutionRecord(
+                session_id=session.id,
+                execution_type=ExecutionType.MANAGED_SQL,
+                status=ExecutionStatus.SUCCEEDED,
+                request={"sql": normalized, "max_rows": limit},
+                source_ids=source_ids,
+                source_fingerprints=fingerprints,
+                started_at=started,
+                completed_at=datetime.now(UTC),
+                runtime={"backend": "duckdb", "duckdb": duckdb.__version__},
+                result_preview={"columns": columns, "rows": serial_rows},
+                truncated=truncated,
+            )
+            self.executions.add(execution)
+            return {
+                "execution_id": execution.id,
+                "columns": columns,
+                "rows": serial_rows,
+                "row_count_returned": len(serial_rows),
+                "truncated": truncated,
+                "artifact_id": None,
+            }
+        finally:
+            connection.close()
