@@ -12,4 +12,8 @@ def utc_now() -> datetime:
 class CanonicalModel(BaseModel):
     """Base for persisted protocol records."""
 
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        populate_by_name=True,
+    )
