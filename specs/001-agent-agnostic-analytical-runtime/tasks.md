@@ -33,17 +33,17 @@
 
 **Independent Test**: Generic protocol harness completes a CSV analysis without host-specific fields.
 
-- [ ] T017 Implement canonical path authorization and workspace root handling in `services/workspace.py`.
-- [ ] T018 Add security unit tests for `../`, absolute-path, and symlink escape attempts.
-- [ ] T019 Implement file discovery for CSV/Parquet in `services/workspace.py`.
-- [ ] T020 Implement source fingerprinting (SHA-256, size, mtime metadata) in `services/inspector.py`.
-- [ ] T021 Implement CSV/Parquet schema and bounded profile inspection through DuckDB.
-- [ ] T022 Add malformed/empty/wide-table inspection fixtures and tests.
-- [ ] T023 Implement read-only DuckDB query service with registered source aliases in `services/query.py`.
-- [ ] T024 Implement bounded query result serialization and truncation metadata.
-- [ ] T025 Add query tests proving oversized results do not serialize complete datasets to model-facing output.
-- [ ] T026 Implement MCP `create_session`, `list_sources`, `inspect_source`, and `query_data` tools.
-- [ ] T027 Add protocol schema tests for the four tools.
+- [x] T017 Implement canonical path authorization and workspace root handling in `services/workspace.py`.
+- [x] T018 Add security unit tests for `../`, absolute-path, and symlink escape attempts.
+- [x] T019 Implement file discovery for CSV/Parquet in `services/workspace.py`.
+- [x] T020 Implement source fingerprinting (SHA-256, size, mtime metadata) in `services/inspector.py`.
+- [x] T021 Implement CSV/Parquet schema and bounded profile inspection through DuckDB.
+- [x] T022 Add malformed/empty/wide-table inspection fixtures and tests.
+- [x] T023 Implement read-only DuckDB query service with registered source aliases in `services/query.py`.
+- [x] T024 Implement bounded query result serialization and truncation metadata.
+- [x] T025 Add query tests proving oversized results do not serialize complete datasets to model-facing output.
+- [x] T026 Implement MCP `create_session`, `list_sources`, `inspect_source`, and `query_data` tools.
+- [x] T027 Add protocol schema tests for the four tools.
 
 ## Phase 4 — Managed Execution and Artifacts [P1]
 
