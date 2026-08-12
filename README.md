@@ -1,27 +1,41 @@
-# Agentic Analytics — Spec Kit Package
+# Agentic Analytics
 
-This directory is a complete Spec Kit design package for an **agent-agnostic, MCP-native analytical runtime** inspired by the architectural lessons of DeepAnalyze while targeting coding agents such as Codex, Claude Code, Antigravity, and future MCP-capable hosts.
+Agentic Analytics is an **agent-agnostic, MCP-native analytical runtime** for coding agents such as Codex, Claude Code, Antigravity, and other MCP-capable hosts.
 
-## Contents
+The product boundary is the MCP protocol, not a host-specific plugin. Core correctness, provenance, validation, and execution rules live in the runtime and canonical contracts. Host adapters may improve ergonomics, but they must not contain unique analytical logic.
 
-```text
-.specify/memory/constitution.md
-specs/001-agent-agnostic-analytical-runtime/
-├── spec.md
-├── research.md
-├── plan.md
-├── data-model.md
-├── quickstart.md
-├── tasks.md
-├── contracts/
-│   ├── mcp-tools.md
-│   └── schemas.json
-└── checklists/
-    └── requirements.md
+## Design goals
+
+- Inspect and query local analytical data without serializing full datasets into model context.
+- Execute reproducible analysis in a managed runtime.
+- Record source → execution → artifact → evidence provenance.
+- Validate material analytical claims independently of model self-review.
+- Support both strict managed execution and explicitly marked permissive host-native execution.
+- Remain portable across MCP-capable agents.
+
+## Current implementation status
+
+The first implementation slice establishes the Python package, MCP v2 server skeleton, canonical typed IDs, provenance models, append-only session-scoped record persistence, model invariants, evidence DAG cycle detection, and CI quality gates.
+
+See `specs/001-agent-agnostic-analytical-runtime/` for the specification, plan, contracts, data model, and implementation task graph.
+
+## Development
+
+Requires Python 3.12+.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+python -m pip install -e '.[dev]'
+ruff check .
+mypy src
+pytest
 ```
 
-## Design thesis
+Run the MCP server over stdio:
 
-The MCP server is the product boundary. Coding-agent integrations are thin optional adapters. Core correctness, execution, evidence provenance, validation, artifacts, and security remain host-neutral.
+```bash
+agentic-analytics
+```
 
-The runtime deliberately does **not** recreate DeepAnalyze's model-specific XML control protocol or add a separate multi-agent planner. Modern coding agents already plan and call tools; this project supplies the analytical environment and evidence contract they can share.
+The implementation targets the current stable MCP Python SDK v2 line.
