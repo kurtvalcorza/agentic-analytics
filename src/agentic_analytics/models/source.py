@@ -35,7 +35,7 @@ class DataSource(CanonicalModel):
     registered_at: datetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
-    def require_location(self) -> "DataSource":
+    def require_location(self) -> DataSource:
         if not self.relative_path and not self.uri:
             raise ValueError("at least one of relative_path or uri is required")
         return self

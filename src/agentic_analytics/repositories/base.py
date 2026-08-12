@@ -3,13 +3,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
 from agentic_analytics.ids import EntityType, is_canonical_id
-
-RecordT = TypeVar("RecordT", bound=BaseModel)
 
 
 class RecordAlreadyExists(RuntimeError):
@@ -24,7 +21,7 @@ class SessionScopeError(PermissionError):
     pass
 
 
-class JsonRecordRepository(Generic[RecordT]):
+class JsonRecordRepository[RecordT: BaseModel]:
     """Append-only JSON record store scoped by session and record type.
 
     Each record is a create-once file. O_EXCL prevents accidental replacement and keeps the
@@ -47,10 +44,11 @@ class JsonRecordRepository(Generic[RecordT]):
         return self._session_dir(session_id) / f"{record_id}.json"
 
     def add(self, record: RecordT) -> RecordT:
-        session_id = str(getattr(record, "session_id", getattr(record, "id", "")))
+        record_data = record.model_dump(mode="python")
+        session_id = str(record_data.get("session_id") or record_data.get("id") or "")
         if not is_canonical_id(session_id, EntityType.SESSION):
             raise ValueError("record must expose a canonical session_id or be a session record")
-        record_id = str(getattr(record, "id"))
+        record_id = str(record_data.get("id") or "")
         target = self._path(session_id, record_id)
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = record.model_dump_json(by_alias=True, indent=2).encode("utf-8") + b"\n"
@@ -72,7 +70,9 @@ class JsonRecordRepository(Generic[RecordT]):
         target = self._path(session_id, record_id)
         if not target.exists():
             if self._record_exists_elsewhere(record_id):
-                raise SessionScopeError(f"record {record_id} does not belong to session {session_id}")
+                raise SessionScopeError(
+                    f"record {record_id} does not belong to session {session_id}"
+                )
             raise RecordNotFound(record_id)
         data = json.loads(target.read_text(encoding="utf-8"))
         return self.model_type.model_validate(data)

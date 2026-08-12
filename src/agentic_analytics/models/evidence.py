@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Iterable
+from typing import Any
 
 from pydantic import Field, model_validator
 
@@ -35,7 +36,7 @@ class EvidenceItem(CanonicalModel):
     created_by: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def validate_classification_links(self) -> "EvidenceItem":
+    def validate_classification_links(self) -> EvidenceItem:
         match self.classification:
             case EvidenceClassification.SOURCE_FACT:
                 if not self.source_ids:

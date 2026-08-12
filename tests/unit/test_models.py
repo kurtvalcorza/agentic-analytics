@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -48,7 +48,7 @@ def test_terminal_execution_requires_completed_at() -> None:
         execution_type=ExecutionType.MANAGED_PYTHON,
         status=ExecutionStatus.SUCCEEDED,
         request={"code": "print(1)"},
-        completed_at=datetime.now(timezone.utc),
+        completed_at=datetime.now(UTC),
     )
     assert record.status.terminal
 

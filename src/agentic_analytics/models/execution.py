@@ -55,7 +55,7 @@ class ExecutionRecord(CanonicalModel):
     error: dict[str, Any] | None = None
 
     @model_validator(mode="after")
-    def validate_terminal_timestamp(self) -> "ExecutionRecord":
+    def validate_terminal_timestamp(self) -> ExecutionRecord:
         if self.status.terminal and self.completed_at is None:
             raise ValueError("terminal executions require completed_at")
         if not self.status.terminal and self.completed_at is not None:

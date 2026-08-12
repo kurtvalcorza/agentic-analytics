@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import Field, field_validator
 
-from agentic_analytics.ids import EntityType, PROTOCOL_VERSION, is_canonical_id, new_id
+from agentic_analytics.ids import PROTOCOL_VERSION, EntityType, is_canonical_id, new_id
 
 from .common import CanonicalModel, utc_now
 
