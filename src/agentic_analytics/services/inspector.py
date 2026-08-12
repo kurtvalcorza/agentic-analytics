@@ -13,6 +13,10 @@ from agentic_analytics.settings import Settings
 from .workspace import WorkspaceService
 
 
+class SourceInspectionError(ValueError):
+    pass
+
+
 def fingerprint_file(path: Path) -> dict[str, Any]:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -43,7 +47,7 @@ class InspectorService:
     @staticmethod
     def _relation(kind: SourceKind) -> str:
         if kind is SourceKind.CSV:
-            return "read_csv_auto(?)"
+            return "read_csv(?, strict_mode = true)"
         if kind is SourceKind.PARQUET:
             return "read_parquet(?)"
         raise ValueError(f"unsupported inspectable source kind: {kind}")
@@ -52,13 +56,18 @@ class InspectorService:
         self, session: AnalysisSession, source_path: str, sample_rows: int = 20
     ) -> tuple[DataSource, dict[str, Any]]:
         path = self.workspace.resolve_file(session.workspace_root, source_path)
+        if path.stat().st_size == 0:
+            raise SourceInspectionError("source is empty")
         suffix = path.suffix.lower()
         if suffix not in {".csv", ".parquet"}:
-            raise ValueError("only CSV and Parquet sources are supported")
+            raise SourceInspectionError("only CSV and Parquet sources are supported")
         kind = SourceKind.CSV if suffix == ".csv" else SourceKind.PARQUET
         relative_path = self.workspace.relative_to_workspace(session.workspace_root, path)
         fingerprint = fingerprint_file(path)
-        profile = self._profile(path, kind, sample_rows)
+        try:
+            profile = self._profile(path, kind, sample_rows)
+        except duckdb.Error as exc:
+            raise SourceInspectionError(f"source could not be inspected: {path.name}") from exc
         existing = next(
             (
                 item

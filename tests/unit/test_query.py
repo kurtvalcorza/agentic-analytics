@@ -46,6 +46,8 @@ def test_query_blocks_external_access_and_writes(tmp_path: Path) -> None:
     with pytest.raises(QueryRejected):
         query.execute(session, "SELECT * FROM read_csv('/etc/passwd')")
     with pytest.raises(QueryRejected):
+        query.execute(session, "SELECT * FROM read_text('/etc/passwd')")
+    with pytest.raises(QueryRejected):
         query.execute(session, f"DROP TABLE source('{source.id}')")
     with pytest.raises(QueryRejected):
         query.execute(session, "SELECT 1")

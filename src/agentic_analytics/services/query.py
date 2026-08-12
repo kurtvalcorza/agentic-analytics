@@ -23,7 +23,7 @@ _SOURCE_REF = re.compile(r"source\(\s*['\"](?P<id>src_[0-9a-f]{32})['\"]\s*\)", 
 _FORBIDDEN = re.compile(
     r"\b(insert|update|delete|create|drop|alter|copy|attach|detach|install|load|call|pragma|set|"
     r"export|import|vacuum|read_csv|read_csv_auto|read_parquet|parquet_scan|csv_scan|read_json|"
-    r"glob|sqlite_scan|postgres_scan|httpfs)\b",
+    r"read_text|read_blob|glob|sqlite_scan|postgres_scan|httpfs|duckdb_secrets)\b",
     re.IGNORECASE,
 )
 _ALLOWED_START = re.compile(r"^\s*(select|with|explain)\b", re.IGNORECASE)
@@ -39,6 +39,10 @@ def _json_value(value: Any) -> Any:
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return str(value)
+
+
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 class QueryRejected(ValueError):
@@ -71,6 +75,16 @@ class QueryService:
             raise QueryRejected("query contains a forbidden command or external access function")
         return normalized
 
+    @staticmethod
+    def _secure_connection(connection: duckdb.DuckDBPyConnection, paths: list[str]) -> None:
+        allowed_paths = ", ".join(_sql_string(path) for path in paths)
+        connection.execute(f"SET allowed_paths = [{allowed_paths}]")
+        connection.execute("SET autoinstall_known_extensions = false")
+        connection.execute("SET autoload_known_extensions = false")
+        connection.execute("SET allow_community_extensions = false")
+        connection.execute("SET enable_external_access = false")
+        connection.execute("SET lock_configuration = true")
+
     def execute(
         self, session: AnalysisSession, sql: str, max_rows: int | None = None
     ) -> dict[str, Any]:
@@ -82,30 +96,38 @@ class QueryService:
         )
         if not source_ids:
             raise QueryRejected("query must reference at least one registered source('src_...')")
+
+        resolved_sources: list[tuple[str, SourceKind, str, dict[str, Any]]] = []
+        for source_id in source_ids:
+            source = self.sources.get(session.id, source_id)
+            if source.relative_path is None:
+                raise QueryRejected("URI/database sources are not supported by local query")
+            path = self.workspace.resolve_file(session.workspace_root, source.relative_path)
+            resolved_sources.append((source_id, source.kind, str(path), source.fingerprint))
+
         connection = duckdb.connect(database=":memory:")
         fingerprints: dict[str, Any] = {}
         rewritten = normalized
         try:
-            for index, source_id in enumerate(source_ids):
-                source = self.sources.get(session.id, source_id)
-                if source.relative_path is None:
-                    raise QueryRejected("URI/database sources are not supported by local query")
-                path = self.workspace.resolve_file(session.workspace_root, source.relative_path)
+            self._secure_connection(connection, [item[2] for item in resolved_sources])
+            for index, (source_id, kind, path, fingerprint) in enumerate(resolved_sources):
                 view_name = f"_source_{index}"
-                if source.kind is SourceKind.CSV:
-                    reader = "read_csv_auto(?)"
-                elif source.kind is SourceKind.PARQUET:
-                    reader = "read_parquet(?)"
+                path_literal = _sql_string(path)
+                if kind is SourceKind.CSV:
+                    reader = f"read_csv({path_literal}, strict_mode = true)"
+                elif kind is SourceKind.PARQUET:
+                    reader = f"read_parquet({path_literal})"
                 else:
-                    raise QueryRejected(f"unsupported source kind: {source.kind}")
+                    raise QueryRejected(f"unsupported source kind: {kind}")
                 connection.execute(
-                    f'CREATE TEMP VIEW "{view_name}" AS SELECT * FROM {reader}', [str(path)]
+                    f'CREATE TEMP VIEW "{view_name}" AS SELECT * FROM {reader}'
                 )
                 pattern = re.compile(
                     rf"source\(\s*['\"]{re.escape(source_id)}['\"]\s*\)", re.IGNORECASE
                 )
                 rewritten = pattern.sub(f'"{view_name}"', rewritten)
-                fingerprints[source_id] = source.fingerprint
+                fingerprints[source_id] = fingerprint
+
             started = datetime.now(UTC)
             bounded_sql = f"SELECT * FROM ({rewritten}) AS _bounded LIMIT {limit + 1}"
             cursor = connection.execute(bounded_sql)
