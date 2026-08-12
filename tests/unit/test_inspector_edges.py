@@ -12,7 +12,12 @@ from agentic_analytics.services.workspace import WorkspaceService
 from agentic_analytics.settings import Settings
 
 
-def _service(tmp_path: Path, workspace: Path, *, max_profile_columns: int = 200) -> InspectorService:
+def _service(
+    tmp_path: Path,
+    workspace: Path,
+    *,
+    max_profile_columns: int = 200,
+) -> InspectorService:
     settings = Settings(
         state_dir=tmp_path / "state",
         workspace_base_dir=tmp_path / "generated",
