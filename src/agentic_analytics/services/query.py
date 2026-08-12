@@ -107,7 +107,8 @@ class QueryService:
                 rewritten = pattern.sub(f'"{view_name}"', rewritten)
                 fingerprints[source_id] = source.fingerprint
             started = datetime.now(UTC)
-            cursor = connection.execute(f"SELECT * FROM ({rewritten}) AS _bounded LIMIT {limit + 1}")
+            bounded_sql = f"SELECT * FROM ({rewritten}) AS _bounded LIMIT {limit + 1}"
+            cursor = connection.execute(bounded_sql)
             columns = [str(item[0]) for item in (cursor.description or [])]
             raw_rows = cursor.fetchall()
             truncated = len(raw_rows) > limit

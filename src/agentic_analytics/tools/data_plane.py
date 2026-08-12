@@ -46,7 +46,9 @@ def register_data_plane_tools(server: MCPServer[Any], runtime: Runtime) -> None:
             )
         return {"sources": items, "count": len(items)}
 
-    @server.tool(description="Register and inspect one CSV or Parquet source with bounded profiling.")
+    @server.tool(
+        description="Register and inspect one CSV or Parquet source with bounded profiling."
+    )
     def inspect_source(
         session_id: str,
         source: str,
@@ -56,7 +58,12 @@ def register_data_plane_tools(server: MCPServer[Any], runtime: Runtime) -> None:
         del profile
         session = runtime.sessions.get(session_id, session_id)
         record, result = runtime.inspector.inspect(session, source, sample_rows=sample_rows)
-        return {"source_id": record.id, "kind": record.kind.value, "fingerprint": record.fingerprint, **result}
+        return {
+            "source_id": record.id,
+            "kind": record.kind.value,
+            "fingerprint": record.fingerprint,
+            **result,
+        }
 
     @server.tool(description="Run bounded read-only DuckDB SQL over registered session sources.")
     def query_data(session_id: str, sql: str, max_rows: int = 200) -> dict[str, Any]:

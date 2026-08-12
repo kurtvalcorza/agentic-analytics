@@ -19,8 +19,10 @@ async def test_data_plane_tool_schemas_are_host_neutral(tmp_path: Path) -> None:
     tools = await server.list_tools()
     by_name = {tool.name: tool for tool in tools}
     assert {"create_session", "list_sources", "inspect_source", "query_data"} <= set(by_name)
-    assert set(by_name["create_session"].input_schema["properties"]) == {"workspace_root", "mode"}
-    assert {"session_id", "sql", "max_rows"} <= set(by_name["query_data"].input_schema["properties"])
+    create_properties = by_name["create_session"].input_schema["properties"]
+    assert set(create_properties) == {"workspace_root", "mode"}
+    query_properties = by_name["query_data"].input_schema["properties"]
+    assert {"session_id", "sql", "max_rows"} <= set(query_properties)
     for tool in by_name.values():
         serialized = str(tool.input_schema).lower()
         assert "claude" not in serialized

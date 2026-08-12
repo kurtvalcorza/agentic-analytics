@@ -32,7 +32,8 @@ def _services(tmp_path: Path):
 
 def test_query_is_bounded_and_persists_execution(tmp_path: Path) -> None:
     session, source, query, executions = _services(tmp_path)
-    result = query.execute(session, f"SELECT * FROM source('{source.id}') ORDER BY value", max_rows=2)
+    sql = f"SELECT * FROM source('{source.id}') ORDER BY value"
+    result = query.execute(session, sql, max_rows=2)
     assert result["row_count_returned"] == 2
     assert result["truncated"] is True
     execution = executions.get(session.id, result["execution_id"])

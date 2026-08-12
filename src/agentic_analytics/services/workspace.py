@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 
 class WorkspaceAuthorizationError(PermissionError):
@@ -10,7 +11,7 @@ class WorkspaceAuthorizationError(PermissionError):
 class WorkspaceService:
     """Canonical path authorization and supported-data discovery."""
 
-    SUPPORTED_SUFFIXES = {".csv", ".parquet"}
+    SUPPORTED_SUFFIXES: ClassVar[frozenset[str]] = frozenset({".csv", ".parquet"})
 
     def __init__(self, allowed_roots: list[Path]) -> None:
         if not allowed_roots:
