@@ -102,17 +102,21 @@ class QueryService:
             source = self.sources.get(session.id, source_id)
             if source.relative_path is None:
                 raise QueryRejected("URI/database sources are not supported by local query")
-            path = self.workspace.resolve_file(session.workspace_root, source.relative_path)
-            resolved_sources.append((source_id, source.kind, str(path), source.fingerprint))
+            resolved_path = self.workspace.resolve_file(
+                session.workspace_root, source.relative_path
+            )
+            resolved_sources.append(
+                (source_id, source.kind, str(resolved_path), source.fingerprint)
+            )
 
         connection = duckdb.connect(database=":memory:")
         fingerprints: dict[str, Any] = {}
         rewritten = normalized
         try:
             self._secure_connection(connection, [item[2] for item in resolved_sources])
-            for index, (source_id, kind, path, fingerprint) in enumerate(resolved_sources):
+            for index, (source_id, kind, file_path, fingerprint) in enumerate(resolved_sources):
                 view_name = f"_source_{index}"
-                path_literal = _sql_string(path)
+                path_literal = _sql_string(file_path)
                 if kind is SourceKind.CSV:
                     reader = f"read_csv({path_literal}, strict_mode = true)"
                 elif kind is SourceKind.PARQUET:
