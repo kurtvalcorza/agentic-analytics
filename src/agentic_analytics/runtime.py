@@ -7,14 +7,17 @@ from .repositories import (
     ArtifactRepository,
     EvidenceRepository,
     ExecutionRepository,
+    FindingRepository,
     SessionRepository,
     SourceRepository,
+    ValidationRunRepository,
 )
 from .services.artifact_registry import ArtifactRegistry
 from .services.evidence_ledger import EvidenceLedger
 from .services.execution import ExecutionService
 from .services.inspector import InspectorService
 from .services.query import QueryService
+from .services.validation import ValidationService
 from .services.workspace import WorkspaceService
 from .settings import Settings
 
@@ -27,12 +30,15 @@ class Runtime:
     executions: ExecutionRepository
     artifacts: ArtifactRepository
     evidence: EvidenceRepository
+    findings: FindingRepository
+    validation_runs: ValidationRunRepository
     workspace: WorkspaceService
     inspector: InspectorService
     query: QueryService
     execution_backend: ExecutionBackend
     execution: ExecutionService
     evidence_ledger: EvidenceLedger
+    validation: ValidationService
 
     @classmethod
     def create(cls, settings: Settings | None = None) -> Runtime:
@@ -43,6 +49,8 @@ class Runtime:
         executions = ExecutionRepository(resolved.state_dir)
         artifact_repository = ArtifactRepository(resolved.state_dir)
         evidence_repository = EvidenceRepository(resolved.state_dir)
+        findings = FindingRepository(resolved.state_dir)
+        validation_runs = ValidationRunRepository(resolved.state_dir)
         workspace = WorkspaceService(resolved.normalized_allowed_roots())
         inspector = InspectorService(sources, workspace, resolved)
         query = QueryService(sources, executions, workspace, resolved)
@@ -66,6 +74,12 @@ class Runtime:
             executions,
             artifact_repository,
         )
+        validation = ValidationService(
+            evidence_repository,
+            sources,
+            findings,
+            validation_runs,
+        )
         return cls(
             resolved,
             sessions,
@@ -73,10 +87,13 @@ class Runtime:
             executions,
             artifact_repository,
             evidence_repository,
+            findings,
+            validation_runs,
             workspace,
             inspector,
             query,
             backend,
             execution,
             evidence_ledger,
+            validation,
         )
