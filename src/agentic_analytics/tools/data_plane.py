@@ -32,10 +32,25 @@ def _reject_overlapping_active_sessions(runtime: Runtime, root: Path) -> None:
 
 def register_data_plane_tools(server: MCPServer[Any], runtime: Runtime) -> None:
     @server.tool(description="Create an authorized analysis session for a local workspace.")
-    def create_session(workspace_root: str = ".", mode: str = "strict") -> dict[str, Any]:
+    def create_session(
+        workspace_root: str = ".",
+        mode: str = "strict",
+        analysis_design: str | None = None,
+        causal_design: bool = False,
+    ) -> dict[str, Any]:
         authorized = runtime.workspace.authorize_workspace(workspace_root)
         _reject_overlapping_active_sessions(runtime, authorized)
-        session = AnalysisSession(workspace_root=str(authorized), mode=SessionMode(mode))
+        # Design metadata is captured at session creation so downstream causal validation can
+        # recognize a genuinely supported design (otherwise the immutable session could never
+        # carry it and every causal claim would be blocked).
+        metadata: dict[str, Any] = {}
+        if analysis_design is not None:
+            metadata["analysis_design"] = analysis_design
+        if causal_design:
+            metadata["causal_design"] = True
+        session = AnalysisSession(
+            workspace_root=str(authorized), mode=SessionMode(mode), metadata=metadata
+        )
         runtime.sessions.add(session)
         return {
             "session_id": session.id,
