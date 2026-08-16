@@ -250,12 +250,19 @@ Runs deterministic provenance and analytical validation.
 }
 ```
 
+### Requirements
+
+- `scope` selects the analytical stage under review (`final` or `interim`, default `final`) and is echoed back on the run.
+- `checks` accepts the `default`/`all` selector or an explicit array. An explicit empty array has zero coverage and is rejected rather than reported as a clean pass.
+- Unknown check names are rejected so a typo cannot silently skip every check.
+
 ### Output
 
 ```json
 {
   "validation_run_id": "vrn_...",
   "status": "blocked",
+  "scope": "final",
   "checks_run": ["evidence_coverage", "causal_language", "duplicates", "missingness"],
   "checks_skipped": [],
   "findings": [

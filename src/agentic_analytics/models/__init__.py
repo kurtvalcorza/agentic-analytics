@@ -8,6 +8,7 @@ from .validation import (
     ValidationFindingStatus,
     ValidationRun,
     ValidationRunStatus,
+    ValidationScope,
     ValidationSeverity,
 )
 
@@ -28,6 +29,7 @@ __all__ = [
     "ValidationFindingStatus",
     "ValidationRun",
     "ValidationRunStatus",
+    "ValidationScope",
     "ValidationSeverity",
     "ensure_acyclic_evidence",
 ]

@@ -29,6 +29,13 @@ class ValidationRunStatus(StrEnum):
     BLOCKED = "blocked"
 
 
+class ValidationScope(StrEnum):
+    """Analytical stage a validation run targets, per the canonical contract."""
+
+    FINAL = "final"
+    INTERIM = "interim"
+
+
 class ValidationFinding(CanonicalModel):
     id: str = Field(default_factory=lambda: new_id(EntityType.VALIDATION))
     session_id: str
@@ -47,7 +54,9 @@ class ValidationRun(CanonicalModel):
     id: str = Field(default_factory=lambda: new_id(EntityType.VALIDATION_RUN))
     session_id: str
     status: ValidationRunStatus
+    scope: ValidationScope = ValidationScope.FINAL
     finding_ids: list[str] = Field(default_factory=list)
     checks_run: list[str] = Field(default_factory=list)
     checks_skipped: list[str] = Field(default_factory=list)
+    checks_inconclusive: list[dict[str, str]] = Field(default_factory=list)
     created_at: UtcDatetime = Field(default_factory=utc_now)

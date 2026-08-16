@@ -11,6 +11,7 @@ from .executions import ExecutionRepository
 from .findings import FindingRepository
 from .sessions import SessionRepository
 from .sources import SourceRepository
+from .validation_runs import ValidationRunRepository
 
 __all__ = [
     "ArtifactRepository",
@@ -23,5 +24,6 @@ __all__ = [
     "SessionRepository",
     "SessionScopeError",
     "SourceRepository",
+    "ValidationRunRepository",
     "require_session_scope",
 ]

@@ -10,6 +10,7 @@ from .settings import Settings
 from .tools.data_plane import register_data_plane_tools
 from .tools.evidence import register_evidence_tools
 from .tools.execution import register_execution_tools
+from .tools.validation import register_validation_tools
 
 
 def build_server(settings: Settings | None = None) -> MCPServer[Any]:
@@ -25,6 +26,7 @@ def build_server(settings: Settings | None = None) -> MCPServer[Any]:
     register_data_plane_tools(server, runtime)
     register_execution_tools(server, runtime)
     register_evidence_tools(server, runtime)
+    register_validation_tools(server, runtime)
     register_artifact_resources(server, runtime)
     return server
 

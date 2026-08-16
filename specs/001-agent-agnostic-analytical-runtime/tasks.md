@@ -49,46 +49,46 @@
 
 **Goal**: Strict-mode Python execution outside the server process with artifact detection.
 
-- [ ] T028 Define execution backend interface in `execution_backends/base.py`.
-- [ ] T029 Create `docker/Dockerfile.exec` with pinned analytical runtime dependencies.
-- [ ] T030 Implement session-scoped Docker backend in `execution_backends/docker.py`.
-- [ ] T031 Enforce timeout, sanitized environment, disabled/restricted network, and workspace mounts in Docker backend.
-- [ ] T032 Implement clearly marked non-conformant subprocess development backend in `execution_backends/subprocess_dev.py`.
-- [ ] T033 Implement execution lifecycle service with source fingerprint capture in `services/execution.py`.
-- [ ] T034 Implement workspace before/after snapshots for generated/modified file detection.
-- [ ] T035 Implement artifact hashing, type detection, versioning, and registration in `services/artifact_registry.py`.
-- [ ] T036 Implement MCP `execute_python`, `list_artifacts`, and `get_artifact` tools.
-- [ ] T037 Add execution timeout and infinite-loop scenario tests.
-- [ ] T038 Add secret-isolation and cross-session sandbox tests.
-- [ ] T039 Add scenario test generating PNG + CSV and verifying canonical artifact lineage.
+- [x] T028 Define execution backend interface in `execution_backends/base.py`.
+- [x] T029 Create `docker/Dockerfile.exec` with pinned analytical runtime dependencies.
+- [x] T030 Implement session-scoped Docker backend in `execution_backends/docker.py`.
+- [x] T031 Enforce timeout, sanitized environment, disabled/restricted network, and workspace mounts in Docker backend.
+- [x] T032 Implement clearly marked non-conformant subprocess development backend in `execution_backends/subprocess_dev.py`.
+- [x] T033 Implement execution lifecycle service with source fingerprint capture in `services/execution.py`.
+- [x] T034 Implement workspace before/after snapshots for generated/modified file detection.
+- [x] T035 Implement artifact hashing, type detection, versioning, and registration in `services/artifact_registry.py`.
+- [x] T036 Implement MCP `execute_python`, `list_artifacts`, and `get_artifact` tools.
+- [x] T037 Add execution timeout and infinite-loop scenario tests.
+- [x] T038 Add secret-isolation and cross-session sandbox tests.
+- [x] T039 Add scenario test generating PNG + CSV and verifying canonical artifact lineage.
 
 ## Phase 5 — Evidence Ledger [P1]
 
 **Goal**: Material claims are represented as explicit, queryable provenance records.
 
-- [ ] T040 Implement evidence registration service and class-specific validation rules in `services/evidence_ledger.py`.
-- [ ] T041 Enforce successful execution references for derived facts.
-- [ ] T042 Enforce upstream evidence relationships for interpretations/recommendations.
-- [ ] T043 Enforce same-session entity ownership and evidence DAG acyclicity.
-- [ ] T044 Implement MCP `register_evidence` and `list_evidence` tools.
-- [ ] T045 Add protocol tests for valid and invalid evidence registration.
-- [ ] T046 Add scenario test where final material claim can be traced source → execution → evidence.
+- [x] T040 Implement evidence registration service and class-specific validation rules in `services/evidence_ledger.py`.
+- [x] T041 Enforce successful execution references for derived facts.
+- [x] T042 Enforce upstream evidence relationships for interpretations/recommendations.
+- [x] T043 Enforce same-session entity ownership and evidence DAG acyclicity.
+- [x] T044 Implement MCP `register_evidence` and `list_evidence` tools.
+- [x] T045 Add protocol tests for valid and invalid evidence registration.
+- [x] T046 Add scenario test where final material claim can be traced source → execution → evidence.
 
 ## Phase 6 — Validation [P1]
 
 **Goal**: Independent deterministic checks can block invalid final analyses.
 
-- [ ] T047 Implement validator interface and check registry.
-- [ ] T048 [P] Implement evidence coverage validator.
-- [ ] T049 [P] Implement stale source validator.
-- [ ] T050 [P] Implement duplicate-observation validator using whole-row and configured-key modes.
-- [ ] T051 [P] Implement missingness validator with configurable thresholds and explicit inconclusive state.
-- [ ] T052 [P] Implement denominator consistency validator for registered denominator metadata.
-- [ ] T053 [P] Implement unsupported causal-language validator using conservative lexical/pattern rules plus registered design metadata.
-- [ ] T054 Implement validation aggregation and `validated`/`warnings`/`blocked` status logic.
-- [ ] T055 Implement MCP `validate_analysis` tool.
-- [ ] T056 Add known-bad fixture tests for all v1 validators.
-- [ ] T057 Add scenario proving a material unlinked claim cannot receive `validated` status.
+- [x] T047 Implement validator interface and check registry.
+- [x] T048 [P] Implement evidence coverage validator.
+- [x] T049 [P] Implement stale source validator.
+- [x] T050 [P] Implement duplicate-observation validator using whole-row and configured-key modes.
+- [x] T051 [P] Implement missingness validator with configurable thresholds and explicit inconclusive state.
+- [x] T052 [P] Implement denominator consistency validator for registered denominator metadata.
+- [x] T053 [P] Implement unsupported causal-language validator using conservative lexical/pattern rules plus registered design metadata.
+- [x] T054 Implement validation aggregation and `validated`/`warnings`/`blocked` status logic.
+- [x] T055 Implement MCP `validate_analysis` tool.
+- [x] T056 Add known-bad fixture tests for all v1 validators.
+- [x] T057 Add scenario proving a material unlinked claim cannot receive `validated` status.
 
 ## Phase 7 — Large Data and Spill-to-Artifact [P2]
 
