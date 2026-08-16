@@ -174,6 +174,70 @@ def test_spill_over_artifact_byte_ceiling_is_rejected(tmp_path: Path) -> None:
     assert any(record.status is ExecutionStatus.FAILED for record in records)
 
 
+def test_preview_first_row_stays_within_byte_budget(tmp_path: Path) -> None:
+    session, source, query, _, _, _ = _services(tmp_path, max_query_rows=100)
+    # A single row with many individually large columns. The per-cell cap is derived from the
+    # preview byte budget and column count, so even this first row cannot exceed the budget.
+    import json
+
+    from agentic_analytics.settings import Settings as _Settings
+
+    budget = _Settings().max_result_preview_bytes
+    columns = ", ".join(f"repeat('x', 20000) AS c{index}" for index in range(60))
+    result = query.execute(session, f"SELECT {columns} FROM source('{source.id}') LIMIT 1")
+    assert result["row_count_returned"] == 1
+    assert result["truncated"] is True
+    preview_bytes = len(json.dumps(result["rows"], default=str).encode("utf-8"))
+    assert preview_bytes <= budget
+    assert all(len(cell) <= 8192 for cell in result["rows"][0])
+
+
+def test_spill_watchdog_bounds_oversized_write(tmp_path: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # A multi-megabyte, multi-row-group spill: the COPY watchdog must interrupt the write once
+    # the file crosses the tiny ceiling, and the partial file must be cleaned up.
+    count = 300_000
+    tokens = [format((index * 2654435761) % (2**64), "016x") for index in range(count)]
+    pq.write_table(
+        pa.table({"id": list(range(count)), "tok": tokens}), workspace / "big.parquet"
+    )
+    settings = Settings(
+        state_dir=tmp_path / "state",
+        workspace_base_dir=tmp_path / "generated",
+        allowed_workspace_roots=[workspace],
+        max_query_rows=1,
+        max_artifact_bytes=1024,
+    )
+    sources = SourceRepository(settings.state_dir)
+    executions = ExecutionRepository(settings.state_dir)
+    artifacts = ArtifactRepository(settings.state_dir)
+    workspace_service = WorkspaceService([workspace])
+    inspector = InspectorService(sources, workspace_service, settings)
+    registry = ArtifactRegistry(
+        artifacts,
+        settings.state_dir / "artifacts",
+        max_artifact_bytes=settings.max_artifact_bytes,
+        max_total_bytes=settings.max_total_artifact_bytes,
+    )
+    query = QueryService(sources, executions, workspace_service, registry, settings)
+    session = AnalysisSession(workspace_root=str(workspace))
+    source, _ = inspector.inspect(session, "big.parquet")
+
+    with pytest.raises(QueryExecutionError, match="limit"):
+        query.execute(session, f"SELECT * FROM source('{source.id}')")
+
+    # No over-limit artifact registered and no spill file left behind in the archive.
+    assert artifacts.list(session.id) == []
+    archive_root = settings.state_dir / "artifacts"
+    leftover = list(archive_root.rglob("query-result.parquet")) if archive_root.exists() else []
+    assert leftover == []
+    assert any(record.status is ExecutionStatus.FAILED for record in executions.list(session.id))
+
+
 def test_query_view_names_cannot_be_shadowed_by_cte(tmp_path: Path) -> None:
     session, source, query, _, _, _ = _services(tmp_path, max_query_rows=100)
     sql = (
