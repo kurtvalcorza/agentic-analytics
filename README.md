@@ -73,3 +73,12 @@ If you build on that work, please cite it:
       url={https://arxiv.org/abs/2510.16872},
 }
 ```
+
+## Development and AI assistance
+
+This project is developed with AI coding assistants under human direction:
+
+- Specification and initial implementation were produced with **OpenAI Codex**, which also performed automated code review.
+- Review-finding remediation, security/robustness hardening, and documentation were done with **Anthropic Claude** (via Claude Code).
+
+The maintainer directs the work and is responsible for all changes. AI contributions are attributed per-commit via `Co-Authored-By` trailers, and every change lands through pull requests gated by CI (ruff, mypy, tests, and the sandbox image build).
