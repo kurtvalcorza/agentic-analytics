@@ -5,27 +5,27 @@
 
 ## Phase 1 — Setup
 
-- [ ] T001 Create Python package skeleton and `pyproject.toml` with Python 3.12+, MCP SDK, Pydantic, DuckDB, pytest, and dev tooling.
-- [ ] T002 Create `src/agentic_analytics/` package structure from `plan.md`.
-- [ ] T003 [P] Add formatting, linting, and type-check configuration.
-- [ ] T004 [P] Add initial `README.md` explaining MCP-native/agent-agnostic architecture and strict/permissive modes.
-- [ ] T005 Create test directories and fixture conventions under `tests/`.
+- [x] T001 Create Python package skeleton and `pyproject.toml` with Python 3.12+, MCP SDK, Pydantic, DuckDB, pytest, and dev tooling.
+- [x] T002 Create `src/agentic_analytics/` package structure from `plan.md`.
+- [x] T003 [P] Add formatting, linting, and type-check configuration.
+- [x] T004 [P] Add initial `README.md` explaining MCP-native/agent-agnostic architecture and strict/permissive modes.
+- [x] T005 Create test directories and fixture conventions under `tests/`.
 
 ## Phase 2 — Foundational Models and Persistence
 
 **Checkpoint**: Canonical records can be created, serialized, validated, and stored without MCP or execution backends.
 
-- [ ] T006 Implement opaque typed ID generation in `src/agentic_analytics/ids.py`.
-- [ ] T007 [P] Implement `AnalysisSession` model in `models/session.py`.
-- [ ] T008 [P] Implement `DataSource` model in `models/source.py`.
-- [ ] T009 [P] Implement `ExecutionRecord` model in `models/execution.py`.
-- [ ] T010 [P] Implement `Artifact` model in `models/artifact.py`.
-- [ ] T011 [P] Implement `EvidenceItem` and evidence classification invariants in `models/evidence.py`.
-- [ ] T012 [P] Implement `ValidationFinding` and validation run status models in `models/validation.py`.
-- [ ] T013 Implement append-oriented repository base with atomic writes and per-session scoping.
-- [ ] T014 [P] Implement session/source/execution/artifact/evidence/finding repositories under `repositories/`.
-- [ ] T015 Add unit tests for schema invariants and cross-session reference rejection.
-- [ ] T016 Add evidence DAG cycle-detection unit tests.
+- [x] T006 Implement opaque typed ID generation in `src/agentic_analytics/ids.py`.
+- [x] T007 [P] Implement `AnalysisSession` model in `models/session.py`.
+- [x] T008 [P] Implement `DataSource` model in `models/source.py`.
+- [x] T009 [P] Implement `ExecutionRecord` model in `models/execution.py`.
+- [x] T010 [P] Implement `Artifact` model in `models/artifact.py`.
+- [x] T011 [P] Implement `EvidenceItem` and evidence classification invariants in `models/evidence.py`.
+- [x] T012 [P] Implement `ValidationFinding` and validation run status models in `models/validation.py`.
+- [x] T013 Implement append-oriented repository base with atomic writes and per-session scoping.
+- [x] T014 [P] Implement session/source/execution/artifact/evidence/finding repositories under `repositories/`.
+- [x] T015 Add unit tests for schema invariants and cross-session reference rejection.
+- [x] T016 Add evidence DAG cycle-detection unit tests.
 
 ## Phase 3 — User Story 1: Analyze Local Data from Any MCP Client [P1]
 
