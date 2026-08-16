@@ -13,11 +13,20 @@ The product boundary is the MCP protocol, not a host-specific plugin. Core corre
 - Support both strict managed execution and explicitly marked permissive host-native execution.
 - Remain portable across MCP-capable agents.
 
-## Current implementation status
+## Implemented capabilities
 
-The first implementation slice establishes the Python package, MCP v2 server skeleton, canonical typed IDs, provenance models, append-only session-scoped record persistence, model invariants, evidence DAG cycle detection, and CI quality gates.
+The runtime exposes a versioned MCP tool surface over a host-neutral core:
 
-See `specs/001-agent-agnostic-analytical-runtime/` for the specification, plan, contracts, data model, and implementation task graph.
+- **Sessions** — `create_session` authorizes a workspace root (optionally with analysis/causal design metadata) and reports host capabilities derived from the configured backend.
+- **Data plane** — `list_sources` discovers CSV/Parquet sources (bounded), `inspect_source` registers and profiles them in a single scan, and `query_data` runs bounded, read-only DuckDB SQL over registered sources with enforced memory/time limits, source-fingerprint integrity checks, and audit records for successful and failed runs.
+- **Managed execution** — `execute_python` runs code in an isolated, ephemeral Docker sandbox (network-disabled, read-only root filesystem, dropped capabilities, resource-capped) and registers generated files as immutable artifacts stored outside the writable workspace; `list_artifacts` / `get_artifact` expose metadata, and artifact bytes are retrievable through a registered MCP resource. A non-conformant subprocess backend is available for development (permissive sessions only).
+- **Evidence ledger** — `register_evidence` / `list_evidence` record a source → execution → artifact → evidence provenance chain with validated links, lineage enforcement, and cycle detection.
+- **Validation** — `validate_analysis` runs deterministic checks (evidence coverage, stale sources, duplicates, missingness, denominator consistency, unsupported causal language) and returns bounded, provenance-linked findings; incomplete coverage never reports a clean pass.
+- **Large results** — query results that exceed the row or response-size budget spill to a Parquet artifact, with a bounded in-context preview derived from the same evaluation.
+
+Persistence is append-only and session-scoped, with atomic record publication, canonical typed IDs, and UTC-normalized timestamps. Quality gates (ruff, mypy, pytest, and the sandbox image build) run in CI.
+
+See `specs/001-agent-agnostic-analytical-runtime/` for the specification, plan, contracts, data model, and implementation task graph. The runtime is delivered as a stack of layered pull requests: runtime foundation → data plane → managed execution → evidence ledger → validation → large-data spill.
 
 ## Development
 
@@ -39,3 +48,28 @@ agentic-analytics
 ```
 
 The implementation targets the current stable MCP Python SDK v2 line.
+
+## Acknowledgements
+
+This project is informed by research on agentic systems for autonomous data
+science, in particular **DeepAnalyze: Agentic Large Language Models for
+Autonomous Data Science** by Shaolei Zhang, Ju Fan, Meihao Fan, Guoliang Li,
+and Xiaoyong Du (Renmin University of China and Tsinghua University).
+
+- Paper: [arXiv:2510.16872](https://arxiv.org/abs/2510.16872)
+- Code: <https://github.com/ruc-datalab/DeepAnalyze> (MIT-licensed)
+- Project page: <https://ruc-deepanalyze.github.io/>
+
+If you build on that work, please cite it:
+
+```bibtex
+@misc{deepanalyze,
+      title={DeepAnalyze: Agentic Large Language Models for Autonomous Data Science},
+      author={Shaolei Zhang and Ju Fan and Meihao Fan and Guoliang Li and Xiaoyong Du},
+      year={2025},
+      eprint={2510.16872},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2510.16872},
+}
+```
