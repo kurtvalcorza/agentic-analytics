@@ -70,6 +70,13 @@ Persistence is append-only and session-scoped, with atomic record publication, c
 
 See `specs/001-agent-agnostic-analytical-runtime/` for the specification, plan, contracts, data model, and implementation task graph. The runtime is delivered as a stack of layered pull requests: runtime foundation → data plane → managed execution → evidence ledger → validation → large-data spill.
 
+### Not yet implemented
+
+Two capabilities appear in the contracts (`specs/.../contracts/mcp-tools.md`) but are deliberately deferred to a later `0.1.x` and are **not** available yet:
+
+- **External execution registration** (`register_external_execution`) — recording analyses run outside the managed sandbox, in permissive mode.
+- **Challenge analysis** (`challenge_analysis`) — independent, adversarial re-checking of a completed analysis. Deterministic validation is available today via `validate_analysis`.
+
 ## How it works
 
 You bring your own data — local CSV/Parquet files — and point an MCP-capable coding agent (Claude Code, Codex, …) at the runtime. The agent does the reasoning and decides which tools to call; the runtime provides a bounded, sandboxed environment and records provenance so every result is reproducible and independently checkable. Full datasets never flood the model's context.
