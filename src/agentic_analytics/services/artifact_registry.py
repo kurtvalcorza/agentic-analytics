@@ -5,6 +5,7 @@ import mimetypes
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from agentic_analytics.models import Artifact, ArtifactKind
 from agentic_analytics.repositories import ArtifactRepository
@@ -57,6 +58,35 @@ def _artifact_kind(path: Path) -> ArtifactKind:
 class ArtifactRegistry:
     def __init__(self, repository: ArtifactRepository) -> None:
         self.repository = repository
+
+    def register_file(
+        self,
+        session_id: str,
+        execution_id: str,
+        workspace_root: Path,
+        path: Path,
+        *,
+        lineage: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Artifact:
+        root = workspace_root.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        if resolved != root and root not in resolved.parents:
+            raise ValueError("artifact path must remain inside the session workspace")
+        stat = resolved.stat()
+        artifact = Artifact(
+            session_id=session_id,
+            execution_id=execution_id,
+            kind=_artifact_kind(resolved),
+            display_name=resolved.name,
+            relative_path=resolved.relative_to(root).as_posix(),
+            media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+            size_bytes=stat.st_size,
+            sha256=_sha256(resolved),
+            lineage=lineage or {},
+            metadata=metadata or {},
+        )
+        return self.repository.add(artifact)
 
     def register_changes(
         self,
