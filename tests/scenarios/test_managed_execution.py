@@ -43,10 +43,13 @@ print('done')
         artifacts = runtime.artifacts.list(session.id)
         assert {artifact.kind.value for artifact in artifacts} == {"chart", "dataset"}
         assert all(len(artifact.sha256) == 64 for artifact in artifacts)
-        assert all(
-            artifact.relative_path.startswith(".agentic-analytics/artifacts/")
-            for artifact in artifacts
-        )
+        assert all(artifact.relative_path.startswith("outputs/") for artifact in artifacts)
+        # Artifacts are archived outside the writable workspace mount so managed code cannot
+        # corrupt them; the bytes live under the state directory, not the workspace.
+        for artifact in artifacts:
+            archived = runtime.artifact_registry.archived_path(artifact)
+            assert archived.is_file()
+            assert workspace not in archived.parents
     finally:
         runtime.execution_backend.close_session(session.id)
 

@@ -18,6 +18,10 @@ from agentic_analytics.repositories import (
 from agentic_analytics.validators.core import DEFAULT_VALIDATORS, ValidationContext, Validator
 
 
+class ValidationRequestError(ValueError):
+    pass
+
+
 class ValidationService:
     def __init__(
         self,
@@ -39,14 +43,27 @@ class ValidationService:
         *,
         claim_texts: list[str] | None = None,
         checks: list[str] | None = None,
+        duplicate_keys: dict[str, list[str]] | None = None,
     ) -> tuple[ValidationRun, list[ValidationFinding]]:
-        selected = set(checks or [validator.name for validator in self.validators])
+        known = {validator.name for validator in self.validators}
+        if checks is not None:
+            unknown = sorted({check for check in checks if check not in known})
+            if unknown:
+                # Reject unknown check selectors so a typo cannot silently skip every check
+                # and report success.
+                raise ValidationRequestError(
+                    f"unknown validation checks: {', '.join(unknown)}"
+                )
+            selected = set(checks)
+        else:
+            selected = known
         context = ValidationContext(
             session=session,
             evidence=self.evidence.list(session.id),
             sources=self.sources.list(session.id),
             workspace_root=Path(session.workspace_root).resolve(strict=True),
             claim_texts=claim_texts or [],
+            duplicate_keys=duplicate_keys or {},
         )
         all_findings: list[ValidationFinding] = []
         checks_run: list[str] = []
@@ -71,6 +88,10 @@ class ValidationService:
         if ValidationSeverity.BLOCKING in severities:
             status = ValidationRunStatus.BLOCKED
         elif severities & {ValidationSeverity.ERROR, ValidationSeverity.WARNING}:
+            status = ValidationRunStatus.WARNINGS
+        elif checks_inconclusive:
+            # Coverage gaps must not read as a clean pass: if any selected check could not
+            # reach a verdict, the run is not a confident "validated".
             status = ValidationRunStatus.WARNINGS
         else:
             status = ValidationRunStatus.VALIDATED

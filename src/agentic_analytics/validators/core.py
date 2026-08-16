@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeGuard
 
 import duckdb
 
@@ -27,6 +27,21 @@ class ValidationContext:
     sources: list[DataSource]
     workspace_root: Path
     claim_texts: list[str] = field(default_factory=list)
+    # Per-source duplicate keys supplied through the public validate_analysis call, keyed by
+    # source relative_path or source id. Makes the key-based duplicate check reachable via MCP.
+    duplicate_keys: dict[str, list[str]] = field(default_factory=dict)
+
+    def resolve_source_file(self, source: DataSource) -> Path | None:
+        return _resolve_source_file(self.workspace_root, source)
+
+    def source_duplicate_keys(self, source: DataSource) -> list[str]:
+        if source.relative_path and source.relative_path in self.duplicate_keys:
+            return list(self.duplicate_keys[source.relative_path])
+        if source.id in self.duplicate_keys:
+            return list(self.duplicate_keys[source.id])
+        meta = source.profile.get("validation", {})
+        keys_raw = meta.get("duplicate_keys", []) if isinstance(meta, dict) else []
+        return [str(key) for key in keys_raw] if isinstance(keys_raw, list) else []
 
 
 @dataclass(slots=True)
@@ -68,6 +83,34 @@ def _finding(
 
 def _normalize_claim(value: str) -> str:
     return " ".join(value.casefold().split())
+
+
+def _is_number(value: object) -> TypeGuard[int | float]:
+    # bool is a subclass of int; a boolean is never a meaningful analytical quantity.
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _resolve_source_file(workspace_root: Path, source: DataSource) -> Path | None:
+    """Resolve a source to a real file strictly contained in the workspace, else None.
+
+    Mirrors the workspace containment check so validators never follow a symlink out of the
+    authorized workspace, and never abort the whole run when a registered file is missing.
+    """
+
+    if source.relative_path is None:
+        return None
+    requested = Path(source.relative_path)
+    if requested.is_absolute() or ".." in requested.parts:
+        return None
+    try:
+        resolved = (workspace_root / requested).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if resolved != workspace_root and workspace_root not in resolved.parents:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
 
 
 def _inconclusive(check: str, reason: str) -> CheckResult:
@@ -134,8 +177,8 @@ class StaleSourceValidator:
             if source.relative_path is None:
                 continue
             checked += 1
-            path = (context.workspace_root / source.relative_path).resolve(strict=False)
-            if not path.exists():
+            path = context.resolve_source_file(source)
+            if path is None:
                 findings.append(
                     _finding(
                         context,
@@ -186,8 +229,11 @@ class DuplicateObservationValidator:
         for source in context.sources:
             if source.relative_path is None or source.kind not in _SUPPORTED_TABULAR:
                 continue
+            path = context.resolve_source_file(source)
+            if path is None:
+                # Missing/escaped sources are reported by stale_sources; do not abort here.
+                continue
             supported += 1
-            path = (context.workspace_root / source.relative_path).resolve(strict=True)
             reader = _reader_sql(source, path)
             connection = duckdb.connect(database=":memory:")
             try:
@@ -197,9 +243,7 @@ class DuplicateObservationValidator:
                     f"SELECT count(*) FROM (SELECT DISTINCT * FROM {reader})",
                 )
                 duplicate_rows = total - distinct
-                meta = source.profile.get("validation", {})
-                keys_raw = meta.get("duplicate_keys", []) if isinstance(meta, dict) else []
-                keys = [str(key) for key in keys_raw] if isinstance(keys_raw, list) else []
+                keys = context.source_duplicate_keys(source)
                 if duplicate_rows > 0:
                     findings.append(
                         _finding(
@@ -269,8 +313,10 @@ class MissingnessValidator:
         for source in context.sources:
             if source.relative_path is None or source.kind not in _SUPPORTED_TABULAR:
                 continue
+            path = context.resolve_source_file(source)
+            if path is None:
+                continue
             supported += 1
-            path = (context.workspace_root / source.relative_path).resolve(strict=True)
             reader = _reader_sql(source, path)
             connection = duckdb.connect(database=":memory:")
             try:
@@ -344,7 +390,7 @@ class DenominatorConsistencyValidator:
             denominator = item.value.get("denominator")
             numerator = item.value.get("numerator")
             expected = item.value.get("expected_denominator")
-            if not isinstance(denominator, (int, float)) or denominator <= 0:
+            if not _is_number(denominator) or denominator <= 0:
                 findings.append(
                     _finding(
                         context,
@@ -360,7 +406,7 @@ class DenominatorConsistencyValidator:
                     )
                 )
                 continue
-            if isinstance(numerator, (int, float)) and numerator > denominator:
+            if _is_number(numerator) and numerator > denominator:
                 findings.append(
                     _finding(
                         context,
@@ -379,7 +425,7 @@ class DenominatorConsistencyValidator:
                         ),
                     )
                 )
-            if isinstance(expected, (int, float)) and expected != denominator:
+            if _is_number(expected) and expected != denominator:
                 findings.append(
                     _finding(
                         context,
@@ -407,7 +453,7 @@ class DenominatorConsistencyValidator:
 
 
 _CAUSAL = re.compile(
-    r"\b(caus(?:e|ed|es|al|ally)|led to|resulted in|responsible for|"
+    r"\b(caus(?:e|ed|es|ing|al|ally|ation)|led to|resulted in|responsible for|"
     r"treatment effect|causal effect)\b",
     re.IGNORECASE,
 )
@@ -427,12 +473,21 @@ class UnsupportedCausalLanguageValidator:
         if explicitly_supported or design in _SUPPORTED_CAUSAL_DESIGNS:
             return CheckResult(self.name)
         findings: list[ValidationFinding] = []
-        claims = context.claim_texts or [
-            item.claim for item in context.evidence if item.material
-        ]
-        for claim in claims:
+        # Track the originating evidence id so an evidence-derived finding can link back to it.
+        if context.claim_texts:
+            candidates: list[tuple[str, str | None]] = [
+                (claim, None) for claim in context.claim_texts
+            ]
+        else:
+            candidates = [
+                (item.claim, item.id) for item in context.evidence if item.material
+            ]
+        for claim, evidence_id in candidates:
             if not _CAUSAL.search(claim):
                 continue
+            entity_refs = (
+                [{"type": "evidence", "id": evidence_id}] if evidence_id is not None else []
+            )
             findings.append(
                 _finding(
                     context,
@@ -443,6 +498,7 @@ class UnsupportedCausalLanguageValidator:
                         "Causal language is unsupported by the registered design: "
                         f"{claim}"
                     ),
+                    entity_refs=entity_refs,
                     details={"analysis_design": design or None, "claim": claim},
                     remediation=(
                         "Use associational wording or register a supported causal design."

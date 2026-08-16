@@ -39,6 +39,7 @@ class Runtime:
     execution: ExecutionService
     evidence_ledger: EvidenceLedger
     validation: ValidationService
+    artifact_registry: ArtifactRegistry
 
     @classmethod
     def create(cls, settings: Settings | None = None) -> Runtime:
@@ -53,7 +54,13 @@ class Runtime:
         validation_runs = ValidationRunRepository(resolved.state_dir)
         workspace = WorkspaceService(resolved.normalized_allowed_roots())
         inspector = InspectorService(sources, workspace, resolved)
-        registry = ArtifactRegistry(artifact_repository)
+        registry = ArtifactRegistry(
+            artifact_repository,
+            resolved.state_dir / "artifacts",
+            max_artifacts=resolved.max_artifacts_per_execution,
+            max_artifact_bytes=resolved.max_artifact_bytes,
+            max_total_bytes=resolved.max_total_artifact_bytes,
+        )
         query = QueryService(sources, executions, workspace, registry, resolved)
         backend: ExecutionBackend
         if resolved.execution_backend == "docker":
@@ -62,6 +69,7 @@ class Runtime:
                 memory=resolved.docker_memory,
                 cpus=resolved.docker_cpus,
                 pids_limit=resolved.docker_pids_limit,
+                max_output_chars=resolved.max_output_chars,
             )
         else:
             backend = SubprocessDevBackend()
@@ -96,4 +104,5 @@ class Runtime:
             execution,
             evidence_ledger,
             validation,
+            registry,
         )

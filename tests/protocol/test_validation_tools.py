@@ -37,3 +37,29 @@ async def test_unlinked_material_claim_cannot_validate(tmp_path: Path) -> None:
     assert result.structured_content["checks_run"] == ["evidence_coverage"]
     codes = {finding["code"] for finding in result.structured_content["findings"]}
     assert "MISSING_MATERIAL_EVIDENCE" in codes
+
+
+@pytest.mark.anyio
+async def test_default_check_selector_and_bounded_findings(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = build_server(
+        Settings(
+            state_dir=tmp_path / "state",
+            allowed_workspace_roots=[workspace],
+            execution_backend="subprocess_dev",
+        )
+    )
+    created = await server.call_tool(
+        "create_session", {"workspace_root": ".", "mode": "permissive"}
+    )
+    assert created.structured_content is not None
+    session_id = created.structured_content["session_id"]
+
+    # The documented "default" selector must be accepted (not only an array or null).
+    result = await server.call_tool(
+        "validate_analysis", {"session_id": session_id, "checks": "default"}
+    )
+    assert result.structured_content is not None
+    assert "total_findings" in result.structured_content
+    assert result.structured_content["findings_truncated"] is False
