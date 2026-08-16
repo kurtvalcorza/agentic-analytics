@@ -7,6 +7,7 @@ from agentic_analytics.models import (
     ValidationFinding,
     ValidationRun,
     ValidationRunStatus,
+    ValidationScope,
     ValidationSeverity,
 )
 from agentic_analytics.repositories import (
@@ -44,6 +45,7 @@ class ValidationService:
         claim_texts: list[str] | None = None,
         checks: list[str] | None = None,
         duplicate_keys: dict[str, list[str]] | None = None,
+        scope: ValidationScope = ValidationScope.FINAL,
     ) -> tuple[ValidationRun, list[ValidationFinding]]:
         known = {validator.name for validator in self.validators}
         if checks is not None:
@@ -57,6 +59,13 @@ class ValidationService:
             selected = set(checks)
         else:
             selected = known
+        if not selected:
+            # An explicit empty check set has zero coverage. Rejecting it prevents a
+            # request that runs no validator at all from falling through to a clean
+            # "validated" verdict.
+            raise ValidationRequestError(
+                "validation requires at least one check; an empty check set has zero coverage"
+            )
         context = ValidationContext(
             session=session,
             evidence=self.evidence.list(session.id),
@@ -99,6 +108,7 @@ class ValidationService:
             ValidationRun(
                 session_id=session.id,
                 status=status,
+                scope=scope,
                 finding_ids=[finding.id for finding in persisted],
                 checks_run=checks_run,
                 checks_skipped=checks_skipped,
