@@ -3,10 +3,12 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import duckdb
 
+from agentic_analytics.ids import EntityType, new_id
 from agentic_analytics.models import (
     AnalysisSession,
     ExecutionRecord,
@@ -17,6 +19,7 @@ from agentic_analytics.models import (
 from agentic_analytics.repositories import ExecutionRepository, SourceRepository
 from agentic_analytics.settings import Settings
 
+from .artifact_registry import ArtifactRegistry
 from .workspace import WorkspaceService
 
 _SOURCE_REF = re.compile(r"source\(\s*['\"](?P<id>src_[0-9a-f]{32})['\"]\s*\)", re.IGNORECASE)
@@ -55,11 +58,13 @@ class QueryService:
         sources: SourceRepository,
         executions: ExecutionRepository,
         workspace: WorkspaceService,
+        artifacts: ArtifactRegistry,
         settings: Settings,
     ) -> None:
         self.sources = sources
         self.executions = executions
         self.workspace = workspace
+        self.artifacts = artifacts
         self.settings = settings
 
     @staticmethod
@@ -109,11 +114,24 @@ class QueryService:
                 (source_id, source.kind, str(resolved_path), source.fingerprint)
             )
 
+        execution_id = new_id(EntityType.EXECUTION)
+        workspace_root = Path(session.workspace_root).resolve(strict=True)
+        spill_path = (
+            workspace_root
+            / ".agentic-analytics"
+            / "artifacts"
+            / execution_id
+            / "query-result.parquet"
+        )
+        spill_path.parent.mkdir(parents=True, exist_ok=True)
+
         connection = duckdb.connect(database=":memory:")
         fingerprints: dict[str, Any] = {}
         rewritten = normalized
         try:
-            self._secure_connection(connection, [item[2] for item in resolved_sources])
+            allowed_paths = [item[2] for item in resolved_sources]
+            allowed_paths.append(str(spill_path))
+            self._secure_connection(connection, allowed_paths)
             for index, (source_id, kind, file_path, fingerprint) in enumerate(resolved_sources):
                 view_name = f"_source_{index}"
                 path_literal = _sql_string(file_path)
@@ -139,7 +157,35 @@ class QueryService:
             raw_rows = cursor.fetchall()
             truncated = len(raw_rows) > limit
             serial_rows = [[_json_value(value) for value in row] for row in raw_rows[:limit]]
+
+            artifact_id: str | None = None
+            artifact_ids: list[str] = []
+            if truncated:
+                spill_literal = _sql_string(str(spill_path))
+                connection.execute(
+                    f"COPY ({rewritten}) TO {spill_literal} "
+                    "(FORMAT PARQUET, COMPRESSION ZSTD)"
+                )
+                artifact = self.artifacts.register_file(
+                    session.id,
+                    execution_id,
+                    workspace_root,
+                    spill_path,
+                    lineage={
+                        "change": "query_result_spill",
+                        "source_ids": source_ids,
+                    },
+                    metadata={
+                        "format": "parquet",
+                        "preview_rows": len(serial_rows),
+                        "query_truncated": True,
+                    },
+                )
+                artifact_id = artifact.id
+                artifact_ids.append(artifact.id)
+
             execution = ExecutionRecord(
+                id=execution_id,
                 session_id=session.id,
                 execution_type=ExecutionType.MANAGED_SQL,
                 status=ExecutionStatus.SUCCEEDED,
@@ -151,6 +197,7 @@ class QueryService:
                 runtime={"backend": "duckdb", "duckdb": duckdb.__version__},
                 result_preview={"columns": columns, "rows": serial_rows},
                 truncated=truncated,
+                artifact_ids=artifact_ids,
             )
             self.executions.add(execution)
             return {
@@ -159,7 +206,7 @@ class QueryService:
                 "rows": serial_rows,
                 "row_count_returned": len(serial_rows),
                 "truncated": truncated,
-                "artifact_id": None,
+                "artifact_id": artifact_id,
             }
         finally:
             connection.close()
