@@ -28,6 +28,22 @@ Persistence is append-only and session-scoped, with atomic record publication, c
 
 See `specs/001-agent-agnostic-analytical-runtime/` for the specification, plan, contracts, data model, and implementation task graph. The runtime is delivered as a stack of layered pull requests: runtime foundation → data plane → managed execution → evidence ledger → validation → large-data spill.
 
+## How it works
+
+You bring your own data — local CSV/Parquet files — and point an MCP-capable coding agent (Claude Code, Codex, …) at the runtime. The agent does the reasoning and decides which tools to call; the runtime provides a bounded, sandboxed environment and records provenance so every result is reproducible and independently checkable. Full datasets never flood the model's context.
+
+A typical end-to-end flow over a `survey.csv` in your workspace (subsequent calls carry the `session_id` returned by the first):
+
+1. **Authorize the data.** `create_session(workspace_root=".")` opens a session scoped to your workspace and returns `ses_…`. Only directories under the server's configured allowlist are accepted.
+2. **Discover and inspect.** `list_sources()` finds `survey.csv`; `inspect_source(source="survey.csv")` registers it and returns schema, row count, null counts, duplicate-row count, and a small sample — plus a content fingerprint. The full file is never sent to the model.
+3. **Query without loading everything.** `query_data(sql="SELECT region, avg(score) AS mean FROM source('src_…') GROUP BY region")` runs bounded, read-only DuckDB SQL. Small results return inline; oversized results spill to a Parquet artifact with a bounded preview.
+4. **Run richer analysis in a sandbox.** `execute_python(code=...)` runs pandas / scikit-learn / matplotlib in an isolated, network-disabled Docker container over the workspace. Generated files (a chart, a cleaned dataset) are captured as immutable artifacts.
+5. **Record evidence.** `register_evidence(classification="derived_fact", claim="Mean score in NCR is 4.2", source_ids=[...], execution_ids=[...])` links the claim to the exact source and execution that produced it.
+6. **Validate the analysis.** `validate_analysis(claim_texts=[...])` runs deterministic checks — stale/changed sources, duplicate observations, high missingness, denominator sanity, unsupported causal language, and whether each material claim is backed by registered evidence — and returns findings to act on.
+7. **Retrieve outputs.** `list_artifacts()` / `get_artifact(artifact_id="art_…")` return the generated tables, charts, and datasets with metadata and content hashes.
+
+The agent chooses *which* steps to take and in what order; the runtime guarantees they run in a bounded sandbox, over authorized data, with a verifiable source → execution → artifact → evidence trail.
+
 ## Development
 
 Requires Python 3.12+.
