@@ -96,6 +96,21 @@ def test_query_persists_failed_execution_record(tmp_path: Path) -> None:
     assert failed.error is not None
 
 
+def test_query_spills_oversized_low_row_result(tmp_path: Path) -> None:
+    session, source, query, _, _, artifacts = _services(tmp_path, max_query_rows=100)
+    # A single very large cell must still spill and be trimmed in the preview, even though the
+    # row count is well under the limit.
+    result = query.execute(
+        session, f"SELECT repeat('x', 200000) AS big FROM source('{source.id}') LIMIT 1"
+    )
+    assert result["row_count_returned"] == 1
+    assert result["truncated"] is True
+    assert result["artifact_id"] is not None
+    assert len(result["rows"][0][0]) <= 8192
+    artifact = artifacts.get(session.id, result["artifact_id"])
+    assert artifact.media_type == "application/vnd.apache.parquet"
+
+
 def test_query_view_names_cannot_be_shadowed_by_cte(tmp_path: Path) -> None:
     session, source, query, _, _, _ = _services(tmp_path, max_query_rows=100)
     sql = (

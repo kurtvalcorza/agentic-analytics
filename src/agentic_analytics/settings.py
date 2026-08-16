@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     max_artifact_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
     max_total_artifact_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
     max_validation_findings: int = Field(default=200, ge=1, le=10_000)
+    max_spill_rows: int = Field(default=1_000_000, ge=1)
+    max_result_preview_bytes: int = Field(default=256 * 1024, ge=1024)
+    max_result_cell_chars: int = Field(default=8192, ge=64)
     log_level: str = "INFO"
 
     def normalized_allowed_roots(self) -> list[Path]:

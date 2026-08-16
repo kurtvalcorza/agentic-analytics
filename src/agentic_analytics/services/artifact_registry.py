@@ -117,24 +117,29 @@ class ArtifactRegistry:
         self,
         session_id: str,
         execution_id: str,
-        workspace_root: Path,
         path: Path,
         *,
         lineage: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Artifact:
-        root = workspace_root.resolve(strict=True)
+        """Register a file already written into this execution's archive base.
+
+        The file lives outside every executable workspace, so managed code cannot later
+        corrupt it, and its archive-relative path resolves through ``archived_path``.
+        """
+
+        archive_base = self.archive_base(session_id, execution_id).resolve(strict=False)
         resolved = path.resolve(strict=True)
-        if resolved != root and root not in resolved.parents:
-            raise ValueError("artifact path must remain inside the session workspace")
+        if resolved != archive_base and archive_base not in resolved.parents:
+            raise ValueError("artifact path must remain inside the execution archive")
         stat = resolved.stat()
         artifact = Artifact(
             session_id=session_id,
             execution_id=execution_id,
             kind=_artifact_kind(resolved),
             display_name=resolved.name,
-            relative_path=resolved.relative_to(root).as_posix(),
-            media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+            relative_path=resolved.relative_to(archive_base).as_posix(),
+            media_type=_media_type(resolved),
             size_bytes=stat.st_size,
             sha256=_sha256(resolved),
             lineage=lineage or {},

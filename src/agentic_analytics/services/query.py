@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import threading
 from datetime import UTC, datetime
@@ -118,6 +119,59 @@ class QueryService:
         connection.execute(f"SET memory_limit = {_sql_string(self.settings.query_memory_limit)}")
         connection.execute("SET lock_configuration = true")
 
+    @staticmethod
+    def _prepare_spill_path(archive_base: Path) -> Path:
+        """Create the archive directory and return the validated spill file path.
+
+        Resolves and checks the created directory stays inside the archive root, rejecting a
+        symlinked component before anything is written through it.
+        """
+
+        base = archive_base
+        base.mkdir(parents=True, exist_ok=True)
+        resolved_base = base.resolve(strict=True)
+        # archive_base is ``<archive_root>/<session>/<execution>``; the resolved directory must
+        # remain under the archive root (its parents[1]).
+        archive_root = archive_base.parent.parent.resolve(strict=False)
+        if resolved_base != archive_root and archive_root not in resolved_base.parents:
+            raise QueryRejected("spill directory escapes the artifact archive root")
+        return resolved_base / "query-result.parquet"
+
+    def _bound_preview(
+        self, rows: list[list[Any]]
+    ) -> tuple[list[list[Any]], bool]:
+        """Cap the preview by per-cell size and total bytes; return (rows, was_truncated)."""
+
+        cell_cap = self.settings.max_result_cell_chars
+        truncated = False
+        capped_rows: list[list[Any]] = []
+        for row in rows:
+            capped_row: list[Any] = []
+            for value in row:
+                if isinstance(value, str) and len(value) > cell_cap:
+                    capped_row.append(value[:cell_cap])
+                    truncated = True
+                else:
+                    capped_row.append(value)
+            capped_rows.append(capped_row)
+
+        budget = self.settings.max_result_preview_bytes
+        kept: list[list[Any]] = []
+        used = 0
+        for row in capped_rows:
+            size = len(json.dumps(row, default=str).encode("utf-8"))
+            if kept and used + size > budget:
+                truncated = True
+                break
+            kept.append(row)
+            used += size
+        return kept, truncated
+
+    @staticmethod
+    def _scalar_int(connection: duckdb.DuckDBPyConnection, sql: str) -> int:
+        row = connection.execute(sql).fetchone()
+        return int(row[0]) if row else 0
+
     def _run_bounded(
         self, connection: duckdb.DuckDBPyConnection, sql: str
     ) -> tuple[list[str], list[tuple[Any, ...]]]:
@@ -173,21 +227,18 @@ class QueryService:
             resolved_sources.append((source_id, source.kind, str(resolved_path), current))
 
         execution_id = new_id(EntityType.EXECUTION)
-        workspace_root = Path(session.workspace_root).resolve(strict=True)
-        spill_path = (
-            workspace_root
-            / ".agentic-analytics"
-            / "artifacts"
-            / execution_id
-            / "query-result.parquet"
-        )
-        spill_path.parent.mkdir(parents=True, exist_ok=True)
+        # Spill to the out-of-workspace archive (server-controlled) so managed code cannot
+        # corrupt the artifact and a workspace .agentic-analytics symlink cannot redirect the
+        # write outside its boundary.
+        archive_base = self.artifacts.archive_base(session.id, execution_id)
+        spill_path = self._prepare_spill_path(archive_base)
 
         connection = duckdb.connect(database=":memory:")
         fingerprints: dict[str, Any] = {}
         rewritten = normalized
-        # Unguessable per-execution view names cannot be shadowed by a caller-defined CTE.
+        # Unguessable per-execution view/table names cannot be shadowed by a caller CTE.
         token = uuid4().hex
+        result_table = f"_result_{token}"
         try:
             allowed_paths = [item[2] for item in resolved_sources]
             allowed_paths.append(str(spill_path))
@@ -209,28 +260,45 @@ class QueryService:
                 fingerprints[source_id] = fingerprint
 
             started = datetime.now(UTC)
-            bounded_sql = f"SELECT * FROM ({rewritten}) AS _bounded LIMIT {limit + 1}"
+            # Materialize the full result ONCE, bounded by a row cap and the interrupt timer, so
+            # the preview and the spilled artifact are the same evaluation (deterministic even
+            # for nondeterministic SQL) and materialization cannot run unbounded.
+            spill_cap = self.settings.max_spill_rows
+            materialize_sql = (
+                f'CREATE TEMP TABLE "{result_table}" AS '
+                f"SELECT * FROM ({rewritten}) AS _q LIMIT {spill_cap + 1}"
+            )
             try:
-                columns, raw_rows = self._run_bounded(connection, bounded_sql)
+                self._run_bounded(connection, materialize_sql)
+                columns, preview_raw = self._run_bounded(
+                    connection, f'SELECT * FROM "{result_table}" LIMIT {limit + 1}'
+                )
+                materialized = self._scalar_int(
+                    connection, f'SELECT count(*) FROM "{result_table}"'
+                )
             except (duckdb.Error, TimeoutError) as exc:
                 self._persist_failure(session, normalized, limit, source_ids, fingerprints, exc)
                 raise QueryExecutionError(str(exc)) from exc
 
-            truncated = len(raw_rows) > limit
-            serial_rows = [[_json_value(value) for value in row] for row in raw_rows[:limit]]
+            row_truncated = len(preview_raw) > limit
+            serial_rows = [[_json_value(value) for value in row] for row in preview_raw[:limit]]
+            # Bound the preview by cell size and total bytes so a low-row-count result with a
+            # very large/wide value cannot exhaust memory or model context.
+            serial_rows, budget_truncated = self._bound_preview(serial_rows)
+            truncated = row_truncated or budget_truncated
+            spill_capped = materialized > spill_cap
 
             artifact_id: str | None = None
             artifact_ids: list[str] = []
             if truncated:
                 spill_literal = _sql_string(str(spill_path))
                 connection.execute(
-                    f"COPY ({rewritten}) TO {spill_literal} "
+                    f'COPY "{result_table}" TO {spill_literal} '
                     "(FORMAT PARQUET, COMPRESSION ZSTD)"
                 )
                 artifact = self.artifacts.register_file(
                     session.id,
                     execution_id,
-                    workspace_root,
                     spill_path,
                     lineage={
                         "change": "query_result_spill",
@@ -240,6 +308,8 @@ class QueryService:
                         "format": "parquet",
                         "preview_rows": len(serial_rows),
                         "query_truncated": True,
+                        "spill_row_count": materialized,
+                        "spill_truncated": spill_capped,
                     },
                 )
                 artifact_id = artifact.id

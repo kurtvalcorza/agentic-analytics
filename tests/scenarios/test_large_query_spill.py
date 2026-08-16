@@ -1,3 +1,4 @@
+import io
 from pathlib import Path
 
 import pyarrow as pa
@@ -66,6 +67,10 @@ async def test_large_query_returns_preview_and_spill_artifact(tmp_path: Path) ->
     assert artifact["kind"] == "dataset"
     assert artifact["media_type"] == "application/vnd.apache.parquet"
     assert artifact["metadata"]["query_truncated"] is True
-    spill_path = workspace / artifact["relative_path"]
-    assert spill_path.exists()
-    assert pq.read_table(spill_path).num_rows == rows
+    # The spill lives in the out-of-workspace archive and is retrievable through its resource.
+    assert not (workspace / artifact["relative_path"]).exists()
+    uri = artifact_result.structured_content["uri"]
+    contents = list(await server.read_resource(uri))
+    assert contents
+    spilled = pq.read_table(io.BytesIO(contents[0].content))
+    assert spilled.num_rows == rows
