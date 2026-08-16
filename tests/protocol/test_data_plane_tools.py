@@ -75,6 +75,66 @@ async def test_create_session_rejects_overlapping_active_workspace(tmp_path: Pat
 
 
 @pytest.mark.anyio
+async def test_close_session_releases_workspace_for_reuse(tmp_path: Path) -> None:
+    settings = Settings(
+        state_dir=tmp_path / "state",
+        allowed_workspace_roots=[tmp_path],
+        execution_backend="subprocess_dev",
+    )
+    server = build_server(settings)
+    first = await server.call_tool("create_session", {"workspace_root": str(tmp_path)})
+    assert first.structured_content is not None
+    session_id = first.structured_content["session_id"]
+
+    # An active session still blocks an overlapping create.
+    with pytest.raises(Exception, match="overlaps an active session"):
+        await server.call_tool("create_session", {"workspace_root": str(tmp_path)})
+
+    closed = await server.call_tool("close_session", {"session_id": session_id})
+    assert closed.structured_content is not None
+    assert closed.structured_content["status"] == "completed"
+
+    # After close, the same workspace can back a fresh session.
+    second = await server.call_tool("create_session", {"workspace_root": str(tmp_path)})
+    assert second.structured_content is not None
+    assert second.structured_content["session_id"] != session_id
+
+    # Closing is idempotent.
+    again = await server.call_tool("close_session", {"session_id": session_id})
+    assert again.structured_content is not None
+    assert again.structured_content["status"] == "completed"
+
+    # Rejects a non-terminal target status.
+    with pytest.raises(Exception, match=r"completed.*cancelled|cancelled.*completed"):
+        await server.call_tool(
+            "close_session",
+            {"session_id": second.structured_content["session_id"], "status": "active"},
+        )
+
+
+@pytest.mark.anyio
+async def test_closed_session_stays_reusable_after_restart(tmp_path: Path) -> None:
+    # A fresh server over the same persistent state_dir models a process restart: the closed
+    # status must survive so the workspace is not re-locked by stale persisted state.
+    settings = Settings(
+        state_dir=tmp_path / "state",
+        allowed_workspace_roots=[tmp_path],
+        execution_backend="subprocess_dev",
+    )
+    server = build_server(settings)
+    created = await server.call_tool("create_session", {"workspace_root": str(tmp_path)})
+    assert created.structured_content is not None
+    await server.call_tool(
+        "close_session", {"session_id": created.structured_content["session_id"]}
+    )
+
+    restarted = build_server(settings)
+    reopened = await restarted.call_tool("create_session", {"workspace_root": str(tmp_path)})
+    assert reopened.structured_content is not None
+    assert reopened.structured_content["session_id"] != created.structured_content["session_id"]
+
+
+@pytest.mark.anyio
 async def test_data_plane_tool_schemas_are_host_neutral(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
