@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,15 @@ class ArtifactRegistry:
         self.max_artifacts = max_artifacts
         self.max_artifact_bytes = max_artifact_bytes
         self.max_total_bytes = max_total_bytes
+        # Per-session lock so the read-check-write of the cumulative byte budget is atomic:
+        # concurrent spills/executions in one session cannot both observe the same remaining
+        # budget and register artifacts whose combined size exceeds max_total_bytes.
+        self._locks_guard = threading.Lock()
+        self._session_locks: dict[str, threading.Lock] = {}
+
+    def _session_lock(self, session_id: str) -> threading.Lock:
+        with self._locks_guard:
+            return self._session_locks.setdefault(session_id, threading.Lock())
 
     def archive_base(self, session_id: str, execution_id: str) -> Path:
         return self.archive_root / session_id / execution_id
@@ -160,12 +170,7 @@ class ArtifactRegistry:
                 f"artifact {resolved.name} is {stat.st_size} bytes; per-file limit is "
                 f"{self.max_artifact_bytes}"
             )
-        existing_bytes = self.session_artifact_bytes(session_id)
-        if existing_bytes + stat.st_size > self.max_total_bytes:
-            raise ArtifactLimitError(
-                f"registering {resolved.name} ({stat.st_size} bytes) would exceed the session "
-                f"artifact byte budget of {self.max_total_bytes}"
-            )
+        # Hash outside the lock (it can be expensive) then reserve budget and persist atomically.
         artifact = Artifact(
             session_id=session_id,
             execution_id=execution_id,
@@ -178,7 +183,14 @@ class ArtifactRegistry:
             lineage=lineage or {},
             metadata=metadata or {},
         )
-        return self.repository.add(artifact)
+        with self._session_lock(session_id):
+            existing_bytes = self.session_artifact_bytes(session_id)
+            if existing_bytes + stat.st_size > self.max_total_bytes:
+                raise ArtifactLimitError(
+                    f"registering {resolved.name} ({stat.st_size} bytes) would exceed the session "
+                    f"artifact byte budget of {self.max_total_bytes}"
+                )
+            return self.repository.add(artifact)
 
     def register_changes(
         self,
@@ -208,12 +220,27 @@ class ArtifactRegistry:
                     f"{self.max_artifact_bytes}"
                 )
             total_bytes += size
-        if total_bytes > self.max_total_bytes:
-            raise ArtifactLimitError(
-                f"execution produced {total_bytes} bytes of artifacts; limit is "
-                f"{self.max_total_bytes}"
-            )
 
+        # Reserve budget against the session-cumulative cap and copy under the session lock so a
+        # concurrent execution/spill in the same session cannot pass its own check against the
+        # same remaining budget and let the combined size exceed max_total_bytes.
+        with self._session_lock(session_id):
+            existing_bytes = self.session_artifact_bytes(session_id)
+            if existing_bytes + total_bytes > self.max_total_bytes:
+                raise ArtifactLimitError(
+                    f"execution would bring session artifacts to {existing_bytes + total_bytes} "
+                    f"bytes; limit is {self.max_total_bytes}"
+                )
+            return self._copy_and_register(session_id, execution_id, root, changed, before)
+
+    def _copy_and_register(
+        self,
+        session_id: str,
+        execution_id: str,
+        root: Path,
+        changed: list[str],
+        before: dict[str, FileMeta],
+    ) -> list[Artifact]:
         archive_base = self.archive_base(session_id, execution_id).resolve(strict=False)
         artifacts: list[Artifact] = []
         for relative in changed:

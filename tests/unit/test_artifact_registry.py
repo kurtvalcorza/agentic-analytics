@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from agentic_analytics.ids import EntityType, new_id
+from agentic_analytics.models import Artifact
 from agentic_analytics.repositories import ArtifactRepository
 from agentic_analytics.services.artifact_registry import (
     ArtifactLimitError,
@@ -115,6 +116,50 @@ def test_spill_byte_ceiling_reflects_remaining_session_budget(tmp_path: Path) ->
     # After consuming 6 KiB of a 10 KiB session budget, only 4 KiB remains — the ceiling drops
     # below the per-file cap so a watchdog interrupts before over-writing.
     assert registry.spill_byte_ceiling(session_id) == 10240 - 6144
+
+
+def test_concurrent_register_file_respects_session_budget(tmp_path: Path) -> None:
+    import threading
+
+    # Ten threads each register a 4 KiB file into the same session; the cumulative session cap
+    # is 10 KiB, so at most two may succeed. Without an atomic reserve-and-register, several
+    # threads read the same remaining budget and the combined size exceeds the cap.
+    registry = _registry(tmp_path, max_artifact_bytes=8192, max_total_bytes=10240)
+    session_id = new_id(EntityType.SESSION)
+    executions = [new_id(EntityType.EXECUTION) for _ in range(10)]
+    for execution_id in executions:
+        base = registry.archive_base(session_id, execution_id)
+        base.mkdir(parents=True)
+        (base / "spill.parquet").write_bytes(b"x" * 4096)
+
+    start = threading.Barrier(len(executions))
+    successes: list[Artifact] = []
+    rejections: list[ArtifactLimitError] = []
+    lock = threading.Lock()
+
+    def _worker(execution_id: str) -> None:
+        path = registry.archive_base(session_id, execution_id) / "spill.parquet"
+        start.wait()
+        try:
+            artifact = registry.register_file(session_id, execution_id, path)
+        except ArtifactLimitError as exc:
+            with lock:
+                rejections.append(exc)
+        else:
+            with lock:
+                successes.append(artifact)
+
+    threads = [threading.Thread(target=_worker, args=(eid,)) for eid in executions]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # The invariant must hold under concurrency: registered bytes never exceed the session cap.
+    assert len(successes) == 2
+    assert sum(item.size_bytes for item in successes) <= 10240
+    assert len(rejections) == 8
+    assert registry.session_artifact_bytes(session_id) <= 10240
 
 
 def test_snapshot_ignores_symlinks(tmp_path: Path) -> None:
