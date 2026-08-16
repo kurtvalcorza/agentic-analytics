@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from agentic_analytics.models import Artifact, ArtifactKind
 from agentic_analytics.repositories import ArtifactRepository
@@ -103,6 +105,15 @@ class ArtifactRegistry:
         self.max_artifacts = max_artifacts
         self.max_artifact_bytes = max_artifact_bytes
         self.max_total_bytes = max_total_bytes
+        # Per-session lock so the read-check-write of the cumulative byte budget is atomic:
+        # concurrent spills/executions in one session cannot both observe the same remaining
+        # budget and register artifacts whose combined size exceeds max_total_bytes.
+        self._locks_guard = threading.Lock()
+        self._session_locks: dict[str, threading.Lock] = {}
+
+    def _session_lock(self, session_id: str) -> threading.Lock:
+        with self._locks_guard:
+            return self._session_locks.setdefault(session_id, threading.Lock())
 
     def archive_base(self, session_id: str, execution_id: str) -> Path:
         return self.archive_root / session_id / execution_id
@@ -111,6 +122,75 @@ class ArtifactRegistry:
         return self.archive_base(artifact.session_id, artifact.execution_id or "") / (
             artifact.relative_path
         )
+
+    def session_artifact_bytes(self, session_id: str) -> int:
+        """Total bytes already registered for a session."""
+
+        return sum(item.size_bytes for item in self.repository.list(session_id))
+
+    def remaining_session_budget(self, session_id: str) -> int:
+        """Bytes a new artifact may still consume before the session-cumulative cap is hit."""
+
+        return max(0, self.max_total_bytes - self.session_artifact_bytes(session_id))
+
+    def spill_byte_ceiling(self, session_id: str) -> int:
+        """Largest a single spilled artifact may be given the per-file and remaining-session caps.
+
+        A spill watchdog uses this so a write is interrupted at the *remaining* session budget,
+        not the full cumulative ceiling, keeping the temporary file from over-writing before
+        registration would reject it.
+        """
+
+        return min(self.max_artifact_bytes, self.remaining_session_budget(session_id))
+
+    def register_file(
+        self,
+        session_id: str,
+        execution_id: str,
+        path: Path,
+        *,
+        lineage: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Artifact:
+        """Register a file already written into this execution's archive base.
+
+        The file lives outside every executable workspace, so managed code cannot later
+        corrupt it, and its archive-relative path resolves through ``archived_path``.
+        """
+
+        archive_base = self.archive_base(session_id, execution_id).resolve(strict=False)
+        resolved = path.resolve(strict=True)
+        if resolved != archive_base and archive_base not in resolved.parents:
+            raise ValueError("artifact path must remain inside the execution archive")
+        stat = resolved.stat()
+        # Enforce the same byte ceilings as workspace-file registration so a spilled query
+        # result (or any pre-written file) cannot bypass the configured artifact quotas.
+        if stat.st_size > self.max_artifact_bytes:
+            raise ArtifactLimitError(
+                f"artifact {resolved.name} is {stat.st_size} bytes; per-file limit is "
+                f"{self.max_artifact_bytes}"
+            )
+        # Hash outside the lock (it can be expensive) then reserve budget and persist atomically.
+        artifact = Artifact(
+            session_id=session_id,
+            execution_id=execution_id,
+            kind=_artifact_kind(resolved),
+            display_name=resolved.name,
+            relative_path=resolved.relative_to(archive_base).as_posix(),
+            media_type=_media_type(resolved),
+            size_bytes=stat.st_size,
+            sha256=_sha256(resolved),
+            lineage=lineage or {},
+            metadata=metadata or {},
+        )
+        with self._session_lock(session_id):
+            existing_bytes = self.session_artifact_bytes(session_id)
+            if existing_bytes + stat.st_size > self.max_total_bytes:
+                raise ArtifactLimitError(
+                    f"registering {resolved.name} ({stat.st_size} bytes) would exceed the session "
+                    f"artifact byte budget of {self.max_total_bytes}"
+                )
+            return self.repository.add(artifact)
 
     def register_changes(
         self,
@@ -140,12 +220,27 @@ class ArtifactRegistry:
                     f"{self.max_artifact_bytes}"
                 )
             total_bytes += size
-        if total_bytes > self.max_total_bytes:
-            raise ArtifactLimitError(
-                f"execution produced {total_bytes} bytes of artifacts; limit is "
-                f"{self.max_total_bytes}"
-            )
 
+        # Reserve budget against the session-cumulative cap and copy under the session lock so a
+        # concurrent execution/spill in the same session cannot pass its own check against the
+        # same remaining budget and let the combined size exceed max_total_bytes.
+        with self._session_lock(session_id):
+            existing_bytes = self.session_artifact_bytes(session_id)
+            if existing_bytes + total_bytes > self.max_total_bytes:
+                raise ArtifactLimitError(
+                    f"execution would bring session artifacts to {existing_bytes + total_bytes} "
+                    f"bytes; limit is {self.max_total_bytes}"
+                )
+            return self._copy_and_register(session_id, execution_id, root, changed, before)
+
+    def _copy_and_register(
+        self,
+        session_id: str,
+        execution_id: str,
+        root: Path,
+        changed: list[str],
+        before: dict[str, FileMeta],
+    ) -> list[Artifact]:
         archive_base = self.archive_base(session_id, execution_id).resolve(strict=False)
         artifacts: list[Artifact] = []
         for relative in changed:

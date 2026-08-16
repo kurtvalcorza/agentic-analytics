@@ -54,7 +54,14 @@ class Runtime:
         validation_runs = ValidationRunRepository(resolved.state_dir)
         workspace = WorkspaceService(resolved.normalized_allowed_roots())
         inspector = InspectorService(sources, workspace, resolved)
-        query = QueryService(sources, executions, workspace, resolved)
+        registry = ArtifactRegistry(
+            artifact_repository,
+            resolved.state_dir / "artifacts",
+            max_artifacts=resolved.max_artifacts_per_execution,
+            max_artifact_bytes=resolved.max_artifact_bytes,
+            max_total_bytes=resolved.max_total_artifact_bytes,
+        )
+        query = QueryService(sources, executions, workspace, registry, resolved)
         backend: ExecutionBackend
         if resolved.execution_backend == "docker":
             backend = DockerBackend(
@@ -66,13 +73,6 @@ class Runtime:
             )
         else:
             backend = SubprocessDevBackend()
-        registry = ArtifactRegistry(
-            artifact_repository,
-            resolved.state_dir / "artifacts",
-            max_artifacts=resolved.max_artifacts_per_execution,
-            max_artifact_bytes=resolved.max_artifact_bytes,
-            max_total_bytes=resolved.max_total_artifact_bytes,
-        )
         execution = ExecutionService(
             backend, executions, sources, registry, workspace, resolved
         )
