@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     execution_timeout_seconds: int = Field(default=120, ge=1, le=3600)
     max_execution_timeout_seconds: int = Field(default=300, ge=1, le=3600)
     max_output_chars: int = Field(default=65536, ge=1024, le=1_000_000)
+    max_artifacts_per_execution: int = Field(default=64, ge=1, le=10_000)
+    max_artifact_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
+    max_total_artifact_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
     log_level: str = "INFO"
 
     def normalized_allowed_roots(self) -> list[Path]:
