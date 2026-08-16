@@ -37,7 +37,7 @@ print('done')
 """
     try:
         record = runtime.execution.execute_python(session, code, timeout_seconds=10)
-        assert record.status.value == "succeeded"
+        assert record.status.value == "succeeded", record.stderr_preview
         assert record.stdout_preview.strip() == "done"
         assert len(record.artifact_ids) == 2
         artifacts = runtime.artifacts.list(session.id)
