@@ -32,6 +32,37 @@ Creates or resumes an analysis workspace policy context.
 }
 ```
 
+## `close_session`
+
+Transitions an active session to a terminal status, releasing its workspace so a new session can reuse it and freeing managed backend resources.
+
+### Input
+
+```json
+{
+  "session_id": "ses_...",
+  "status": "completed"
+}
+```
+
+`status` must be `completed` or `cancelled` (default `completed`).
+
+### Output
+
+```json
+{
+  "session_id": "ses_...",
+  "status": "completed",
+  "workspace_root": "/abs/workspace"
+}
+```
+
+### Requirements
+
+- The status transition is persisted durably, so a workspace is no longer treated as occupied after a server restart.
+- Backend resource cleanup is best-effort; the persisted status transition is authoritative.
+- Closing an already-terminal session is idempotent and returns its current status.
+
 ## `list_sources`
 
 Discovers supported data sources within the authorized workspace.
