@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from agentic_analytics.ids import EntityType
 from agentic_analytics.models import Artifact
 
 from .base import JsonRecordRepository
@@ -7,4 +8,4 @@ from .base import JsonRecordRepository
 
 class ArtifactRepository(JsonRecordRepository[Artifact]):
     def __init__(self, root: Path) -> None:
-        super().__init__(root, "artifacts", Artifact)
+        super().__init__(root, "artifacts", Artifact, EntityType.ARTIFACT)

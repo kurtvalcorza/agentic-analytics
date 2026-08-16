@@ -33,6 +33,7 @@ class Runtime:
     execution_backend: ExecutionBackend
     execution: ExecutionService
     evidence_ledger: EvidenceLedger
+    artifact_registry: ArtifactRegistry
 
     @classmethod
     def create(cls, settings: Settings | None = None) -> Runtime:
@@ -53,10 +54,17 @@ class Runtime:
                 memory=resolved.docker_memory,
                 cpus=resolved.docker_cpus,
                 pids_limit=resolved.docker_pids_limit,
+                max_output_chars=resolved.max_output_chars,
             )
         else:
             backend = SubprocessDevBackend()
-        registry = ArtifactRegistry(artifact_repository)
+        registry = ArtifactRegistry(
+            artifact_repository,
+            resolved.state_dir / "artifacts",
+            max_artifacts=resolved.max_artifacts_per_execution,
+            max_artifact_bytes=resolved.max_artifact_bytes,
+            max_total_bytes=resolved.max_total_artifact_bytes,
+        )
         execution = ExecutionService(
             backend, executions, sources, registry, workspace, resolved
         )
@@ -79,4 +87,5 @@ class Runtime:
             backend,
             execution,
             evidence_ledger,
+            registry,
         )

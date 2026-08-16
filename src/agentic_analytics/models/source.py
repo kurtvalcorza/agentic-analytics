@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -8,7 +7,7 @@ from pydantic import Field, model_validator
 
 from agentic_analytics.ids import EntityType, new_id
 
-from .common import CanonicalModel, utc_now
+from .common import CanonicalModel, UtcDatetime, utc_now
 
 
 class SourceKind(StrEnum):
@@ -32,7 +31,7 @@ class DataSource(CanonicalModel):
     schema_: list[dict[str, Any]] = Field(default_factory=list, alias="schema")
     row_count: int | None = Field(default=None, ge=0)
     profile: dict[str, Any] = Field(default_factory=dict)
-    registered_at: datetime = Field(default_factory=utc_now)
+    registered_at: UtcDatetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
     def require_location(self) -> DataSource:

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import mimetypes
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,12 +9,33 @@ from agentic_analytics.repositories import ArtifactRepository
 
 _INTERNAL_DIR = ".agentic-analytics"
 
+_MEDIA_TYPES: dict[str, str] = {
+    ".csv": "text/csv",
+    ".parquet": "application/vnd.apache.parquet",
+    ".json": "application/json",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".svg": "image/svg+xml",
+    ".webp": "image/webp",
+    ".html": "text/html",
+    ".md": "text/markdown",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".py": "text/x-python",
+    ".sql": "application/sql",
+}
+
+
+class ArtifactLimitError(RuntimeError):
+    pass
+
 
 @dataclass(frozen=True, slots=True)
-class FileState:
+class FileMeta:
     size_bytes: int
     mtime_ns: int
-    sha256: str
 
 
 def _sha256(path: Path) -> str:
@@ -27,18 +46,31 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def snapshot_workspace(workspace_root: Path) -> dict[str, FileState]:
+def snapshot_workspace(workspace_root: Path) -> dict[str, FileMeta]:
+    """Record cheap file metadata (size + mtime) for every workspace file.
+
+    Only metadata is captured here; contents are hashed later and only for files whose
+    metadata shows they were created or modified, so unchanged multi-gigabyte inputs are
+    never read twice per execution.
+    """
+
     root = workspace_root.resolve(strict=True)
-    snapshot: dict[str, FileState] = {}
+    snapshot: dict[str, FileMeta] = {}
     for path in root.rglob("*"):
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():
             continue
         relative = path.relative_to(root)
         if relative.parts and relative.parts[0] == _INTERNAL_DIR:
             continue
         stat = path.stat()
-        snapshot[relative.as_posix()] = FileState(stat.st_size, stat.st_mtime_ns, _sha256(path))
+        snapshot[relative.as_posix()] = FileMeta(stat.st_size, stat.st_mtime_ns)
     return snapshot
+
+
+def _media_type(path: Path) -> str:
+    # Map known suffixes explicitly rather than relying on the host MIME database, which does
+    # not always know newer types such as .parquet.
+    return _MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
 
 
 def _artifact_kind(path: Path) -> ArtifactKind:
@@ -55,46 +87,114 @@ def _artifact_kind(path: Path) -> ArtifactKind:
 
 
 class ArtifactRegistry:
-    def __init__(self, repository: ArtifactRepository) -> None:
+    def __init__(
+        self,
+        repository: ArtifactRepository,
+        archive_root: Path,
+        *,
+        max_artifacts: int = 64,
+        max_artifact_bytes: int = 100 * 1024 * 1024,
+        max_total_bytes: int = 512 * 1024 * 1024,
+    ) -> None:
         self.repository = repository
+        # The archive lives outside every executable workspace so managed code (which only
+        # sees its workspace mount) can never overwrite or delete a persisted artifact.
+        self.archive_root = archive_root.resolve(strict=False)
+        self.max_artifacts = max_artifacts
+        self.max_artifact_bytes = max_artifact_bytes
+        self.max_total_bytes = max_total_bytes
+
+    def archive_base(self, session_id: str, execution_id: str) -> Path:
+        return self.archive_root / session_id / execution_id
+
+    def archived_path(self, artifact: Artifact) -> Path:
+        return self.archive_base(artifact.session_id, artifact.execution_id or "") / (
+            artifact.relative_path
+        )
 
     def register_changes(
         self,
         session_id: str,
         execution_id: str,
         workspace_root: Path,
-        before: dict[str, FileState],
-        after: dict[str, FileState],
+        before: dict[str, FileMeta],
+        after: dict[str, FileMeta],
     ) -> list[Artifact]:
         root = workspace_root.resolve(strict=True)
         changed = sorted(
             path for path, state in after.items() if path not in before or before[path] != state
         )
-        artifacts: list[Artifact] = []
-        archive_root = root / _INTERNAL_DIR / "artifacts" / execution_id
+
+        # Enforce aggregate limits before hashing or copying so a single execution cannot
+        # exhaust host disk or keep the server busy long after its timeout.
+        if len(changed) > self.max_artifacts:
+            raise ArtifactLimitError(
+                f"execution produced {len(changed)} artifacts; limit is {self.max_artifacts}"
+            )
+        total_bytes = 0
         for relative in changed:
-            source = (root / relative).resolve(strict=True)
-            if root not in source.parents:
+            size = after[relative].size_bytes
+            if size > self.max_artifact_bytes:
+                raise ArtifactLimitError(
+                    f"artifact {relative} is {size} bytes; per-file limit is "
+                    f"{self.max_artifact_bytes}"
+                )
+            total_bytes += size
+        if total_bytes > self.max_total_bytes:
+            raise ArtifactLimitError(
+                f"execution produced {total_bytes} bytes of artifacts; limit is "
+                f"{self.max_total_bytes}"
+            )
+
+        archive_base = self.archive_base(session_id, execution_id).resolve(strict=False)
+        artifacts: list[Artifact] = []
+        for relative in changed:
+            source = (root / relative)
+            # Reject a source that resolves outside the workspace (for example a symlink managed
+            # code created that points at a host file).
+            resolved_source = source.resolve(strict=True)
+            if resolved_source != root and root not in resolved_source.parents:
                 continue
-            destination = archive_root / relative
+            if not resolved_source.is_file():
+                continue
+
+            destination = archive_base / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-            state = after[relative]
-            media_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+            # Never write through a symlinked archive destination: the resolved parent must stay
+            # beneath the (managed-inaccessible) archive base.
+            resolved_parent = destination.parent.resolve(strict=True)
+            if resolved_parent != archive_base and archive_base not in resolved_parent.parents:
+                raise ArtifactLimitError(
+                    f"artifact destination for {relative} escapes the archive root"
+                )
+
+            sha256 = _sha256(resolved_source)
+            self._copy_bytes(resolved_source, destination)
+            size_bytes = destination.stat().st_size
             artifact = Artifact(
                 session_id=session_id,
                 execution_id=execution_id,
-                kind=_artifact_kind(source),
-                display_name=source.name,
-                relative_path=destination.relative_to(root).as_posix(),
-                media_type=media_type,
-                size_bytes=state.size_bytes,
-                sha256=state.sha256,
+                kind=_artifact_kind(resolved_source),
+                display_name=resolved_source.name,
+                relative_path=relative,
+                media_type=_media_type(resolved_source),
+                size_bytes=size_bytes,
+                sha256=sha256,
                 lineage={
                     "original_relative_path": relative,
                     "change": "created" if relative not in before else "modified",
+                    "archive_root": _INTERNAL_DIR + "/artifacts",
                 },
             )
             self.repository.add(artifact)
             artifacts.append(artifact)
         return artifacts
+
+    @staticmethod
+    def _copy_bytes(source: Path, destination: Path) -> None:
+        # Copy contents without following a symlinked destination file.
+        if destination.is_symlink() or destination.exists():
+            destination.unlink()
+        with source.open("rb") as src, destination.open("wb") as dst:
+            for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                dst.write(chunk)

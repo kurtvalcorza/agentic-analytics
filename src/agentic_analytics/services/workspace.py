@@ -37,7 +37,9 @@ class WorkspaceService:
         return resolved
 
     def resolve_file(self, workspace_root: str | Path, relative_path: str | Path) -> Path:
-        root = Path(workspace_root).resolve(strict=True)
+        # Re-check the (possibly persisted) root against the current allowlist so a session
+        # whose root was later removed from configuration can no longer read its files.
+        root = self.authorize_workspace(workspace_root)
         requested = Path(relative_path)
         if requested.is_absolute():
             raise WorkspaceAuthorizationError("source paths must be relative to the workspace")
@@ -54,7 +56,7 @@ class WorkspaceService:
         return resolved
 
     def discover(self, workspace_root: str | Path, recursive: bool = True) -> list[Path]:
-        root = Path(workspace_root).resolve(strict=True)
+        root = self.authorize_workspace(workspace_root)
         iterator = root.rglob("*") if recursive else root.glob("*")
         discovered: list[Path] = []
         for candidate in iterator:
