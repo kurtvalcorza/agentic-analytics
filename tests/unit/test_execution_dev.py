@@ -2,13 +2,13 @@ from pathlib import Path
 
 import pytest
 
+from agentic_analytics.execution_backends import SubprocessDevBackend
 from agentic_analytics.models import AnalysisSession, SessionMode
 from agentic_analytics.repositories import (
     ArtifactRepository,
     ExecutionRepository,
     SourceRepository,
 )
-from agentic_analytics.execution_backends import SubprocessDevBackend
 from agentic_analytics.services.artifact_registry import ArtifactRegistry
 from agentic_analytics.services.execution import ExecutionPolicyError, ExecutionService
 from agentic_analytics.services.workspace import WorkspaceService
