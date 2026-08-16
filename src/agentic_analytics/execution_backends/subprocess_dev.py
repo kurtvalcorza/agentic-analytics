@@ -47,8 +47,16 @@ class SubprocessDevBackend:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else exc.stdout
-            stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else exc.stderr
+            stdout = (
+                exc.stdout.decode("utf-8", "replace")
+                if isinstance(exc.stdout, bytes)
+                else exc.stdout
+            )
+            stderr = (
+                exc.stderr.decode("utf-8", "replace")
+                if isinstance(exc.stderr, bytes)
+                else exc.stderr
+            )
             return BackendResult(
                 status=ExecutionStatus.TIMED_OUT,
                 stdout=stdout or "",
