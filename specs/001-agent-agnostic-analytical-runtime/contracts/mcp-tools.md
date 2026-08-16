@@ -147,6 +147,8 @@ Runs Python inside the managed execution backend.
 
 ## `register_external_execution`
 
+> ⏳ **Planned — not implemented in this release.** Deferred to a later `0.1.x`; the runtime currently reports `external_execution_registration: false` in `create_session` capabilities.
+
 Registers computation performed by the host or another environment.
 
 ### Input
@@ -239,6 +241,8 @@ Runs deterministic provenance and analytical validation.
 ```
 
 ## `challenge_analysis`
+
+> ⏳ **Planned — not implemented in this release.** Deferred to a later `0.1.x`. Deterministic validation is available today via `validate_analysis`.
 
 Runs adversarial diagnostics against the registered evidence graph and source metadata.
 
