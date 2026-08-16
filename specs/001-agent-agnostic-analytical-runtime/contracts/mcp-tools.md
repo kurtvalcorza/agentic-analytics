@@ -32,6 +32,37 @@ Creates or resumes an analysis workspace policy context.
 }
 ```
 
+## `close_session`
+
+Transitions an active session to a terminal status, releasing its workspace so a new session can reuse it and freeing managed backend resources.
+
+### Input
+
+```json
+{
+  "session_id": "ses_...",
+  "status": "completed"
+}
+```
+
+`status` must be `completed` or `cancelled` (default `completed`).
+
+### Output
+
+```json
+{
+  "session_id": "ses_...",
+  "status": "completed",
+  "workspace_root": "/abs/workspace"
+}
+```
+
+### Requirements
+
+- The status transition is persisted durably, so a workspace is no longer treated as occupied after a server restart.
+- Backend resource cleanup is best-effort; the persisted status transition is authoritative.
+- Closing an already-terminal session is idempotent and returns its current status.
+
 ## `list_sources`
 
 Discovers supported data sources within the authorized workspace.
@@ -220,12 +251,19 @@ Runs deterministic provenance and analytical validation.
 }
 ```
 
+### Requirements
+
+- `scope` selects the analytical stage under review (`final` or `interim`, default `final`) and is echoed back on the run.
+- `checks` accepts the `default`/`all` selector or an explicit array. An explicit empty array has zero coverage and is rejected rather than reported as a clean pass.
+- Unknown check names are rejected so a typo cannot silently skip every check.
+
 ### Output
 
 ```json
 {
   "validation_run_id": "vrn_...",
   "status": "blocked",
+  "scope": "final",
   "checks_run": ["evidence_coverage", "causal_language", "duplicates", "missingness"],
   "checks_skipped": [],
   "findings": [
