@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -8,7 +7,7 @@ from pydantic import Field
 
 from agentic_analytics.ids import EntityType, new_id
 
-from .common import CanonicalModel, utc_now
+from .common import CanonicalModel, UtcDatetime, utc_now
 
 
 class ValidationSeverity(StrEnum):
@@ -33,7 +32,7 @@ class ValidationRunStatus(StrEnum):
 class ValidationFinding(CanonicalModel):
     id: str = Field(default_factory=lambda: new_id(EntityType.VALIDATION))
     session_id: str
-    code: str = Field(min_length=1)
+    code: str = Field(pattern=r"^[A-Z0-9_]+$")
     severity: ValidationSeverity
     status: ValidationFindingStatus = ValidationFindingStatus.OPEN
     message: str = Field(min_length=1)
@@ -41,7 +40,7 @@ class ValidationFinding(CanonicalModel):
     check: str = Field(min_length=1)
     details: dict[str, Any] = Field(default_factory=dict)
     remediation: str | None = None
-    created_at: datetime = Field(default_factory=utc_now)
+    created_at: UtcDatetime = Field(default_factory=utc_now)
 
 
 class ValidationRun(CanonicalModel):
@@ -52,4 +51,4 @@ class ValidationRun(CanonicalModel):
     checks_run: list[str] = Field(default_factory=list)
     checks_skipped: list[str] = Field(default_factory=list)
     checks_inconclusive: list[dict[str, str]] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=utc_now)
+    created_at: UtcDatetime = Field(default_factory=utc_now)

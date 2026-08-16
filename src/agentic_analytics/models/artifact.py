@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+import re
 from enum import StrEnum
 from typing import Any
 
@@ -8,7 +8,9 @@ from pydantic import Field, field_validator
 
 from agentic_analytics.ids import EntityType, new_id
 
-from .common import CanonicalModel, utc_now
+from .common import CanonicalModel, UtcDatetime, utc_now
+
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 
 class ArtifactKind(StrEnum):
@@ -31,7 +33,7 @@ class Artifact(CanonicalModel):
     media_type: str
     size_bytes: int = Field(ge=0)
     sha256: str
-    created_at: datetime = Field(default_factory=utc_now)
+    created_at: UtcDatetime = Field(default_factory=utc_now)
     lineage: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -39,8 +41,12 @@ class Artifact(CanonicalModel):
     @classmethod
     def reject_absolute_path(cls, value: str) -> str:
         normalized = value.replace("\\", "/")
-        if normalized.startswith("/") or ":/" in normalized or normalized in {"", "."}:
+        if normalized.startswith("/") or normalized in {"", "."}:
             raise ValueError("artifact relative_path must be relative")
+        # A Windows drive component (``C:/foo`` or drive-relative ``C:foo``) escapes the
+        # artifact root because it resolves against a per-drive current directory.
+        if _WINDOWS_DRIVE_RE.match(normalized):
+            raise ValueError("artifact relative_path must not include a drive component")
         if ".." in normalized.split("/"):
             raise ValueError("artifact relative_path must not traverse parents")
         return normalized

@@ -105,17 +105,22 @@ class InspectorService:
                 {"name": str(column[0]), "type": str(column[1]), "nullable": True}
                 for column in (cursor.description or [])
             ]
-            row = connection.execute(f"SELECT count(*) FROM {relation}", [str(path)]).fetchone()
-            row_count = int(row[0] if row else 0)
-            null_counts: dict[str, int] = {}
-            for item in schema[: self.settings.max_profile_columns]:
-                name = str(item["name"])
-                quoted = '"' + name.replace('"', '""') + '"'
-                value = connection.execute(
-                    f"SELECT count(*) FILTER (WHERE {quoted} IS NULL) FROM {relation}",
-                    [str(path)],
-                ).fetchone()
-                null_counts[name] = int(value[0] if value else 0)
+            # Compute row count and every column's null count in a single scan of the source
+            # instead of one aggregate query per column (previously up to max_profile_columns
+            # full scans), which made wide files effectively un-inspectable.
+            profiled = schema[: self.settings.max_profile_columns]
+            select_parts = ["count(*) AS __row_count"]
+            for index, item in enumerate(profiled):
+                quoted = '"' + str(item["name"]).replace('"', '""') + '"'
+                select_parts.append(f"count(*) FILTER (WHERE {quoted} IS NULL) AS __null_{index}")
+            aggregate = connection.execute(
+                f"SELECT {', '.join(select_parts)} FROM {relation}", [str(path)]
+            ).fetchone()
+            row_count = int(aggregate[0]) if aggregate else 0
+            null_counts: dict[str, int] = {
+                str(item["name"]): int(aggregate[index + 1]) if aggregate else 0
+                for index, item in enumerate(profiled)
+            }
             distinct = connection.execute(
                 f"SELECT count(*) FROM (SELECT DISTINCT * FROM {relation})", [str(path)]
             ).fetchone()

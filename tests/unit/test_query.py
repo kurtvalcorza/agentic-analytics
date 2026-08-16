@@ -2,15 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from agentic_analytics.models import AnalysisSession
+from agentic_analytics.models import AnalysisSession, ExecutionStatus
 from agentic_analytics.repositories import ExecutionRepository, SourceRepository
 from agentic_analytics.services.inspector import InspectorService
-from agentic_analytics.services.query import QueryRejected, QueryService
-from agentic_analytics.services.workspace import WorkspaceService
+from agentic_analytics.services.query import QueryExecutionError, QueryRejected, QueryService
+from agentic_analytics.services.workspace import WorkspaceAuthorizationError, WorkspaceService
 from agentic_analytics.settings import Settings
 
 
-def _services(tmp_path: Path):
+def _services(tmp_path: Path, *, max_query_rows: int = 2):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "sample.csv").write_text("region,value\nNCR,1\nCAR,2\nNCR,3\n", encoding="utf-8")
@@ -18,7 +18,7 @@ def _services(tmp_path: Path):
         state_dir=tmp_path / "state",
         workspace_base_dir=tmp_path / "generated",
         allowed_workspace_roots=[workspace],
-        max_query_rows=2,
+        max_query_rows=max_query_rows,
     )
     sources = SourceRepository(settings.state_dir)
     executions = ExecutionRepository(settings.state_dir)
@@ -27,11 +27,11 @@ def _services(tmp_path: Path):
     query = QueryService(sources, executions, workspace_service, settings)
     session = AnalysisSession(workspace_root=str(workspace))
     source, _ = inspector.inspect(session, "sample.csv")
-    return session, source, query, executions
+    return session, source, query, executions, workspace
 
 
 def test_query_is_bounded_and_persists_execution(tmp_path: Path) -> None:
-    session, source, query, executions = _services(tmp_path)
+    session, source, query, executions, _ = _services(tmp_path)
     sql = f"SELECT * FROM source('{source.id}') ORDER BY value"
     result = query.execute(session, sql, max_rows=2)
     assert result["row_count_returned"] == 2
@@ -42,7 +42,7 @@ def test_query_is_bounded_and_persists_execution(tmp_path: Path) -> None:
 
 
 def test_query_blocks_external_access_and_writes(tmp_path: Path) -> None:
-    session, source, query, _ = _services(tmp_path)
+    session, source, query, _, _ = _services(tmp_path)
     with pytest.raises(QueryRejected):
         query.execute(session, "SELECT * FROM read_csv('/etc/passwd')")
     with pytest.raises(QueryRejected):
@@ -51,3 +51,62 @@ def test_query_blocks_external_access_and_writes(tmp_path: Path) -> None:
         query.execute(session, f"DROP TABLE source('{source.id}')")
     with pytest.raises(QueryRejected):
         query.execute(session, "SELECT 1")
+    with pytest.raises(QueryRejected):
+        query.execute(session, f"EXPLAIN SELECT * FROM source('{source.id}')")
+
+
+def test_query_allows_forbidden_tokens_inside_literals(tmp_path: Path) -> None:
+    session, source, query, _, _ = _services(tmp_path, max_query_rows=100)
+    result = query.execute(
+        session, f"SELECT * FROM source('{source.id}') WHERE region = 'update'"
+    )
+    assert result["row_count_returned"] == 0
+    assert result["truncated"] is False
+
+
+def test_query_rejects_source_modified_after_inspection(tmp_path: Path) -> None:
+    session, source, query, _, workspace = _services(tmp_path, max_query_rows=100)
+    (workspace / "sample.csv").write_text("region,value\nNCR,9\n", encoding="utf-8")
+    with pytest.raises(QueryRejected, match="changed since inspection"):
+        query.execute(session, f"SELECT * FROM source('{source.id}')")
+
+
+def test_query_persists_failed_execution_record(tmp_path: Path) -> None:
+    session, source, query, executions, _ = _services(tmp_path, max_query_rows=100)
+    with pytest.raises(QueryExecutionError):
+        query.execute(session, f"SELECT missing_column FROM source('{source.id}')")
+    records = executions.list(session.id)
+    assert any(record.status is ExecutionStatus.FAILED for record in records)
+    failed = next(record for record in records if record.status is ExecutionStatus.FAILED)
+    assert failed.completed_at is not None
+    assert failed.error is not None
+
+
+def test_query_view_names_cannot_be_shadowed_by_cte(tmp_path: Path) -> None:
+    session, source, query, _, _ = _services(tmp_path, max_query_rows=100)
+    sql = (
+        f"WITH _source_0 AS (SELECT 999 AS value) "
+        f"SELECT value FROM source('{source.id}') ORDER BY value"
+    )
+    result = query.execute(session, sql)
+    assert result["rows"] == [[1], [2], [3]]
+
+
+def test_query_reauthorizes_workspace_root(tmp_path: Path) -> None:
+    session, source, _, executions, _ = _services(tmp_path, max_query_rows=100)
+    # A service whose allowlist no longer contains the session root must refuse to read.
+    narrowed = WorkspaceService([tmp_path / "elsewhere"])
+    (tmp_path / "elsewhere").mkdir()
+    query = QueryService(
+        SourceRepository(tmp_path / "state"),
+        executions,
+        narrowed,
+        Settings(
+            state_dir=tmp_path / "state",
+            workspace_base_dir=tmp_path / "generated",
+            allowed_workspace_roots=[tmp_path / "elsewhere"],
+            max_query_rows=100,
+        ),
+    )
+    with pytest.raises(WorkspaceAuthorizationError):
+        query.execute(session, f"SELECT * FROM source('{source.id}')")

@@ -13,7 +13,7 @@ def register_execution_tools(server: MCPServer[Any], runtime: Runtime) -> None:
         session_id: str,
         code: str,
         source_ids: list[str] | None = None,
-        timeout_seconds: int = 120,
+        timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         session = runtime.sessions.get(session_id, session_id)
         record = runtime.execution.execute_python(
@@ -40,9 +40,11 @@ def register_execution_tools(server: MCPServer[Any], runtime: Runtime) -> None:
             "count": len(artifacts),
         }
 
-    @server.tool(description="Return canonical artifact metadata and a host-neutral resource URI.")
+    @server.tool(description="Return canonical artifact metadata and a resolvable resource URI.")
     def get_artifact(session_id: str, artifact_id: str) -> dict[str, Any]:
         artifact = runtime.artifacts.get(session_id, artifact_id)
+        # This URI is backed by a registered MCP resource (see build_server), so an MCP-only
+        # client can read the artifact bytes without host filesystem access.
         return {
             "artifact": artifact.model_dump(mode="json"),
             "uri": f"agentic-analytics://sessions/{session_id}/artifacts/{artifact_id}",
