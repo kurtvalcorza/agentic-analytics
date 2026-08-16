@@ -43,7 +43,10 @@ print('done')
         artifacts = runtime.artifacts.list(session.id)
         assert {artifact.kind.value for artifact in artifacts} == {"chart", "dataset"}
         assert all(len(artifact.sha256) == 64 for artifact in artifacts)
-        assert all(artifact.relative_path.startswith(".agentic-analytics/artifacts/") for artifact in artifacts)
+        assert all(
+            artifact.relative_path.startswith(".agentic-analytics/artifacts/")
+            for artifact in artifacts
+        )
     finally:
         runtime.execution_backend.close_session(session.id)
 
@@ -54,5 +57,7 @@ def test_managed_execution_timeout_destroys_runaway_container(tmp_path: Path) ->
     runtime = _runtime(tmp_path, workspace, timeout=1)
     session = AnalysisSession(workspace_root=str(workspace), mode=SessionMode.STRICT)
     runtime.sessions.add(session)
-    record = runtime.execution.execute_python(session, "while True:\n    pass\n", timeout_seconds=1)
+    record = runtime.execution.execute_python(
+        session, "while True:\n    pass\n", timeout_seconds=1
+    )
     assert record.status.value == "timed_out"
