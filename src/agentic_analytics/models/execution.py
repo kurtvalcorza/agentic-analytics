@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -8,7 +7,7 @@ from pydantic import Field, model_validator
 
 from agentic_analytics.ids import EntityType, new_id
 
-from .common import CanonicalModel, utc_now
+from .common import CanonicalModel, UtcDatetime, utc_now
 
 
 class ExecutionType(StrEnum):
@@ -44,8 +43,8 @@ class ExecutionRecord(CanonicalModel):
     request: dict[str, Any]
     source_ids: list[str] = Field(default_factory=list)
     source_fingerprints: dict[str, Any] = Field(default_factory=dict)
-    started_at: datetime = Field(default_factory=utc_now)
-    completed_at: datetime | None = None
+    started_at: UtcDatetime = Field(default_factory=utc_now)
+    completed_at: UtcDatetime | None = None
     runtime: dict[str, Any] = Field(default_factory=dict)
     stdout_preview: str = ""
     stderr_preview: str = ""
