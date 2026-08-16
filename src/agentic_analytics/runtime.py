@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from .execution_backends import DockerBackend, ExecutionBackend, SubprocessDevBackend
 from .repositories import (
     ArtifactRepository,
+    EvidenceRepository,
     ExecutionRepository,
     SessionRepository,
     SourceRepository,
 )
 from .services.artifact_registry import ArtifactRegistry
+from .services.evidence_ledger import EvidenceLedger
 from .services.execution import ExecutionService
 from .services.inspector import InspectorService
 from .services.query import QueryService
@@ -24,11 +26,13 @@ class Runtime:
     sources: SourceRepository
     executions: ExecutionRepository
     artifacts: ArtifactRepository
+    evidence: EvidenceRepository
     workspace: WorkspaceService
     inspector: InspectorService
     query: QueryService
     execution_backend: ExecutionBackend
     execution: ExecutionService
+    evidence_ledger: EvidenceLedger
     artifact_registry: ArtifactRegistry
 
     @classmethod
@@ -39,6 +43,7 @@ class Runtime:
         sources = SourceRepository(resolved.state_dir)
         executions = ExecutionRepository(resolved.state_dir)
         artifact_repository = ArtifactRepository(resolved.state_dir)
+        evidence_repository = EvidenceRepository(resolved.state_dir)
         workspace = WorkspaceService(resolved.normalized_allowed_roots())
         inspector = InspectorService(sources, workspace, resolved)
         query = QueryService(sources, executions, workspace, resolved)
@@ -63,16 +68,24 @@ class Runtime:
         execution = ExecutionService(
             backend, executions, sources, registry, workspace, resolved
         )
+        evidence_ledger = EvidenceLedger(
+            evidence_repository,
+            sources,
+            executions,
+            artifact_repository,
+        )
         return cls(
             resolved,
             sessions,
             sources,
             executions,
             artifact_repository,
+            evidence_repository,
             workspace,
             inspector,
             query,
             backend,
             execution,
+            evidence_ledger,
             registry,
         )
