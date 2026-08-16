@@ -47,10 +47,16 @@ async def test_tools_complete_csv_discovery_and_query(tmp_path: Path) -> None:
     listed = await server.call_tool("list_sources", {"session_id": session_id})
     assert listed.structured_content is not None
     assert listed.structured_content["count"] == 1
+    assert listed.structured_content["truncated"] is False
+    assert listed.structured_content["total_discovered"] == 1
     inspected = await server.call_tool(
         "inspect_source", {"session_id": session_id, "source": "data.csv", "sample_rows": 2}
     )
     assert inspected.structured_content is not None
+    # Inspection statistics are nested under `profile` per the canonical contract.
+    profile = inspected.structured_content["profile"]
+    assert "null_counts" in profile
+    assert "duplicate_row_count" in profile
     source_id = inspected.structured_content["source_id"]
     queried = await server.call_tool(
         "query_data",

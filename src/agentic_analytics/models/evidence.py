@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -9,7 +8,7 @@ from pydantic import Field, model_validator
 
 from agentic_analytics.ids import EntityType, new_id
 
-from .common import CanonicalModel, utc_now
+from .common import CanonicalModel, UtcDatetime, utc_now
 
 
 class EvidenceClassification(StrEnum):
@@ -32,8 +31,7 @@ class EvidenceItem(CanonicalModel):
     value: Any | None = None
     units: str | None = None
     method_summary: str | None = None
-    created_at: datetime = Field(default_factory=utc_now)
-    created_by: dict[str, Any] = Field(default_factory=dict)
+    created_at: UtcDatetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
     def validate_classification_links(self) -> EvidenceItem:

@@ -16,8 +16,11 @@ class Settings(BaseSettings):
     max_sample_rows: int = Field(default=100, ge=1, le=1000)
     max_query_rows: int = Field(default=200, ge=1, le=10_000)
     max_profile_columns: int = Field(default=200, ge=1, le=2000)
+    max_discovered_sources: int = Field(default=500, ge=1, le=100_000)
+    query_timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
+    query_memory_limit: str = Field(default="1GB")
     execution_backend: Literal["docker", "subprocess_dev"] = "docker"
-    docker_image: str = "agentic-analytics-exec:test"
+    docker_image: str = "agentic-analytics-exec:dev"
     docker_memory: str = "1g"
     docker_cpus: float = Field(default=1.0, gt=0, le=8)
     docker_pids_limit: int = Field(default=128, ge=16, le=4096)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -9,7 +8,7 @@ from pydantic import Field, field_validator
 
 from agentic_analytics.ids import PROTOCOL_VERSION, EntityType, is_canonical_id, new_id
 
-from .common import CanonicalModel, utc_now
+from .common import CanonicalModel, UtcDatetime, utc_now
 
 
 class SessionMode(StrEnum):
@@ -26,8 +25,8 @@ class SessionStatus(StrEnum):
 
 class AnalysisSession(CanonicalModel):
     id: str = Field(default_factory=lambda: new_id(EntityType.SESSION))
-    created_at: datetime = Field(default_factory=utc_now)
-    updated_at: datetime = Field(default_factory=utc_now)
+    created_at: UtcDatetime = Field(default_factory=utc_now)
+    updated_at: UtcDatetime = Field(default_factory=utc_now)
     workspace_root: str
     mode: SessionMode = SessionMode.STRICT
     status: SessionStatus = SessionStatus.ACTIVE
