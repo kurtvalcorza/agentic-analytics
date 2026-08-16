@@ -51,4 +51,5 @@ class ValidationRun(CanonicalModel):
     finding_ids: list[str] = Field(default_factory=list)
     checks_run: list[str] = Field(default_factory=list)
     checks_skipped: list[str] = Field(default_factory=list)
+    checks_inconclusive: list[dict[str, str]] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
