@@ -120,7 +120,8 @@ class DockerBackend:
             timeout=60,
         )
         if result.returncode != 0:
-            raise DockerExecutionError(result.stderr.strip() or "failed to create execution container")
+            message = result.stderr.strip() or "failed to create execution container"
+            raise DockerExecutionError(message)
         return name
 
     def execute(
