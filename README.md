@@ -13,6 +13,48 @@ The product boundary is the MCP protocol, not a host-specific plugin. Core corre
 - Support both strict managed execution and explicitly marked permissive host-native execution.
 - Remain portable across MCP-capable agents.
 
+## Quickstart
+
+Requires Python 3.12+ and, for sandboxed execution, Docker.
+
+```bash
+# Install
+python -m pip install -e '.[dev]'
+
+# Build the managed-execution sandbox image (used by strict-mode execute_python)
+docker build -t agentic-analytics-exec:dev -f docker/Dockerfile.exec .
+
+# Run the MCP server over stdio. By default the current directory is the authorized
+# workspace, so start it from the folder that holds your CSV/Parquet data:
+cd /path/to/your/data
+agentic-analytics
+```
+
+Register it with your MCP client (e.g. Claude Code or Codex). The `env` allowlist
+authorizes exactly which local directories the server may read:
+
+```json
+{
+  "mcpServers": {
+    "agentic-analytics": {
+      "command": "agentic-analytics",
+      "env": {
+        "AGENTIC_ANALYTICS_ALLOWED_WORKSPACE_ROOTS": "[\"/path/to/your/data\"]"
+      }
+    }
+  }
+}
+```
+
+For a quick local trial without Docker, use the development backend — permissive
+sessions only, **not isolated, never for untrusted code**:
+
+```bash
+export AGENTIC_ANALYTICS_EXECUTION_BACKEND=subprocess_dev
+```
+
+Then ask your agent to inspect and analyze the data — see [How it works](#how-it-works) for the tool flow.
+
 ## Implemented capabilities
 
 The runtime exposes a versioned MCP tool surface over a host-neutral core:
