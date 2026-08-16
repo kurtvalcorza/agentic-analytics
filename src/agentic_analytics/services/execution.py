@@ -10,6 +10,7 @@ from agentic_analytics.models import (
     AnalysisSession,
     ExecutionRecord,
     ExecutionStatus,
+    ExecutionType,
     SessionMode,
 )
 from agentic_analytics.repositories import ExecutionRepository, SourceRepository
@@ -99,7 +100,7 @@ class ExecutionService:
         record = ExecutionRecord(
             id=execution_id,
             session_id=session.id,
-            execution_type="managed_python",
+            execution_type=ExecutionType.MANAGED_PYTHON,
             status=result.status,
             request={"code": code, "source_ids": source_ids, "timeout_seconds": timeout},
             source_ids=source_ids,
