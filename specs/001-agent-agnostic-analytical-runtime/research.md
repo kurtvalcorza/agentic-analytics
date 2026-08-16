@@ -1,5 +1,12 @@
 # Research: Agent-Agnostic Analytical Runtime
 
+> **Prior art.** Several decisions below reference **DeepAnalyze: Agentic Large Language
+> Models for Autonomous Data Science** (Zhang, Fan, Fan, Li & Du, 2025,
+> [arXiv:2510.16872](https://arxiv.org/abs/2510.16872),
+> [code](https://github.com/ruc-datalab/DeepAnalyze), MIT-licensed) as motivating prior
+> work. Agentic Analytics is an independent, MCP-native runtime informed by that research,
+> not a port of it. See the Acknowledgements in the project README for citation details.
+
 ## Decision 1 — MCP is the canonical integration boundary
 
 **Decision**: Implement the durable analytical interface as an MCP server. Treat Codex, Claude Code, Antigravity, and other coding agents as clients rather than architectural dependencies.
