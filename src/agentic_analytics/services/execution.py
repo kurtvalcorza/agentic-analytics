@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,7 @@ class ExecutionService:
                 "message": stderr or f"execution ended with status {result.status.value}",
                 "exit_code": result.exit_code,
             }
+        completed_at = datetime.now(UTC) if result.status.terminal else None
         record = ExecutionRecord(
             id=execution_id,
             session_id=session.id,
@@ -102,7 +104,7 @@ class ExecutionService:
             request={"code": code, "source_ids": source_ids, "timeout_seconds": timeout},
             source_ids=source_ids,
             source_fingerprints=source_fingerprints,
-            completed_at=None if not result.status.terminal else __import__("datetime").datetime.now(__import__("datetime").UTC),
+            completed_at=completed_at,
             runtime=result.runtime,
             stdout_preview=stdout,
             stderr_preview=stderr,
