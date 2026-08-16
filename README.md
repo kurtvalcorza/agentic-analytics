@@ -49,6 +49,18 @@ agentic-analytics
 
 The implementation targets the current stable MCP Python SDK v2 line.
 
+## Relationship to DeepAnalyze
+
+[DeepAnalyze](https://arxiv.org/abs/2510.16872) puts the intelligence and the analytical environment inside a single trained model (DeepAnalyze-8B) that autonomously drives the data-science pipeline. Agentic Analytics deliberately separates those concerns: it is the portable, MCP-native analytical **environment and evidence contract** — data inspection, sandboxed query and execution, source → execution → artifact → evidence provenance, and deterministic validation — that *any* MCP-capable coding agent can drive.
+
+The two are complementary rather than equivalent:
+
+- **Planning and autonomy** live in the calling agent, not in this runtime. Agentic Analytics has no agent loop or planner of its own; it exposes tools and enforces contracts.
+- **Rigor lives in the runtime.** Provenance and validation are deterministic and independent of model self-review — a trust layer DeepAnalyze's autonomous framing does not emphasize.
+- **Scope.** The runtime covers inspection, query, managed execution (including modeling and visualization through code), artifacts, evidence, and validation. It does not attempt autonomous end-to-end pipelines or turnkey report generation; those remain the agent's responsibility.
+
+In short: DeepAnalyze is an autonomous data scientist; Agentic Analytics is the shared, verifiable environment that such an agent — or any coding agent — can work in.
+
 ## Acknowledgements
 
 This project is informed by research on agentic systems for autonomous data
