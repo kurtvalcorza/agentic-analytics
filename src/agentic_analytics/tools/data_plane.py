@@ -28,7 +28,12 @@ def register_data_plane_tools(server: MCPServer[Any], runtime: Runtime) -> None:
     @server.tool(description="Discover CSV and Parquet sources inside an authorized workspace.")
     def list_sources(session_id: str, recursive: bool = True) -> dict[str, Any]:
         session = runtime.sessions.get(session_id, session_id)
-        paths = runtime.workspace.discover(session.workspace_root, recursive=recursive)
+        discovered = runtime.workspace.discover(session.workspace_root, recursive=recursive)
+        # Bound the model-facing response so a workspace with very many files cannot produce
+        # an arbitrarily large descriptor array.
+        limit = runtime.settings.max_discovered_sources
+        total_discovered = len(discovered)
+        paths = discovered[:limit]
         registered = {source.relative_path: source for source in runtime.sources.list(session.id)}
         items = []
         for path in paths:
@@ -44,7 +49,13 @@ def register_data_plane_tools(server: MCPServer[Any], runtime: Runtime) -> None:
                     "registered": existing is not None,
                 }
             )
-        return {"sources": items, "count": len(items)}
+        return {
+            "sources": items,
+            "count": len(items),
+            "total_discovered": total_discovered,
+            "truncated": total_discovered > len(items),
+            "omitted": total_discovered - len(items),
+        }
 
     @server.tool(
         description="Register and inspect one CSV or Parquet source with bounded profiling."
@@ -62,7 +73,15 @@ def register_data_plane_tools(server: MCPServer[Any], runtime: Runtime) -> None:
             "source_id": record.id,
             "kind": record.kind.value,
             "fingerprint": record.fingerprint,
-            **result,
+            "schema": result["schema"],
+            "row_count": result["row_count"],
+            "profile": {
+                "null_counts": result["null_counts"],
+                "duplicate_row_count": result["duplicate_row_count"],
+                "profile_truncated": result["profile_truncated"],
+            },
+            "sample": result["sample"],
+            "sample_truncated": result["sample_truncated"],
         }
 
     @server.tool(description="Run bounded read-only DuckDB SQL over registered session sources.")
