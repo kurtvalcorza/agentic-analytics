@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -36,6 +37,12 @@ class DockerBackend:
 
     def _container_name(self, session_id: str) -> str:
         return f"agentic-analytics-{self._session_suffix(session_id)}"
+
+    @staticmethod
+    def _user_args() -> list[str]:
+        if os.name != "posix":
+            return []
+        return ["--user", f"{os.getuid()}:{os.getgid()}"]
 
     @staticmethod
     def _run(
@@ -93,6 +100,7 @@ class DockerBackend:
                 "--security-opt",
                 "no-new-privileges:true",
                 "--read-only",
+                *self._user_args(),
                 "--tmpfs",
                 "/tmp:rw,nosuid,nodev,size=128m",
                 "--memory",
