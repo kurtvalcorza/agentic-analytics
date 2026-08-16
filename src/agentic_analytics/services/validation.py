@@ -4,6 +4,7 @@ from pathlib import Path
 
 from agentic_analytics.models import (
     AnalysisSession,
+    ValidationFinding,
     ValidationRun,
     ValidationRunStatus,
     ValidationSeverity,
@@ -38,7 +39,7 @@ class ValidationService:
         *,
         claim_texts: list[str] | None = None,
         checks: list[str] | None = None,
-    ) -> tuple[ValidationRun, list[object]]:
+    ) -> tuple[ValidationRun, list[ValidationFinding]]:
         selected = set(checks or [validator.name for validator in self.validators])
         context = ValidationContext(
             session=session,
@@ -47,7 +48,7 @@ class ValidationService:
             workspace_root=Path(session.workspace_root).resolve(strict=True),
             claim_texts=claim_texts or [],
         )
-        all_findings = []
+        all_findings: list[ValidationFinding] = []
         checks_run: list[str] = []
         checks_skipped: list[str] = []
         checks_inconclusive: list[dict[str, str]] = []
