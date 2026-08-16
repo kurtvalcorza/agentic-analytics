@@ -159,3 +159,7 @@ This project is developed with AI coding assistants under human direction:
 - Review-finding remediation, security/robustness hardening, and documentation were done with **Anthropic Claude** (via Claude Code).
 
 The maintainer directs the work and is responsible for all changes. AI contributions are attributed per-commit via `Co-Authored-By` trailers, and every change lands through pull requests gated by CI (ruff, mypy, tests, and the sandbox image build).
+
+## License
+
+Released under the MIT License. See [LICENSE](LICENSE).
