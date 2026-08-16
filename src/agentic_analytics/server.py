@@ -8,6 +8,7 @@ from .ids import PROTOCOL_VERSION
 from .runtime import Runtime
 from .settings import Settings
 from .tools.data_plane import register_data_plane_tools
+from .tools.execution import register_execution_tools
 
 
 def build_server(settings: Settings | None = None) -> MCPServer[Any]:
@@ -21,6 +22,7 @@ def build_server(settings: Settings | None = None) -> MCPServer[Any]:
         ),
     )
     register_data_plane_tools(server, runtime)
+    register_execution_tools(server, runtime)
     return server
 
 

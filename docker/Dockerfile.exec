@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg \
+    HOME=/tmp \
+    MPLCONFIGDIR=/tmp/matplotlib
+
+RUN python -m pip install --no-cache-dir \
+    duckdb==1.5.5 \
+    matplotlib==3.11.1 \
+    numpy==2.5.2 \
+    pandas==3.0.5 \
+    pyarrow==23.0.1 \
+    scikit-learn==1.9.0 \
+    scipy==1.18.0 \
+    statsmodels==0.14.6
+
+WORKDIR /workspace
+CMD ["python", "-c", "import time; time.sleep(2147483647)"]
