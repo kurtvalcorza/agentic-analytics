@@ -1,17 +1,45 @@
 from __future__ import annotations
 
+import contextlib
+from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
 
-from agentic_analytics.models import AnalysisSession, SessionMode
+from agentic_analytics.models import AnalysisSession, SessionMode, SessionStatus
+from agentic_analytics.models.common import utc_now
 from agentic_analytics.runtime import Runtime
+
+# Terminal statuses a client may transition an active session into via close_session.
+_CLOSE_STATUSES = {SessionStatus.COMPLETED, SessionStatus.CANCELLED}
+
+
+class WorkspaceOverlapError(PermissionError):
+    pass
+
+
+def _reject_overlapping_active_sessions(runtime: Runtime, root: Path) -> None:
+    """Refuse a workspace that overlaps an active session's root.
+
+    Two active sessions sharing (or nesting under) a workspace would each mount it read-write,
+    giving one session's managed code direct access to the other's files and outputs.
+    """
+
+    for existing in runtime.sessions.list_all():
+        if existing.status is not SessionStatus.ACTIVE:
+            continue
+        other = Path(existing.workspace_root)
+        if root == other or root in other.parents or other in root.parents:
+            raise WorkspaceOverlapError(
+                "workspace overlaps an active session; close it or use a disjoint workspace"
+            )
 
 
 def register_data_plane_tools(server: MCPServer[Any], runtime: Runtime) -> None:
     @server.tool(description="Create an authorized analysis session for a local workspace.")
     def create_session(workspace_root: str = ".", mode: str = "strict") -> dict[str, Any]:
         authorized = runtime.workspace.authorize_workspace(workspace_root)
+        _reject_overlapping_active_sessions(runtime, authorized)
         session = AnalysisSession(workspace_root=str(authorized), mode=SessionMode(mode))
         runtime.sessions.add(session)
         return {
@@ -19,10 +47,39 @@ def register_data_plane_tools(server: MCPServer[Any], runtime: Runtime) -> None:
             "mode": session.mode.value,
             "protocol_version": session.protocol_version,
             "capabilities": {
-                "managed_python": False,
+                # Derived from the configured backend so clients see the tool as available when
+                # a conformant managed backend (e.g. Docker) is configured.
+                "managed_python": runtime.execution_backend.conformant,
                 "duckdb": True,
                 "external_execution_registration": False,
             },
+        }
+
+    @server.tool(
+        description=(
+            "Close an analysis session, releasing its workspace so a new session can reuse it "
+            "and freeing managed backend resources. Status must be 'completed' or 'cancelled'."
+        )
+    )
+    def close_session(session_id: str, status: str = "completed") -> dict[str, Any]:
+        requested = SessionStatus(status)
+        if requested not in _CLOSE_STATUSES:
+            raise ValueError("close status must be 'completed' or 'cancelled'")
+        session = runtime.sessions.get(session_id, session_id)
+        if session.status is SessionStatus.ACTIVE:
+            # Persist the terminal status first: this is the durable, authoritative transition
+            # that releases the workspace overlap lock (survives a server restart). Backend
+            # cleanup is best-effort — a missing or unavailable daemon must not wedge a session
+            # in ACTIVE forever, since ephemeral containers already self-remove via --rm.
+            session.status = requested
+            session.updated_at = utc_now()
+            runtime.sessions.update(session)
+            with contextlib.suppress(Exception):
+                runtime.execution_backend.close_session(session.id)
+        return {
+            "session_id": session.id,
+            "status": session.status.value,
+            "workspace_root": session.workspace_root,
         }
 
     @server.tool(description="Discover CSV and Parquet sources inside an authorized workspace.")

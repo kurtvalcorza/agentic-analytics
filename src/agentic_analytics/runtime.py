@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .repositories import ExecutionRepository, SessionRepository, SourceRepository
+from .execution_backends import DockerBackend, ExecutionBackend, SubprocessDevBackend
+from .repositories import (
+    ArtifactRepository,
+    ExecutionRepository,
+    SessionRepository,
+    SourceRepository,
+)
+from .services.artifact_registry import ArtifactRegistry
+from .services.execution import ExecutionService
 from .services.inspector import InspectorService
 from .services.query import QueryService
 from .services.workspace import WorkspaceService
@@ -15,9 +23,13 @@ class Runtime:
     sessions: SessionRepository
     sources: SourceRepository
     executions: ExecutionRepository
+    artifacts: ArtifactRepository
     workspace: WorkspaceService
     inspector: InspectorService
     query: QueryService
+    execution_backend: ExecutionBackend
+    execution: ExecutionService
+    artifact_registry: ArtifactRegistry
 
     @classmethod
     def create(cls, settings: Settings | None = None) -> Runtime:
@@ -26,7 +38,41 @@ class Runtime:
         sessions = SessionRepository(resolved.state_dir)
         sources = SourceRepository(resolved.state_dir)
         executions = ExecutionRepository(resolved.state_dir)
+        artifact_repository = ArtifactRepository(resolved.state_dir)
         workspace = WorkspaceService(resolved.normalized_allowed_roots())
         inspector = InspectorService(sources, workspace, resolved)
         query = QueryService(sources, executions, workspace, resolved)
-        return cls(resolved, sessions, sources, executions, workspace, inspector, query)
+        backend: ExecutionBackend
+        if resolved.execution_backend == "docker":
+            backend = DockerBackend(
+                resolved.docker_image,
+                memory=resolved.docker_memory,
+                cpus=resolved.docker_cpus,
+                pids_limit=resolved.docker_pids_limit,
+                max_output_chars=resolved.max_output_chars,
+            )
+        else:
+            backend = SubprocessDevBackend()
+        registry = ArtifactRegistry(
+            artifact_repository,
+            resolved.state_dir / "artifacts",
+            max_artifacts=resolved.max_artifacts_per_execution,
+            max_artifact_bytes=resolved.max_artifact_bytes,
+            max_total_bytes=resolved.max_total_artifact_bytes,
+        )
+        execution = ExecutionService(
+            backend, executions, sources, registry, workspace, resolved
+        )
+        return cls(
+            resolved,
+            sessions,
+            sources,
+            executions,
+            artifact_repository,
+            workspace,
+            inspector,
+            query,
+            backend,
+            execution,
+            registry,
+        )
