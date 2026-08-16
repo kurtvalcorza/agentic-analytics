@@ -192,6 +192,26 @@ def test_preview_first_row_stays_within_byte_budget(tmp_path: Path) -> None:
     assert all(len(cell) <= 8192 for cell in result["rows"][0])
 
 
+def test_preview_bounds_wide_non_string_row(tmp_path: Path) -> None:
+    session, source, query, _, _, _ = _services(tmp_path, max_query_rows=100)
+    import json
+
+    from agentic_analytics.settings import Settings as _Settings
+
+    budget = _Settings().max_result_preview_bytes
+    # A single row with far more (non-shrinkable integer) columns than the preview column cap.
+    columns = ", ".join(f"{index} AS c{index}" for index in range(2000))
+    result = query.execute(session, f"SELECT {columns} FROM source('{source.id}') LIMIT 1")
+    assert result["row_count_returned"] == 1
+    # Column metadata is bounded, and dropping columns marks the preview truncated + spills.
+    assert len(result["columns"]) <= 512
+    assert len(result["rows"][0]) == len(result["columns"])
+    assert result["truncated"] is True
+    assert result["artifact_id"] is not None
+    preview_bytes = len(json.dumps(result["rows"], default=str).encode("utf-8"))
+    assert preview_bytes <= budget
+
+
 def test_spill_watchdog_bounds_oversized_write(tmp_path: Path) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq

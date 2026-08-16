@@ -113,6 +113,26 @@ class ArtifactRegistry:
             artifact.relative_path
         )
 
+    def session_artifact_bytes(self, session_id: str) -> int:
+        """Total bytes already registered for a session."""
+
+        return sum(item.size_bytes for item in self.repository.list(session_id))
+
+    def remaining_session_budget(self, session_id: str) -> int:
+        """Bytes a new artifact may still consume before the session-cumulative cap is hit."""
+
+        return max(0, self.max_total_bytes - self.session_artifact_bytes(session_id))
+
+    def spill_byte_ceiling(self, session_id: str) -> int:
+        """Largest a single spilled artifact may be given the per-file and remaining-session caps.
+
+        A spill watchdog uses this so a write is interrupted at the *remaining* session budget,
+        not the full cumulative ceiling, keeping the temporary file from over-writing before
+        registration would reject it.
+        """
+
+        return min(self.max_artifact_bytes, self.remaining_session_budget(session_id))
+
     def register_file(
         self,
         session_id: str,
@@ -140,7 +160,7 @@ class ArtifactRegistry:
                 f"artifact {resolved.name} is {stat.st_size} bytes; per-file limit is "
                 f"{self.max_artifact_bytes}"
             )
-        existing_bytes = sum(item.size_bytes for item in self.repository.list(session_id))
+        existing_bytes = self.session_artifact_bytes(session_id)
         if existing_bytes + stat.st_size > self.max_total_bytes:
             raise ArtifactLimitError(
                 f"registering {resolved.name} ({stat.st_size} bytes) would exceed the session "

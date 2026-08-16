@@ -45,6 +45,14 @@ _QUOTED_IDENT = re.compile(r'"(?:[^"]|"")*"')
 # The preview is streamed one row at a time so no more than a single (already cell-capped) row
 # is ever materialized in Python before the byte budget is re-checked.
 _MIN_PREVIEW_CELL_CHARS = 16
+# Absolute cap on previewed columns so a result with an extreme column count cannot produce
+# unbounded column metadata or a row that no per-cell cap can shrink under the budget.
+_MAX_PREVIEW_COLUMNS = 512
+# Worst-case JSON bytes a pass-through (non-string) scalar cell can contribute; used to derive a
+# column count that keeps even an all-scalar row within the byte budget.
+_MAX_SCALAR_BYTES_PER_COL = 64
+# Cap on the length of each returned column name so long aliases cannot inflate the response.
+_MAX_COLUMN_NAME_CHARS = 256
 # How often the spill watchdog samples the growing Parquet file to bound bytes written to disk.
 _SPILL_POLL_SECONDS = 0.02
 
@@ -198,27 +206,37 @@ class QueryService:
 
     def _preview_projection(
         self, connection: duckdb.DuckDBPyConnection, result_table: str
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, bool]:
         """Build a SELECT list that caps each column's cell size in SQL for the preview.
 
-        The per-cell cap is the smaller of the configured cell budget and an even share of the
-        preview byte budget across the columns, so a single fully populated row cannot exceed
-        the preview budget even when every column is individually large. Returns the projection
-        and the effective per-cell cap so the streaming reader can apply the same bound.
+        Two bounds keep a single row within ``max_result_preview_bytes``:
+
+        * The number of previewed columns is capped so even an all-scalar row (whose cells pass
+          through the projection uncapped) cannot exceed the budget through column count alone,
+          and column metadata stays bounded.
+        * The per-cell cap is the smaller of the configured cell budget and an even share of the
+          byte budget across the previewed columns, bounding the string/blob/nested cells.
+
+        Returns the projection, the effective per-cell cap, and whether columns were dropped.
         """
 
         described = connection.execute(f'DESCRIBE "{result_table}"').fetchall()
-        column_count = max(1, len(described))
+        budget = self.settings.max_result_preview_bytes
+        column_budget = max(1, budget // _MAX_SCALAR_BYTES_PER_COL)
+        column_limit = min(len(described), _MAX_PREVIEW_COLUMNS, column_budget)
+        shown = described[:column_limit]
+        column_truncated = len(shown) < len(described)
+        column_count = max(1, len(shown))
         # Halve the per-column share to leave headroom for JSON structure (quotes, commas).
-        row_share = self.settings.max_result_preview_bytes // column_count // 2
+        row_share = budget // column_count // 2
         cell_cap = min(
             self.settings.max_result_cell_chars,
             max(_MIN_PREVIEW_CELL_CHARS, row_share),
         )
         projection = ", ".join(
-            _cell_bound_expr(str(row[0]), str(row[1]), cell_cap) for row in described
+            _cell_bound_expr(str(row[0]), str(row[1]), cell_cap) for row in shown
         )
-        return projection, cell_cap
+        return projection, cell_cap, column_truncated
 
     @staticmethod
     def _row_bytes(row: list[Any]) -> int:
@@ -268,7 +286,9 @@ class QueryService:
         timer.start()
         try:
             cursor = connection.execute(sql)
-            columns = [str(item[0]) for item in (cursor.description or [])]
+            columns = [
+                str(item[0])[:_MAX_COLUMN_NAME_CHARS] for item in (cursor.description or [])
+            ]
             kept: list[list[Any]] = []
             used = 0
             truncated = False
@@ -469,7 +489,7 @@ class QueryService:
                 # Cap each column's cells in SQL, then stream the preview under the byte budget
                 # so an oversized string/blob (or many wide rows) never fully materializes in
                 # Python.
-                projection, preview_cell_cap = self._preview_projection(
+                projection, preview_cell_cap, column_truncated = self._preview_projection(
                     connection, result_table
                 )
                 columns, serial_rows, preview_truncated = self._fetch_preview_bounded(
@@ -483,7 +503,9 @@ class QueryService:
                 raise QueryExecutionError(str(exc)) from exc
 
             row_truncated = materialized > limit
-            truncated = row_truncated or preview_truncated
+            # A dropped column means the preview no longer renders the full result, so the spill
+            # (which COPYs the complete result_table) must carry the full-fidelity data.
+            truncated = row_truncated or preview_truncated or column_truncated
             spill_capped = materialized > spill_cap
 
             artifact_id: str | None = None
@@ -493,11 +515,10 @@ class QueryService:
                 # Bound the spill in bytes as it is written (a watchdog interrupts the COPY once
                 # the file crosses the ceiling) and in time (wall-clock interrupt), so an
                 # oversized spill cannot fill the disk; register_file then enforces the precise
-                # per-file and session-cumulative quotas before the artifact is recorded.
-                byte_ceiling = min(
-                    self.settings.max_artifact_bytes,
-                    self.settings.max_total_artifact_bytes,
-                )
+                # per-file and session-cumulative quotas before the artifact is recorded. The
+                # ceiling is the *remaining* session budget, not the full cumulative cap, so a
+                # session that already holds artifacts cannot over-write before rejection.
+                byte_ceiling = self.artifacts.spill_byte_ceiling(session.id)
                 try:
                     self._write_spill_bounded(
                         connection,

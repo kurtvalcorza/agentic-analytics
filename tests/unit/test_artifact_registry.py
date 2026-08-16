@@ -99,6 +99,24 @@ def test_register_file_enforces_session_total_byte_limit(tmp_path: Path) -> None
         registry.register_file(session_id, execution_id, second)
 
 
+def test_spill_byte_ceiling_reflects_remaining_session_budget(tmp_path: Path) -> None:
+    registry = _registry(tmp_path, max_artifact_bytes=8192, max_total_bytes=10240)
+    session_id, execution_id = _ids()
+    archive_base = registry.archive_base(session_id, execution_id)
+    archive_base.mkdir(parents=True)
+
+    # With nothing registered, the ceiling is the per-file cap.
+    assert registry.spill_byte_ceiling(session_id) == 8192
+
+    first = archive_base / "a.parquet"
+    first.write_bytes(b"x" * 6144)
+    registry.register_file(session_id, execution_id, first)
+
+    # After consuming 6 KiB of a 10 KiB session budget, only 4 KiB remains — the ceiling drops
+    # below the per-file cap so a watchdog interrupts before over-writing.
+    assert registry.spill_byte_ceiling(session_id) == 10240 - 6144
+
+
 def test_snapshot_ignores_symlinks(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
