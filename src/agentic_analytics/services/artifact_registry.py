@@ -133,6 +133,19 @@ class ArtifactRegistry:
         if resolved != archive_base and archive_base not in resolved.parents:
             raise ValueError("artifact path must remain inside the execution archive")
         stat = resolved.stat()
+        # Enforce the same byte ceilings as workspace-file registration so a spilled query
+        # result (or any pre-written file) cannot bypass the configured artifact quotas.
+        if stat.st_size > self.max_artifact_bytes:
+            raise ArtifactLimitError(
+                f"artifact {resolved.name} is {stat.st_size} bytes; per-file limit is "
+                f"{self.max_artifact_bytes}"
+            )
+        existing_bytes = sum(item.size_bytes for item in self.repository.list(session_id))
+        if existing_bytes + stat.st_size > self.max_total_bytes:
+            raise ArtifactLimitError(
+                f"registering {resolved.name} ({stat.st_size} bytes) would exceed the session "
+                f"artifact byte budget of {self.max_total_bytes}"
+            )
         artifact = Artifact(
             session_id=session_id,
             execution_id=execution_id,

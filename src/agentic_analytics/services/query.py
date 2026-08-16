@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
@@ -22,7 +23,7 @@ from agentic_analytics.models import (
 from agentic_analytics.repositories import ExecutionRepository, SourceRepository
 from agentic_analytics.settings import Settings
 
-from .artifact_registry import ArtifactRegistry
+from .artifact_registry import ArtifactLimitError, ArtifactRegistry
 from .inspector import fingerprint_file
 from .workspace import WorkspaceService
 
@@ -40,6 +41,62 @@ _FORBIDDEN = re.compile(
 _ALLOWED_START = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 _STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
 _QUOTED_IDENT = re.compile(r'"(?:[^"]|"")*"')
+
+# Rows are streamed from the preview cursor in small batches so we never pull the whole
+# (row-capped) result set into Python before applying the byte budget.
+_PREVIEW_BATCH = 64
+
+# Types whose values are inherently small; passed through the preview projection unchanged so
+# their original JSON type is preserved (an int stays an int). Every other type is bounded in
+# SQL before it is materialized in Python.
+_SMALL_SCALAR_PREFIXES = (
+    "BOOLEAN",
+    "BOOL",
+    "TINYINT",
+    "SMALLINT",
+    "INTEGER",
+    "BIGINT",
+    "HUGEINT",
+    "UTINYINT",
+    "USMALLINT",
+    "UINTEGER",
+    "UBIGINT",
+    "UHUGEINT",
+    "FLOAT",
+    "DOUBLE",
+    "REAL",
+    "DECIMAL",
+    "NUMERIC",
+    "DATE",
+    "TIME",
+    "TIMESTAMP",
+    "INTERVAL",
+    "UUID",
+)
+_TEXT_PREFIXES = ("VARCHAR", "CHAR", "BPCHAR", "TEXT", "STRING")
+_BLOB_PREFIXES = ("BLOB", "BYTEA", "VARBINARY")
+
+
+def _cell_bound_expr(name: str, sql_type: str, cell_cap: int) -> str:
+    """Return a projection expression that caps one column's cell size inside SQL.
+
+    Bounding at the SQL layer keeps DuckDB from handing a multi-megabyte string/blob (or a
+    large nested value) to Python via ``fetchall`` before any Python-side truncation runs, so
+    the configured cell budget bounds server memory as well as the response payload.
+    """
+
+    ident = '"' + name.replace('"', '""') + '"'
+    upper = sql_type.upper()
+    if upper.startswith(_SMALL_SCALAR_PREFIXES):
+        return ident
+    limit = cell_cap + 1  # one extra unit so downstream truncation detection can fire
+    if upper.startswith(_BLOB_PREFIXES):
+        return f"{ident}[1:{limit}] AS {ident}"
+    if upper.startswith(_TEXT_PREFIXES):
+        return f"substr({ident}, 1, {limit}) AS {ident}"
+    # Nested/other types (LIST, STRUCT, MAP, JSON, ENUM, ...) may be arbitrarily large; render a
+    # bounded textual preview. The full-fidelity value remains in the spilled artifact.
+    return f"substr(CAST({ident} AS VARCHAR), 1, {limit}) AS {ident}"
 
 
 def _json_value(value: Any) -> Any:
@@ -137,35 +194,79 @@ class QueryService:
             raise QueryRejected("spill directory escapes the artifact archive root")
         return resolved_base / "query-result.parquet"
 
-    def _bound_preview(
-        self, rows: list[list[Any]]
-    ) -> tuple[list[list[Any]], bool]:
-        """Cap the preview by per-cell size and total bytes; return (rows, was_truncated)."""
+    def _preview_projection(
+        self, connection: duckdb.DuckDBPyConnection, result_table: str
+    ) -> str:
+        """Build a SELECT list that caps each column's cell size in SQL for the preview."""
 
+        described = connection.execute(f'DESCRIBE "{result_table}"').fetchall()
         cell_cap = self.settings.max_result_cell_chars
-        truncated = False
-        capped_rows: list[list[Any]] = []
-        for row in rows:
-            capped_row: list[Any] = []
-            for value in row:
-                if isinstance(value, str) and len(value) > cell_cap:
-                    capped_row.append(value[:cell_cap])
-                    truncated = True
-                else:
-                    capped_row.append(value)
-            capped_rows.append(capped_row)
+        return ", ".join(
+            _cell_bound_expr(str(row[0]), str(row[1]), cell_cap) for row in described
+        )
+
+    def _fetch_preview_bounded(
+        self, connection: duckdb.DuckDBPyConnection, sql: str, limit: int
+    ) -> tuple[list[str], list[list[Any]], bool]:
+        """Stream a preview whose cells were already SQL-capped, bounding total bytes as well.
+
+        Rows are pulled in small batches under the wall-clock interrupt and accumulated only
+        while they fit the preview byte budget, so neither a very large single cell nor many
+        wide rows can be fully materialized in Python. Returns (columns, rows, truncated) where
+        ``truncated`` is set when the byte budget stopped accumulation before the row limit.
+        """
 
         budget = self.settings.max_result_preview_bytes
-        kept: list[list[Any]] = []
-        used = 0
-        for row in capped_rows:
-            size = len(json.dumps(row, default=str).encode("utf-8"))
-            if kept and used + size > budget:
-                truncated = True
-                break
-            kept.append(row)
-            used += size
-        return kept, truncated
+        cell_cap = self.settings.max_result_cell_chars
+        timed_out = threading.Event()
+
+        def _interrupt() -> None:
+            timed_out.set()
+            connection.interrupt()
+
+        timer = threading.Timer(self.settings.query_timeout_seconds, _interrupt)
+        timer.start()
+        try:
+            cursor = connection.execute(sql)
+            columns = [str(item[0]) for item in (cursor.description or [])]
+            kept: list[list[Any]] = []
+            used = 0
+            truncated = False
+            while len(kept) < limit:
+                batch = cursor.fetchmany(_PREVIEW_BATCH)
+                if not batch:
+                    break
+                stop = False
+                for raw in batch:
+                    row: list[Any] = []
+                    for value in (_json_value(item) for item in raw):
+                        # A cell returned at the SQL cap length (cell_cap + 1) means its source
+                        # value was longer and was trimmed for the preview; flag it so the full
+                        # value is preserved by spilling to an artifact. The trim to cell_cap is
+                        # also a defensive backstop for any type the projection passed through.
+                        if isinstance(value, str) and len(value) > cell_cap:
+                            value = value[:cell_cap]
+                            truncated = True
+                        row.append(value)
+                    size = len(json.dumps(row, default=str).encode("utf-8"))
+                    if kept and used + size > budget:
+                        truncated = True
+                        stop = True
+                        break
+                    kept.append(row)
+                    used += size
+                    if len(kept) >= limit:
+                        stop = True
+                        break
+                if stop:
+                    break
+            return columns, kept, truncated
+        except duckdb.Error as exc:
+            if timed_out.is_set():
+                raise TimeoutError("query exceeded the configured execution time limit") from exc
+            raise
+        finally:
+            timer.cancel()
 
     @staticmethod
     def _scalar_int(connection: duckdb.DuckDBPyConnection, sql: str) -> int:
@@ -270,48 +371,64 @@ class QueryService:
             )
             try:
                 self._run_bounded(connection, materialize_sql)
-                columns, preview_raw = self._run_bounded(
-                    connection, f'SELECT * FROM "{result_table}" LIMIT {limit + 1}'
-                )
                 materialized = self._scalar_int(
                     connection, f'SELECT count(*) FROM "{result_table}"'
+                )
+                # Cap each column's cells in SQL, then stream the preview under the byte budget
+                # so an oversized string/blob (or many wide rows) never fully materializes in
+                # Python.
+                projection = self._preview_projection(connection, result_table)
+                columns, serial_rows, preview_truncated = self._fetch_preview_bounded(
+                    connection,
+                    f'SELECT {projection} FROM "{result_table}" LIMIT {limit + 1}',
+                    limit,
                 )
             except (duckdb.Error, TimeoutError) as exc:
                 self._persist_failure(session, normalized, limit, source_ids, fingerprints, exc)
                 raise QueryExecutionError(str(exc)) from exc
 
-            row_truncated = len(preview_raw) > limit
-            serial_rows = [[_json_value(value) for value in row] for row in preview_raw[:limit]]
-            # Bound the preview by cell size and total bytes so a low-row-count result with a
-            # very large/wide value cannot exhaust memory or model context.
-            serial_rows, budget_truncated = self._bound_preview(serial_rows)
-            truncated = row_truncated or budget_truncated
+            row_truncated = materialized > limit
+            truncated = row_truncated or preview_truncated
             spill_capped = materialized > spill_cap
 
             artifact_id: str | None = None
             artifact_ids: list[str] = []
             if truncated:
                 spill_literal = _sql_string(str(spill_path))
-                connection.execute(
-                    f'COPY "{result_table}" TO {spill_literal} '
-                    "(FORMAT PARQUET, COMPRESSION ZSTD)"
-                )
-                artifact = self.artifacts.register_file(
-                    session.id,
-                    execution_id,
-                    spill_path,
-                    lineage={
-                        "change": "query_result_spill",
-                        "source_ids": source_ids,
-                    },
-                    metadata={
-                        "format": "parquet",
-                        "preview_rows": len(serial_rows),
-                        "query_truncated": True,
-                        "spill_row_count": materialized,
-                        "spill_truncated": spill_capped,
-                    },
-                )
+                # Time-bound the COPY under the same interrupt so a runaway write cannot hang the
+                # server, and enforce the artifact byte ceiling in register_file so a bounded row
+                # count with large cells cannot persist an over-limit artifact.
+                try:
+                    self._run_bounded(
+                        connection,
+                        f'COPY "{result_table}" TO {spill_literal} '
+                        "(FORMAT PARQUET, COMPRESSION ZSTD)",
+                    )
+                    artifact = self.artifacts.register_file(
+                        session.id,
+                        execution_id,
+                        spill_path,
+                        lineage={
+                            "change": "query_result_spill",
+                            "source_ids": source_ids,
+                        },
+                        metadata={
+                            "format": "parquet",
+                            "preview_rows": len(serial_rows),
+                            "query_truncated": True,
+                            "spill_row_count": materialized,
+                            "spill_truncated": spill_capped,
+                        },
+                    )
+                except (duckdb.Error, TimeoutError, ArtifactLimitError) as exc:
+                    # Never register a partial or over-limit spill: drop the file and record the
+                    # failure so the oversized artifact does not silently bypass the quota.
+                    with contextlib.suppress(FileNotFoundError):
+                        spill_path.unlink()
+                    self._persist_failure(
+                        session, normalized, limit, source_ids, fingerprints, exc
+                    )
+                    raise QueryExecutionError(str(exc)) from exc
                 artifact_id = artifact.id
                 artifact_ids.append(artifact.id)
 

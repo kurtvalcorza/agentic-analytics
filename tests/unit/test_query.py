@@ -111,6 +111,69 @@ def test_query_spills_oversized_low_row_result(tmp_path: Path) -> None:
     assert artifact.media_type == "application/vnd.apache.parquet"
 
 
+def test_preview_is_bounded_before_python_materialization(tmp_path: Path) -> None:
+    session, source, query, _, _, _ = _services(tmp_path, max_query_rows=100)
+    # Several rows each carrying a multi-megabyte cell. The SQL projection caps every cell to
+    # the configured budget, so the preview the tool returns stays small regardless of the raw
+    # cell size (the value never fully materializes in Python).
+    result = query.execute(
+        session,
+        f"SELECT repeat('x', 5000000) AS big FROM source('{source.id}')",
+    )
+    assert result["truncated"] is True
+    assert result["artifact_id"] is not None
+    for row in result["rows"]:
+        assert len(row[0]) <= 8192
+
+
+def test_spill_over_artifact_byte_ceiling_is_rejected(tmp_path: Path) -> None:
+    import uuid
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # High-entropy tokens so the ZSTD-compressed spill (~tens of KiB) clearly exceeds the tiny
+    # per-artifact ceiling below; a bounded row count with real data still overflows the quota.
+    tokens = [uuid.UUID(int=(index * 2654435761) % (2**128)).hex for index in range(4000)]
+    pq.write_table(
+        pa.table({"id": list(range(4000)), "tok": tokens}), workspace / "big.parquet"
+    )
+    settings = Settings(
+        state_dir=tmp_path / "state",
+        workspace_base_dir=tmp_path / "generated",
+        allowed_workspace_roots=[workspace],
+        max_query_rows=1,
+        # The floor for max_artifact_bytes is 1 KiB; the spill is far larger.
+        max_artifact_bytes=1024,
+    )
+    sources = SourceRepository(settings.state_dir)
+    executions = ExecutionRepository(settings.state_dir)
+    artifacts = ArtifactRepository(settings.state_dir)
+    workspace_service = WorkspaceService([workspace])
+    inspector = InspectorService(sources, workspace_service, settings)
+    registry = ArtifactRegistry(
+        artifacts,
+        settings.state_dir / "artifacts",
+        max_artifact_bytes=settings.max_artifact_bytes,
+        max_total_bytes=settings.max_total_artifact_bytes,
+    )
+    query = QueryService(sources, executions, workspace_service, registry, settings)
+    session = AnalysisSession(workspace_root=str(workspace))
+    source, _ = inspector.inspect(session, "big.parquet")
+
+    # max_query_rows=1 forces a spill; the spill exceeds the 1 KiB ceiling and must be rejected
+    # rather than persisted as an over-limit artifact.
+    with pytest.raises(QueryExecutionError, match="limit"):
+        query.execute(session, f"SELECT * FROM source('{source.id}')")
+
+    # The oversized spill file was cleaned up and no artifact was registered.
+    assert artifacts.list(session.id) == []
+    records = executions.list(session.id)
+    assert any(record.status is ExecutionStatus.FAILED for record in records)
+
+
 def test_query_view_names_cannot_be_shadowed_by_cte(tmp_path: Path) -> None:
     session, source, query, _, _, _ = _services(tmp_path, max_query_rows=100)
     sql = (

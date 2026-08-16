@@ -70,6 +70,35 @@ def test_registry_enforces_total_byte_limit(tmp_path: Path) -> None:
         )
 
 
+def test_register_file_enforces_per_file_byte_limit(tmp_path: Path) -> None:
+    registry = _registry(tmp_path, max_artifact_bytes=1024)
+    session_id, execution_id = _ids()
+    archive_base = registry.archive_base(session_id, execution_id)
+    archive_base.mkdir(parents=True)
+    spill = archive_base / "query-result.parquet"
+    spill.write_bytes(b"x" * 4096)
+
+    # A pre-written file over the per-file ceiling must be refused, not silently registered.
+    with pytest.raises(ArtifactLimitError, match="per-file limit"):
+        registry.register_file(session_id, execution_id, spill)
+
+
+def test_register_file_enforces_session_total_byte_limit(tmp_path: Path) -> None:
+    registry = _registry(tmp_path, max_total_bytes=6144)
+    session_id, execution_id = _ids()
+    archive_base = registry.archive_base(session_id, execution_id)
+    archive_base.mkdir(parents=True)
+    first = archive_base / "a.parquet"
+    first.write_bytes(b"x" * 4096)
+    registry.register_file(session_id, execution_id, first)
+
+    second = archive_base / "b.parquet"
+    second.write_bytes(b"x" * 4096)
+    # The cumulative session artifact budget is enforced across registrations.
+    with pytest.raises(ArtifactLimitError, match="session"):
+        registry.register_file(session_id, execution_id, second)
+
+
 def test_snapshot_ignores_symlinks(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()

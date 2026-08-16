@@ -101,7 +101,8 @@ Executes read-only DuckDB analytical SQL against registered sources.
 
 - SQL must be read-only.
 - Source references must resolve only to session-authorized sources.
-- Oversized result sets produce an artifact and bounded preview.
+- Oversized result sets produce an artifact and bounded preview. The preview is bounded in SQL (per-cell) before values are materialized, so a single very large cell cannot exhaust server memory.
+- A spilled artifact is subject to the configured artifact byte limits; a spill that would exceed them is rejected rather than persisted.
 - Returns an `execution_id` even for successful inline results.
 
 ### Output
