@@ -90,6 +90,8 @@ A user or agent prefers to use the host's own shell/notebook tooling for some ca
 
 ### User Story 6 — Challenge an existing analysis (Priority: P2)
 
+> ⏳ **Deferred to a later `0.1.x` — not implemented in the initial release.** Deterministic validation (User Story 5 / `validate_analysis`) ships today.
+
 A user asks the agent to adversarially review prior findings. The runtime checks the evidence graph and runs targeted diagnostics for common failure modes such as denominator shifts, missingness, duplicates, Simpson's paradox, multiple comparisons, leakage, or unsupported causal language.
 
 **Why this priority**: Independent challenge turns the evidence ledger into an active quality-control mechanism.
@@ -150,8 +152,8 @@ A maintainer wants to improve ergonomics for a new coding agent. They add a thin
 - **FR-010**: Managed execution MUST run outside the MCP server process.
 - **FR-011**: Managed execution MUST enforce workspace, timeout, environment, and session boundaries server-side.
 - **FR-012**: The system MUST record every managed execution as an immutable execution record with status, code/query, timestamps, inputs, output summary, runtime metadata, and produced artifacts.
-- **FR-013**: The system MUST support explicit registration of external executions in permissive mode.
-- **FR-014**: External execution records MUST be distinguishable from managed execution records.
+- **FR-013**: The system MUST support explicit registration of external executions in permissive mode. _(Deferred to a later `0.1.x`; not implemented in the initial release.)_
+- **FR-014**: External execution records MUST be distinguishable from managed execution records. _(Deferred to a later `0.1.x`; not implemented in the initial release.)_
 - **FR-015**: The system MUST detect generated and modified files associated with managed executions.
 - **FR-016**: The system MUST expose generated files through a canonical artifact registry with stable artifact IDs, media types, paths/resource URIs, lineage, size, and hashes where feasible.
 - **FR-017**: The system MUST provide an evidence ledger with immutable evidence IDs.
