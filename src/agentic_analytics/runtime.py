@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .execution_backends import DockerBackend, ExecutionBackend, SubprocessDevBackend
-from .repositories import ArtifactRepository, ExecutionRepository, SessionRepository, SourceRepository
+from .repositories import (
+    ArtifactRepository,
+    ExecutionRepository,
+    SessionRepository,
+    SourceRepository,
+)
 from .services.artifact_registry import ArtifactRegistry
 from .services.execution import ExecutionService
 from .services.inspector import InspectorService
