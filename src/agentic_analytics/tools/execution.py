@@ -6,19 +6,22 @@ from mcp.server import MCPServer
 
 from agentic_analytics.runtime import Runtime
 
+from .errors import tool_errors
+
 
 def register_execution_tools(server: MCPServer[Any], runtime: Runtime) -> None:
     @server.tool(description="Execute Python in the configured managed analytical sandbox.")
+    @tool_errors
     def execute_python(
         session_id: str,
         code: str,
         source_ids: list[str] | None = None,
         timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
-        session = runtime.sessions.get(session_id, session_id)
-        record = runtime.execution.execute_python(
-            session, code, source_ids=source_ids, timeout_seconds=timeout_seconds
-        )
+        with runtime.sessions.active(session_id) as session:
+            record = runtime.execution.execute_python(
+                session, code, source_ids=source_ids, timeout_seconds=timeout_seconds
+            )
         return {
             "execution_id": record.id,
             "status": record.status.value,
@@ -29,9 +32,8 @@ def register_execution_tools(server: MCPServer[Any], runtime: Runtime) -> None:
         }
 
     @server.tool(description="List immutable artifacts registered for an analysis session.")
-    def list_artifacts(
-        session_id: str, execution_id: str | None = None
-    ) -> dict[str, Any]:
+    @tool_errors
+    def list_artifacts(session_id: str, execution_id: str | None = None) -> dict[str, Any]:
         artifacts = runtime.artifacts.list(session_id)
         if execution_id is not None:
             artifacts = [item for item in artifacts if item.execution_id == execution_id]
@@ -41,6 +43,7 @@ def register_execution_tools(server: MCPServer[Any], runtime: Runtime) -> None:
         }
 
     @server.tool(description="Return canonical artifact metadata and a resolvable resource URI.")
+    @tool_errors
     def get_artifact(session_id: str, artifact_id: str) -> dict[str, Any]:
         artifact = runtime.artifacts.get(session_id, artifact_id)
         # This URI is backed by a registered MCP resource (see build_server), so an MCP-only

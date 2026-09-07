@@ -51,7 +51,7 @@ class _FailingBackend:
     name = "failing"
     conformant = True
 
-    def execute(self, session, script_path, timeout_seconds):
+    def execute(self, session, script_path, timeout_seconds, *, readonly_paths=()):
         raise RuntimeError("backend unavailable")
 
     def close_session(self, session_id: str) -> None:

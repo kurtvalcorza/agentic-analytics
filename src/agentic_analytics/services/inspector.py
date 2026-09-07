@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from agentic_analytics.models import AnalysisSession, DataSource, SourceKind
 from agentic_analytics.repositories import SourceRepository
 from agentic_analytics.settings import Settings
 
+from .preview import cell_bound_expr, json_value
 from .workspace import WorkspaceService
 
 
@@ -24,16 +26,6 @@ def fingerprint_file(path: Path) -> dict[str, Any]:
             digest.update(chunk)
     stat = path.stat()
     return {"sha256": digest.hexdigest(), "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-
-
-def _json_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, bytes):
-        return value.hex()
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return str(value)
 
 
 class InspectorService:
@@ -65,7 +57,7 @@ class InspectorService:
         relative_path = self.workspace.relative_to_workspace(session.workspace_root, path)
         fingerprint = fingerprint_file(path)
         try:
-            profile = self._profile(path, kind, sample_rows)
+            schema, profile = self._profile(path, kind, sample_rows)
         except duckdb.Error as exc:
             raise SourceInspectionError(f"source could not be inspected: {path.name}") from exc
         existing = next(
@@ -84,7 +76,7 @@ class InspectorService:
             display_name=path.name,
             relative_path=relative_path,
             fingerprint=fingerprint,
-            schema=profile["schema"],
+            schema=schema,
             row_count=profile["row_count"],
             profile={
                 "null_counts": profile["null_counts"],
@@ -95,11 +87,79 @@ class InspectorService:
         self.sources.add(source)
         return source, profile
 
-    def _profile(self, path: Path, kind: SourceKind, sample_rows: int) -> dict[str, Any]:
+    def _preview_schema(
+        self, schema: list[dict[str, Any]], null_counts: dict[str, int]
+    ) -> tuple[list[dict[str, Any]], dict[str, int], bool]:
+        """Bound response metadata while leaving the canonical source schema intact."""
+        shown: list[dict[str, Any]] = []
+        shown_nulls: dict[str, int] = {}
+        budget = self.settings.max_result_preview_bytes
+        column_limit = min(512, budget // 64)
+        for column in schema[:column_limit]:
+            candidate = {**column, "type": column["type"][:256]}
+            next_nulls = dict(shown_nulls)
+            if column["name"] in null_counts:
+                next_nulls[column["name"]] = null_counts[column["name"]]
+            metadata = {"schema": [*shown, candidate], "null_counts": next_nulls}
+            if len(json.dumps(metadata).encode("utf-8")) > budget:
+                break
+            shown.append(candidate)
+            shown_nulls = next_nulls
+        return shown, shown_nulls, shown != schema
+
+    def _sample(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        relation: str,
+        path: Path,
+        schema: list[dict[str, Any]],
+        sample_limit: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if not schema:
+            return [], True
+        budget = self.settings.max_result_preview_bytes
+        cell_cap = min(self.settings.max_result_cell_chars, max(16, budget // len(schema) // 2))
+        projection = ", ".join(
+            cell_bound_expr(column["name"], column["type"], cell_cap) for column in schema
+        )
+        cursor = connection.execute(
+            f"SELECT {projection} FROM {relation} LIMIT {sample_limit}", [str(path)]
+        )
+        sample: list[dict[str, Any]] = []
+        truncated = False
+        while (raw := cursor.fetchone()) is not None:
+            row = {}
+            for column, value in zip(schema, raw, strict=True):
+                value = json_value(value)
+                if isinstance(value, str) and len(value) > cell_cap:
+                    value = value[:cell_cap]
+                    truncated = True
+                row[column["name"]] = value
+            if len(json.dumps([*sample, row]).encode("utf-8")) > budget:
+                truncated = True
+                if sample:
+                    break
+                # The first row may need a further byte cap (UTF-8/JSON escaping and keys).
+                while len(json.dumps([row]).encode("utf-8")) > budget:
+                    key = max(
+                        (key for key, value in row.items() if isinstance(value, str) and value),
+                        key=lambda key: len(row[key]),
+                        default=None,
+                    )
+                    if key is None:
+                        return [], True
+                    row[key] = row[key][: len(row[key]) // 2]
+            sample.append(row)
+        return sample, truncated
+
+    def _profile(
+        self, path: Path, kind: SourceKind, sample_rows: int
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         sample_limit = min(max(sample_rows, 1), self.settings.max_sample_rows)
         relation = self._relation(kind)
         connection = duckdb.connect(database=":memory:")
         try:
+            connection.execute("SET memory_limit = ?", [self.settings.query_memory_limit])
             cursor = connection.execute(f"SELECT * FROM {relation} LIMIT 0", [str(path)])
             schema = [
                 {"name": str(column[0]), "type": str(column[1]), "nullable": True}
@@ -125,23 +185,26 @@ class InspectorService:
                 f"SELECT count(*) FROM (SELECT DISTINCT * FROM {relation})", [str(path)]
             ).fetchone()
             distinct_count = int(distinct[0] if distinct else 0)
-            sample_cursor = connection.execute(
-                f"SELECT * FROM {relation} LIMIT {sample_limit + 1}", [str(path)]
+            shown_schema, shown_nulls, metadata_truncated = self._preview_schema(
+                schema, null_counts
             )
-            rows = sample_cursor.fetchall()
-            sample_truncated = len(rows) > sample_limit
-            sample = [
-                {schema[index]["name"]: _json_value(value) for index, value in enumerate(row)}
-                for row in rows[:sample_limit]
-            ]
-            return {
-                "schema": schema,
+            # Use canonical types in SQL; the displayed type itself may have been clipped.
+            sample_schema = schema[: len(shown_schema)]
+            sample, cell_truncated = self._sample(
+                connection, relation, path, sample_schema, sample_limit
+            )
+            return schema, {
+                "schema": shown_schema,
                 "row_count": row_count,
-                "null_counts": null_counts,
+                "null_counts": shown_nulls,
                 "duplicate_row_count": row_count - distinct_count,
                 "sample": sample,
-                "sample_truncated": sample_truncated,
-                "profile_truncated": len(schema) > self.settings.max_profile_columns,
+                "sample_truncated": (
+                    row_count > len(sample) or cell_truncated or len(sample_schema) < len(schema)
+                ),
+                "profile_truncated": (
+                    metadata_truncated or len(schema) > self.settings.max_profile_columns
+                ),
             }
         finally:
             connection.close()

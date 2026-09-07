@@ -14,6 +14,8 @@ class BackendResult:
     stderr: str = ""
     exit_code: int | None = None
     runtime: dict[str, Any] = field(default_factory=dict)
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
 
 class ExecutionBackend(Protocol):
@@ -25,6 +27,8 @@ class ExecutionBackend(Protocol):
         session: AnalysisSession,
         script_path: Path,
         timeout_seconds: int,
+        *,
+        readonly_paths: tuple[Path, ...] = (),
     ) -> BackendResult: ...
 
     def close_session(self, session_id: str) -> None: ...

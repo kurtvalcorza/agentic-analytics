@@ -16,8 +16,17 @@ from agentic_analytics.models import (
     ValidationSeverity,
 )
 from agentic_analytics.services.inspector import fingerprint_file
+from agentic_analytics.services.workspace import WorkspaceAuthorizationError, WorkspaceService
 
 _SUPPORTED_TABULAR = {SourceKind.CSV, SourceKind.PARQUET}
+# Source-format, filesystem, and resource failures are incomplete data checks. SQL
+# programming errors (for example ParserException or BinderException) still propagate.
+_SOURCE_READ_ERRORS = (
+    duckdb.InvalidInputException,
+    duckdb.IOException,
+    duckdb.ConversionException,
+    duckdb.OutOfMemoryException,
+)
 
 
 @dataclass(slots=True)
@@ -30,8 +39,14 @@ class ValidationContext:
     # Per-source duplicate keys supplied through the public validate_analysis call, keyed by
     # source relative_path or source id. Makes the key-based duplicate check reachable via MCP.
     duplicate_keys: dict[str, list[str]] = field(default_factory=dict)
+    workspace: WorkspaceService | None = None
 
     def resolve_source_file(self, source: DataSource) -> Path | None:
+        if self.workspace is not None and source.relative_path is not None:
+            try:
+                return self.workspace.resolve_file(self.workspace_root, source.relative_path)
+            except WorkspaceAuthorizationError:
+                return None
         return _resolve_source_file(self.workspace_root, source)
 
     def source_duplicate_keys(self, source: DataSource) -> list[str]:
@@ -117,6 +132,13 @@ def _inconclusive(check: str, reason: str) -> CheckResult:
     return CheckResult(check, outcome="inconclusive", reason=reason)
 
 
+def _source_read_failure(result: CheckResult, source: DataSource, error: Exception) -> None:
+    result.outcome = "inconclusive"
+    # Keep diagnostics bounded and avoid returning DuckDB's full source contents/host path.
+    reason = f"could not read source {source.id}: {type(error).__name__}"
+    result.reason = f"{result.reason}; {reason}" if result.reason else reason
+
+
 def _reader_sql(source: DataSource, path: Path) -> str:
     literal = "'" + str(path).replace("'", "''") + "'"
     if source.kind is SourceKind.CSV:
@@ -172,6 +194,7 @@ class StaleSourceValidator:
 
     def check(self, context: ValidationContext) -> CheckResult:
         findings: list[ValidationFinding] = []
+        result = CheckResult(self.name, findings)
         checked = 0
         for source in context.sources:
             if source.relative_path is None:
@@ -193,7 +216,11 @@ class StaleSourceValidator:
                     )
                 )
                 continue
-            current = fingerprint_file(path)
+            try:
+                current = fingerprint_file(path)
+            except OSError as exc:
+                _source_read_failure(result, source, exc)
+                continue
             if current != source.fingerprint:
                 findings.append(
                     _finding(
@@ -217,7 +244,7 @@ class StaleSourceValidator:
                 )
         if checked == 0:
             return _inconclusive(self.name, "no local file sources")
-        return CheckResult(self.name, findings)
+        return result
 
 
 class DuplicateObservationValidator:
@@ -225,6 +252,7 @@ class DuplicateObservationValidator:
 
     def check(self, context: ValidationContext) -> CheckResult:
         findings: list[ValidationFinding] = []
+        result = CheckResult(self.name, findings)
         supported = 0
         for source in context.sources:
             if source.relative_path is None or source.kind not in _SUPPORTED_TABULAR:
@@ -297,11 +325,13 @@ class DuplicateObservationValidator:
                                 ),
                             )
                         )
+            except _SOURCE_READ_ERRORS as exc:
+                _source_read_failure(result, source, exc)
             finally:
                 connection.close()
         if supported == 0:
             return _inconclusive(self.name, "no supported tabular sources")
-        return CheckResult(self.name, findings)
+        return result
 
 
 class MissingnessValidator:
@@ -309,6 +339,7 @@ class MissingnessValidator:
 
     def check(self, context: ValidationContext) -> CheckResult:
         findings: list[ValidationFinding] = []
+        result = CheckResult(self.name, findings)
         supported = 0
         for source in context.sources:
             if source.relative_path is None or source.kind not in _SUPPORTED_TABULAR:
@@ -370,11 +401,13 @@ class MissingnessValidator:
                             ),
                         )
                     )
+            except _SOURCE_READ_ERRORS as exc:
+                _source_read_failure(result, source, exc)
             finally:
                 connection.close()
         if supported == 0:
             return _inconclusive(self.name, "no supported tabular sources")
-        return CheckResult(self.name, findings)
+        return result
 
 
 class DenominatorConsistencyValidator:

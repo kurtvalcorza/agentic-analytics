@@ -5,7 +5,6 @@ import json
 import re
 import threading
 from datetime import UTC, datetime
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -25,9 +24,12 @@ from agentic_analytics.settings import Settings
 
 from .artifact_registry import ArtifactLimitError, ArtifactRegistry
 from .inspector import fingerprint_file
+from .preview import cell_bound_expr as _cell_bound_expr
+from .preview import json_value as _json_value
+from .sql_tokens import SqlToken, tokenize_sql
 from .workspace import WorkspaceService
 
-_SOURCE_REF = re.compile(r"source\(\s*['\"](?P<id>src_[0-9a-f]{32})['\"]\s*\)", re.IGNORECASE)
+_SOURCE_ID = re.compile(r"src_[0-9a-f]{32}", re.IGNORECASE)
 _FORBIDDEN = re.compile(
     r"\b(insert|update|delete|create|drop|alter|copy|attach|detach|install|load|call|pragma|set|"
     r"export|import|vacuum|read_csv|read_csv_auto|read_parquet|parquet_scan|csv_scan|read_json|"
@@ -38,10 +40,12 @@ _FORBIDDEN = re.compile(
     r"information_schema|pg_catalog|sqlite_master|sqlite_temp_master)\b",
     re.IGNORECASE,
 )
-_ALLOWED_START = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
-_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
-_QUOTED_IDENT = re.compile(r'"(?:[^"]|"")*"')
-
+_CATALOG_RELATIONS = {
+    "information_schema",
+    "pg_catalog",
+    "sqlite_master",
+    "sqlite_temp_master",
+}
 # The preview is streamed one row at a time so no more than a single (already cell-capped) row
 # is ever materialized in Python before the byte budget is re-checked.
 _MIN_PREVIEW_CELL_CHARS = 16
@@ -56,84 +60,25 @@ _MAX_COLUMN_NAME_CHARS = 256
 # How often the spill watchdog samples the growing Parquet file to bound bytes written to disk.
 _SPILL_POLL_SECONDS = 0.02
 
-# Types whose values are inherently small; passed through the preview projection unchanged so
-# their original JSON type is preserved (an int stays an int). Every other type is bounded in
-# SQL before it is materialized in Python.
-_SMALL_SCALAR_PREFIXES = (
-    "BOOLEAN",
-    "BOOL",
-    "TINYINT",
-    "SMALLINT",
-    "INTEGER",
-    "BIGINT",
-    "HUGEINT",
-    "UTINYINT",
-    "USMALLINT",
-    "UINTEGER",
-    "UBIGINT",
-    "UHUGEINT",
-    "FLOAT",
-    "DOUBLE",
-    "REAL",
-    "DECIMAL",
-    "NUMERIC",
-    "DATE",
-    "TIME",
-    "TIMESTAMP",
-    "INTERVAL",
-    "UUID",
-)
-_TEXT_PREFIXES = ("VARCHAR", "CHAR", "BPCHAR", "TEXT", "STRING")
-_BLOB_PREFIXES = ("BLOB", "BYTEA", "VARBINARY")
-
-
-def _cell_bound_expr(name: str, sql_type: str, cell_cap: int) -> str:
-    """Return a projection expression that caps one column's cell size inside SQL.
-
-    Bounding at the SQL layer keeps DuckDB from handing a multi-megabyte string/blob (or a
-    large nested value) to Python via ``fetchall`` before any Python-side truncation runs, so
-    the configured cell budget bounds server memory as well as the response payload.
-    """
-
-    ident = '"' + name.replace('"', '""') + '"'
-    upper = sql_type.upper()
-    if upper.startswith(_SMALL_SCALAR_PREFIXES):
-        return ident
-    limit = cell_cap + 1  # one extra unit so downstream truncation detection can fire
-    if upper.startswith(_BLOB_PREFIXES):
-        return f"{ident}[1:{limit}] AS {ident}"
-    if upper.startswith(_TEXT_PREFIXES):
-        return f"substr({ident}, 1, {limit}) AS {ident}"
-    # Nested/other types (LIST, STRUCT, MAP, JSON, ENUM, ...) may be arbitrarily large; render a
-    # bounded textual preview. The full-fidelity value remains in the spilled artifact.
-    return f"substr(CAST({ident} AS VARCHAR), 1, {limit}) AS {ident}"
-
-
-def _json_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, bytes):
-        return value.hex()
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return str(value)
-
 
 def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _executable_text(sql: str) -> str:
-    """Strip string literals and quoted identifiers so the denylist matches only executable SQL.
-
-    This keeps benign data values and quoted column names (for example ``WHERE op = 'update'``)
-    from being rejected as commands while still catching real forbidden keywords/functions.
-    """
-
-    without_strings = _STRING_LITERAL.sub(" ", sql)
-    return _QUOTED_IDENT.sub(" ", without_strings)
+def _source_references(tokens: list[SqlToken]) -> list[tuple[int, int, str]]:
+    references = []
+    for index, token in enumerate(tokens[:-3]):
+        if token.kind not in {"identifier", "quoted_identifier"} or token.value.lower() != "source":
+            continue
+        opening, argument, closing = tokens[index + 1 : index + 4]
+        if (
+            opening.value == "("
+            and closing.value == ")"
+            and argument.kind in {"string", "quoted_identifier"}
+            and _SOURCE_ID.fullmatch(argument.value)
+        ):
+            references.append((token.start, closing.end, argument.value))
+    return references
 
 
 class QueryRejected(ValueError):
@@ -162,20 +107,47 @@ class QueryService:
     @staticmethod
     def _validate_sql(sql: str) -> str:
         normalized = sql.strip()
-        if normalized.endswith(";"):
-            normalized = normalized[:-1].rstrip()
-        if not normalized or not _ALLOWED_START.search(normalized):
+        try:
+            tokens = tokenize_sql(normalized)
+        except ValueError as exc:
+            raise QueryRejected(str(exc)) from exc
+        if tokens and tokens[-1].kind == "symbol" and tokens[-1].value == ";":
+            # Comments may follow the optional terminating semicolon.
+            normalized = normalized[: tokens[-1].start].rstrip()
+            tokens.pop()
+        if (
+            not tokens
+            or tokens[0].kind != "identifier"
+            or tokens[0].value.lower() not in {"select", "with"}
+        ):
             raise QueryRejected("only SELECT or WITH analytical queries are allowed")
-        executable = _executable_text(normalized)
-        if ";" in executable:
-            raise QueryRejected("multiple SQL statements are not allowed")
-        if _FORBIDDEN.search(executable):
-            raise QueryRejected("query contains a forbidden command or external access function")
+        for index, token in enumerate(tokens):
+            if token.kind == "symbol" and token.value == ";":
+                raise QueryRejected("multiple SQL statements are not allowed")
+            following = tokens[index + 1].value if index + 1 < len(tokens) else ""
+            preceding = tokens[index - 1].value.lower() if index else ""
+            # Quoting does not disable a function call or catalog relation. Ordinary quoted
+            # column names and aliases remain data identifiers, including names like "update".
+            executable = token.kind == "identifier" or (
+                token.kind == "quoted_identifier"
+                and (
+                    following == "("
+                    or (
+                        token.value.lower() in _CATALOG_RELATIONS
+                        and (
+                            following == "."
+                            or preceding in {"from", "join", "only", "lateral", ",", "."}
+                        )
+                    )
+                )
+            )
+            if executable and _FORBIDDEN.fullmatch(token.value):
+                raise QueryRejected(
+                    "query contains a forbidden command or external access function"
+                )
         return normalized
 
-    def _secure_connection(
-        self, connection: duckdb.DuckDBPyConnection, paths: list[str]
-    ) -> None:
+    def _secure_connection(self, connection: duckdb.DuckDBPyConnection, paths: list[str]) -> None:
         allowed_paths = ", ".join(_sql_string(path) for path in paths)
         connection.execute(f"SET allowed_paths = [{allowed_paths}]")
         connection.execute("SET autoinstall_known_extensions = false")
@@ -286,9 +258,7 @@ class QueryService:
         timer.start()
         try:
             cursor = connection.execute(sql)
-            columns = [
-                str(item[0])[:_MAX_COLUMN_NAME_CHARS] for item in (cursor.description or [])
-            ]
+            columns = [str(item[0])[:_MAX_COLUMN_NAME_CHARS] for item in (cursor.description or [])]
             kept: list[list[Any]] = []
             used = 0
             truncated = False
@@ -416,9 +386,8 @@ class QueryService:
         normalized = self._validate_sql(sql)
         requested_limit = max_rows if max_rows is not None else self.settings.max_query_rows
         limit = min(max(requested_limit, 1), self.settings.max_query_rows)
-        source_ids = list(
-            dict.fromkeys(match.group("id") for match in _SOURCE_REF.finditer(normalized))
-        )
+        references = _source_references(tokenize_sql(normalized))
+        source_ids = list(dict.fromkeys(source_id for _, _, source_id in references))
         if not source_ids:
             raise QueryRejected("query must reference at least one registered source('src_...')")
 
@@ -448,7 +417,7 @@ class QueryService:
 
         connection = duckdb.connect(database=":memory:")
         fingerprints: dict[str, Any] = {}
-        rewritten = normalized
+        view_names: dict[str, str] = {}
         # Unguessable per-execution view/table names cannot be shadowed by a caller CTE.
         token = uuid4().hex
         result_table = f"_result_{token}"
@@ -466,11 +435,12 @@ class QueryService:
                 else:
                     raise QueryRejected(f"unsupported source kind: {kind}")
                 connection.execute(f'CREATE TEMP VIEW "{view_name}" AS SELECT * FROM {reader}')
-                pattern = re.compile(
-                    rf"source\(\s*['\"]{re.escape(source_id)}['\"]\s*\)", re.IGNORECASE
-                )
-                rewritten = pattern.sub(f'"{view_name}"', rewritten)
+                view_names[source_id] = view_name
                 fingerprints[source_id] = fingerprint
+
+            rewritten = normalized
+            for start, end, source_id in reversed(references):
+                rewritten = rewritten[:start] + f'"{view_names[source_id]}"' + rewritten[end:]
 
             started = datetime.now(UTC)
             # Materialize the full result ONCE, bounded by a row cap and the interrupt timer, so
@@ -548,9 +518,7 @@ class QueryService:
                     # failure so the oversized artifact does not silently bypass the quota.
                     with contextlib.suppress(FileNotFoundError):
                         spill_path.unlink()
-                    self._persist_failure(
-                        session, normalized, limit, source_ids, fingerprints, exc
-                    )
+                    self._persist_failure(session, normalized, limit, source_ids, fingerprints, exc)
                     raise QueryExecutionError(str(exc)) from exc
                 artifact_id = artifact.id
                 artifact_ids.append(artifact.id)
@@ -592,9 +560,7 @@ class QueryService:
         exc: BaseException,
     ) -> None:
         status = (
-            ExecutionStatus.TIMED_OUT
-            if isinstance(exc, TimeoutError)
-            else ExecutionStatus.FAILED
+            ExecutionStatus.TIMED_OUT if isinstance(exc, TimeoutError) else ExecutionStatus.FAILED
         )
         record = ExecutionRecord(
             session_id=session.id,

@@ -18,9 +18,7 @@ from agentic_analytics.settings import Settings
 def _services(tmp_path: Path, *, max_query_rows: int = 2):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    (workspace / "sample.csv").write_text(
-        "region,value\nNCR,1\nCAR,2\nNCR,3\n", encoding="utf-8"
-    )
+    (workspace / "sample.csv").write_text("region,value\nNCR,1\nCAR,2\nNCR,3\n", encoding="utf-8")
     settings = Settings(
         state_dir=tmp_path / "state",
         workspace_base_dir=tmp_path / "generated",
@@ -71,9 +69,7 @@ def test_query_blocks_external_access_and_writes(tmp_path: Path) -> None:
 
 def test_query_allows_forbidden_tokens_inside_literals(tmp_path: Path) -> None:
     session, source, query, _, _, _ = _services(tmp_path, max_query_rows=100)
-    result = query.execute(
-        session, f"SELECT * FROM source('{source.id}') WHERE region = 'update'"
-    )
+    result = query.execute(session, f"SELECT * FROM source('{source.id}') WHERE region = 'update'")
     assert result["row_count_returned"] == 0
     assert result["truncated"] is False
 
@@ -137,9 +133,7 @@ def test_spill_over_artifact_byte_ceiling_is_rejected(tmp_path: Path) -> None:
     # High-entropy tokens so the ZSTD-compressed spill (~tens of KiB) clearly exceeds the tiny
     # per-artifact ceiling below; a bounded row count with real data still overflows the quota.
     tokens = [uuid.UUID(int=(index * 2654435761) % (2**128)).hex for index in range(4000)]
-    pq.write_table(
-        pa.table({"id": list(range(4000)), "tok": tokens}), workspace / "big.parquet"
-    )
+    pq.write_table(pa.table({"id": list(range(4000)), "tok": tokens}), workspace / "big.parquet")
     settings = Settings(
         state_dir=tmp_path / "state",
         workspace_base_dir=tmp_path / "generated",
@@ -222,9 +216,7 @@ def test_spill_watchdog_bounds_oversized_write(tmp_path: Path) -> None:
     # the file crosses the tiny ceiling, and the partial file must be cleaned up.
     count = 300_000
     tokens = [format((index * 2654435761) % (2**64), "016x") for index in range(count)]
-    pq.write_table(
-        pa.table({"id": list(range(count)), "tok": tokens}), workspace / "big.parquet"
-    )
+    pq.write_table(pa.table({"id": list(range(count)), "tok": tokens}), workspace / "big.parquet")
     settings = Settings(
         state_dir=tmp_path / "state",
         workspace_base_dir=tmp_path / "generated",
@@ -283,10 +275,125 @@ def test_query_reauthorizes_workspace_root(tmp_path: Path) -> None:
         SourceRepository(tmp_path / "state"),
         executions,
         narrowed,
-        ArtifactRegistry(
-            ArtifactRepository(tmp_path / "state"), tmp_path / "state" / "artifacts"
-        ),
+        ArtifactRegistry(ArtifactRepository(tmp_path / "state"), tmp_path / "state" / "artifacts"),
         narrowed_settings,
     )
     with pytest.raises(WorkspaceAuthorizationError):
         query.execute(session, f"SELECT * FROM source('{source.id}')")
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["['a', 'b']", "[1, 2]", "[1, 2]::INTEGER[2]", "{'nested': [1, 2]}", "[true, false]"],
+)
+def test_query_previews_nested_types(tmp_path: Path, expression: str) -> None:
+    session, source, query, _, _, _ = _services(tmp_path)
+    result = query.execute(
+        session, f"SELECT {expression} AS nested FROM source('{source.id}') LIMIT 1"
+    )
+    assert result["row_count_returned"] == 1
+    assert isinstance(result["rows"][0][0], str)
+    assert result["truncated"] is False
+
+
+@pytest.mark.parametrize("expression", ["range(100000)", "[repeat('x', 100000)]"])
+def test_query_bounds_nested_cells_before_fetch(tmp_path: Path, expression: str) -> None:
+    import duckdb
+
+    session, source, query, _, _, artifacts = _services(tmp_path)
+    query.settings.max_result_cell_chars = 64
+    # The SQL projection itself must cap nested cells before DuckDB hands them to Python.
+    connection = duckdb.connect()
+    try:
+        connection.execute(f"CREATE TABLE nested_result AS SELECT {expression} AS nested")
+        projection, cap, _ = query._preview_projection(connection, "nested_result")
+        raw = connection.execute(f"SELECT {projection} FROM nested_result").fetchone()
+        assert raw is not None and isinstance(raw[0], str)
+        assert len(raw[0]) == cap + 1
+    finally:
+        connection.close()
+    result = query.execute(
+        session, f"SELECT {expression} AS nested FROM source('{source.id}') LIMIT 1"
+    )
+    assert len(result["rows"][0][0]) == 64
+    assert result["truncated"] is True
+    assert artifacts.get(session.id, result["artifact_id"]).kind.value == "dataset"
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        '"duckdb_views"()',
+        'main."DUCKDB_TABLES"()',
+        "\"read_csv\"('/etc/passwd')",
+        '"information_schema".tables',
+        '"pg_catalog".pg_views',
+        '"sqlite_master"',
+        'main."sqlite_master"',
+    ],
+)
+def test_query_blocks_quoted_catalogs_and_functions(tmp_path: Path, forbidden: str) -> None:
+    session, source, query, executions, _, _ = _services(tmp_path)
+    with pytest.raises(QueryRejected, match="forbidden"):
+        query.execute(session, f"SELECT * FROM source('{source.id}'), {forbidden}")
+    assert executions.list(session.id) == []
+
+
+def test_query_preserves_quoted_columns_and_literal_source_references(tmp_path: Path) -> None:
+    session, source, query, _, _, _ = _services(tmp_path)
+    text = f'source("{source.id}")'
+    sql = (
+        f"/* read_csv('ignored') /* nested */ */ WITH data AS "
+        f'(SELECT value AS "update", region AS "read_csv" FROM source(\'{source.id}\')) '
+        f"SELECT \"update\", \"read_csv\", '{text}', $$source('{source.id}')$$, "
+        f"$界$source('{source.id}')$界$, 'it''s {text}', E'escaped\\' {text}' "
+        "FROM data LIMIT 1; -- source('src_00000000000000000000000000000000')"
+    )
+    result = query.execute(session, sql)
+    assert result["rows"] == [
+        [
+            1,
+            "NCR",
+            text,
+            f"source('{source.id}')",
+            f"source('{source.id}')",
+            f"it's {text}",
+            f"escaped' {text}",
+        ]
+    ]
+
+
+def test_query_rewrites_only_executable_source_calls(tmp_path: Path) -> None:
+    session, source, query, executions, _, _ = _services(tmp_path)
+    fake_id = "src_00000000000000000000000000000000"
+    result = query.execute(
+        session,
+        f'SELECT value, \'source("{fake_id}")\' FROM "source" /* comment */ '
+        f"( '{source.id}' ) LIMIT 1",
+    )
+    assert result["rows"] == [[1, f'source("{fake_id}")']]
+    assert executions.get(session.id, result["execution_id"]).source_ids == [source.id]
+    with pytest.raises(QueryRejected, match="must reference"):
+        query.execute(session, f"SELECT 'source(\"{source.id}\")'")
+
+
+def test_query_semicolons_in_literals_do_not_split_statements(tmp_path: Path) -> None:
+    session, source, query, _, _, _ = _services(tmp_path)
+    result = query.execute(
+        session, f"WITH data AS (SELECT * FROM source('{source.id}')) SELECT ';'"
+    )
+    assert result["rows"] == [[";"]]
+    with pytest.raises(QueryRejected, match="multiple SQL"):
+        query.execute(session, f"SELECT * FROM source('{source.id}'); SELECT 2")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r", "\r\n"], ids=["lf", "cr", "crlf"])
+def test_query_policy_recognizes_every_line_comment_ending(newline: str) -> None:
+    with pytest.raises(QueryRejected, match="forbidden"):
+        QueryService._validate_sql(f'SELECT 1 -- comment{newline}FROM "duckdb_views"()')
+
+
+@pytest.mark.parametrize("suffix", ["/* unfinished", "'unfinished", "$tag$unfinished"])
+def test_query_rejects_unterminated_sql_lexemes(suffix: str) -> None:
+    with pytest.raises(QueryRejected, match="unterminated"):
+        QueryService._validate_sql(f"SELECT 1 {suffix}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from agentic_analytics.models import (
     ExecutionStatus,
     ExecutionType,
     SessionMode,
+    SessionStatus,
 )
 from agentic_analytics.repositories import ExecutionRepository, SourceRepository
 from agentic_analytics.settings import Settings
@@ -62,8 +64,14 @@ class ExecutionService:
         source_ids: list[str] | None = None,
         timeout_seconds: int | None = None,
     ) -> ExecutionRecord:
+        if session.status is not SessionStatus.ACTIVE:
+            raise ExecutionPolicyError("session is closed; create a new analysis session")
         if session.mode is SessionMode.STRICT and not self.backend.conformant:
             raise ExecutionPolicyError("strict sessions require a conformant managed backend")
+        workspace_root = self.workspace.authorize_workspace(session.workspace_root)
+        state_root = self.settings.state_dir.resolve(strict=False)
+        if workspace_root == state_root or state_root in workspace_root.parents:
+            raise ExecutionPolicyError("workspace must not be inside server state")
         source_ids = list(dict.fromkeys(source_ids or []))
         source_fingerprints: dict[str, Any] = {}
         for source_id in source_ids:
@@ -78,33 +86,50 @@ class ExecutionService:
             max(timeout_seconds or self.settings.execution_timeout_seconds, 1),
             self.settings.max_execution_timeout_seconds,
         )
+        readonly_paths = tuple(
+            dict.fromkeys(
+                self.workspace.resolve_file(workspace_root, source.relative_path)
+                for source in self.sources.list(session.id)
+                if source.read_only
+                and source.relative_path is not None
+                and (workspace_root / source.relative_path).exists()
+            )
+        )
         execution_id = new_id(EntityType.EXECUTION)
-        workspace_root = Path(session.workspace_root).resolve(strict=True)
         # Serialize executions within a session so overlapping before/after snapshots cannot
         # attribute one execution's file changes to another.
         with self._session_lock(session.id):
-            before = snapshot_workspace(workspace_root)
-            temp_dir = workspace_root / ".agentic-analytics" / "tmp"
+            started_at = datetime.now(UTC)
+            before = snapshot_workspace(workspace_root, excluded_roots=(state_root,))
+            # Never write executable code through a caller-controlled workspace path.
+            # The Docker backend mounts this exact server-owned file read-only.
+            temp_dir = state_root / "tmp"
             temp_dir.mkdir(parents=True, exist_ok=True)
-            script_path = temp_dir / f"{execution_id}.py"
-            script_path.write_text(code, encoding="utf-8")
-            try:
-                result = self.backend.execute(session, script_path, timeout)
-            except Exception as exc:
-                # A backend failure (Docker unavailable, image missing, startup error) still
-                # gets a terminal audit record before the error propagates to the caller.
-                script_path.unlink(missing_ok=True)
-                self._persist_backend_failure(
-                    session, execution_id, code, source_ids, source_fingerprints, timeout, exc
-                )
-                raise
-            try:
-                after = snapshot_workspace(workspace_root)
-                artifacts = self.artifacts.register_changes(
-                    session.id, execution_id, workspace_root, before, after
-                )
-            finally:
-                script_path.unlink(missing_ok=True)
+            with tempfile.TemporaryDirectory(prefix=f"{execution_id}-", dir=temp_dir) as request:
+                script_path = Path(request) / "request.py"
+                script_path.write_text(code, encoding="utf-8")
+                try:
+                    result = self.backend.execute(
+                        session, script_path, timeout, readonly_paths=readonly_paths
+                    )
+                    after = snapshot_workspace(workspace_root, excluded_roots=(state_root,))
+                    artifacts = self.artifacts.register_changes(
+                        session.id, execution_id, workspace_root, before, after
+                    )
+                except Exception as exc:
+                    # Registration failures happen after code has already changed files.
+                    # Preserve their audit record and any artifacts published before failure.
+                    self._persist_backend_failure(
+                        session,
+                        execution_id,
+                        code,
+                        source_ids,
+                        source_fingerprints,
+                        timeout,
+                        started_at,
+                        exc,
+                    )
+                    raise
 
         stdout, stdout_truncated = _bounded_text(result.stdout, self.settings.max_output_chars)
         stderr, stderr_truncated = _bounded_text(result.stderr, self.settings.max_output_chars)
@@ -124,11 +149,17 @@ class ExecutionService:
             request={"code": code, "source_ids": source_ids, "timeout_seconds": timeout},
             source_ids=source_ids,
             source_fingerprints=source_fingerprints,
+            started_at=started_at,
             completed_at=completed_at,
             runtime=result.runtime,
             stdout_preview=stdout,
             stderr_preview=stderr,
-            truncated=stdout_truncated or stderr_truncated,
+            truncated=(
+                stdout_truncated
+                or stderr_truncated
+                or result.stdout_truncated
+                or result.stderr_truncated
+            ),
             artifact_ids=[artifact.id for artifact in artifacts],
             error=error,
         )
@@ -143,6 +174,7 @@ class ExecutionService:
         source_ids: list[str],
         source_fingerprints: dict[str, Any],
         timeout: int,
+        started_at: datetime,
         exc: BaseException,
     ) -> None:
         record = ExecutionRecord(
@@ -153,7 +185,13 @@ class ExecutionService:
             request={"code": code, "source_ids": source_ids, "timeout_seconds": timeout},
             source_ids=source_ids,
             source_fingerprints=source_fingerprints,
+            started_at=started_at,
             completed_at=datetime.now(UTC),
+            artifact_ids=[
+                artifact.id
+                for artifact in self.artifacts.repository.list(session.id)
+                if artifact.execution_id == execution_id
+            ],
             error={"type": type(exc).__name__, "message": str(exc)},
         )
         self.executions.add(record)

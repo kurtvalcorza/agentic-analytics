@@ -13,10 +13,16 @@ class WorkspaceService:
 
     SUPPORTED_SUFFIXES: ClassVar[frozenset[str]] = frozenset({".csv", ".parquet"})
 
-    def __init__(self, allowed_roots: list[Path]) -> None:
+    def __init__(
+        self, allowed_roots: list[Path], *, protected_roots: list[Path] | None = None
+    ) -> None:
         if not allowed_roots:
             raise ValueError("at least one allowed workspace root is required")
         self.allowed_roots = [root.resolve(strict=False) for root in allowed_roots]
+        self.protected_roots = [root.resolve(strict=False) for root in (protected_roots or [])]
+
+    def _protected(self, path: Path) -> bool:
+        return any(self._inside(path, root) for root in self.protected_roots)
 
     @staticmethod
     def _inside(path: Path, root: Path) -> bool:
@@ -34,6 +40,8 @@ class WorkspaceService:
             raise WorkspaceAuthorizationError("workspace_root must be a directory")
         if not any(self._inside(resolved, root) for root in self.allowed_roots):
             raise WorkspaceAuthorizationError("workspace is outside authorized roots")
+        if self._protected(resolved):
+            raise WorkspaceAuthorizationError("workspace must not be inside server state")
         return resolved
 
     def resolve_file(self, workspace_root: str | Path, relative_path: str | Path) -> Path:
@@ -51,6 +59,8 @@ class WorkspaceService:
             raise WorkspaceAuthorizationError(f"source does not resolve: {relative_path}") from exc
         if not self._inside(resolved, root):
             raise WorkspaceAuthorizationError("source resolves outside the authorized workspace")
+        if self._protected(resolved):
+            raise WorkspaceAuthorizationError("server state is not an analytical source")
         if not resolved.is_file():
             raise WorkspaceAuthorizationError("source must resolve to a regular file")
         return resolved
@@ -66,7 +76,11 @@ class WorkspaceService:
                 resolved = candidate.resolve(strict=True)
             except (FileNotFoundError, RuntimeError):
                 continue
-            if resolved.is_file() and self._inside(resolved, root):
+            if (
+                resolved.is_file()
+                and self._inside(resolved, root)
+                and not self._protected(resolved)
+            ):
                 discovered.append(resolved)
         return sorted(set(discovered))
 
