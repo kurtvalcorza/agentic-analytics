@@ -33,7 +33,7 @@ _SOURCE_ID = re.compile(r"src_[0-9a-f]{32}", re.IGNORECASE)
 _FORBIDDEN = re.compile(
     r"\b(insert|update|delete|create|drop|alter|copy|attach|detach|install|load|call|pragma|set|"
     r"export|import|vacuum|read_csv|read_csv_auto|read_parquet|parquet_scan|csv_scan|read_json|"
-    r"read_text|read_blob|glob|sqlite_scan|postgres_scan|httpfs|duckdb_secrets|"
+    r"read_text|read_blob|glob|sqlite_scan|postgres_scan|httpfs|duckdb_secrets|query|query_table|"
     # Catalog/configuration introspection can leak absolute host paths from view definitions.
     r"duckdb_views|duckdb_tables|duckdb_columns|duckdb_constraints|duckdb_databases|"
     r"duckdb_settings|duckdb_functions|duckdb_schemas|duckdb_temporary_files|duckdb_extensions|"
