@@ -73,8 +73,10 @@ class EvidenceLedger:
             self.executions.get(item.session_id, execution_id)
             for execution_id in item.execution_ids
         ]
-        for artifact_id in item.artifact_ids:
+        artifacts = [
             self.artifacts.get(item.session_id, artifact_id)
+            for artifact_id in item.artifact_ids
+        ]
         upstream_evidence = [
             self.evidence.get(item.session_id, evidence_id)
             for evidence_id in item.evidence_ids
@@ -90,6 +92,18 @@ class EvidenceLedger:
                 joined = ", ".join(unsuccessful)
                 raise EvidenceRegistrationError(
                     f"derived_fact requires successful executions; not successful: {joined}"
+                )
+            by_id = {execution.id: execution for execution in executions}
+            unlinked_artifacts = [
+                artifact.id
+                for artifact in artifacts
+                if artifact.execution_id not in by_id
+                or artifact.id not in by_id[artifact.execution_id].artifact_ids
+            ]
+            if unlinked_artifacts:
+                raise EvidenceRegistrationError(
+                    "derived_fact artifacts must be outputs of a referenced successful "
+                    f"execution; unlinked artifacts: {', '.join(unlinked_artifacts)}"
                 )
             # The source -> execution -> evidence chain must be real: every cited source must
             # actually have been used by one of the referenced executions.

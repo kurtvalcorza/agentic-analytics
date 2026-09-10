@@ -48,7 +48,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def snapshot_workspace(workspace_root: Path) -> dict[str, FileMeta]:
+def snapshot_workspace(
+    workspace_root: Path, *, excluded_roots: tuple[Path, ...] = ()
+) -> dict[str, FileMeta]:
     """Record cheap file metadata (size + mtime) for every workspace file.
 
     Only metadata is captured here; contents are hashed later and only for files whose
@@ -57,9 +59,16 @@ def snapshot_workspace(workspace_root: Path) -> dict[str, FileMeta]:
     """
 
     root = workspace_root.resolve(strict=True)
+    excluded = tuple(path.resolve(strict=False) for path in excluded_roots)
     snapshot: dict[str, FileMeta] = {}
     for path in root.rglob("*"):
         if path.is_symlink() or not path.is_file():
+            continue
+        resolved = path.resolve(strict=True)
+        if any(
+            resolved == excluded_root or excluded_root in resolved.parents
+            for excluded_root in excluded
+        ):
             continue
         relative = path.relative_to(root)
         if relative.parts and relative.parts[0] == _INTERNAL_DIR:
@@ -244,7 +253,7 @@ class ArtifactRegistry:
         archive_base = self.archive_base(session_id, execution_id).resolve(strict=False)
         artifacts: list[Artifact] = []
         for relative in changed:
-            source = (root / relative)
+            source = root / relative
             # Reject a source that resolves outside the workspace (for example a symlink managed
             # code created that points at a host file).
             resolved_source = source.resolve(strict=True)

@@ -7,9 +7,12 @@ from mcp.server import MCPServer
 from agentic_analytics.models import EvidenceClassification
 from agentic_analytics.runtime import Runtime
 
+from .errors import tool_errors
+
 
 def register_evidence_tools(server: MCPServer[Any], runtime: Runtime) -> None:
     @server.tool(description="Register an immutable evidence item with validated provenance links.")
+    @tool_errors
     def register_evidence(
         session_id: str,
         classification: EvidenceClassification,
@@ -23,23 +26,24 @@ def register_evidence_tools(server: MCPServer[Any], runtime: Runtime) -> None:
         units: str | None = None,
         method_summary: str | None = None,
     ) -> dict[str, Any]:
-        runtime.sessions.get(session_id, session_id)
-        item = runtime.evidence_ledger.register(
-            session_id,
-            classification,
-            claim,
-            material=material,
-            source_ids=source_ids,
-            execution_ids=execution_ids,
-            artifact_ids=artifact_ids,
-            evidence_ids=evidence_ids,
-            value=value,
-            units=units,
-            method_summary=method_summary,
-        )
+        with runtime.sessions.active(session_id):
+            item = runtime.evidence_ledger.register(
+                session_id,
+                classification,
+                claim,
+                material=material,
+                source_ids=source_ids,
+                execution_ids=execution_ids,
+                artifact_ids=artifact_ids,
+                evidence_ids=evidence_ids,
+                value=value,
+                units=units,
+                method_summary=method_summary,
+            )
         return item.model_dump(mode="json", by_alias=True)
 
     @server.tool(description="List session evidence with optional provenance filters.")
+    @tool_errors
     def list_evidence(
         session_id: str,
         classification: EvidenceClassification | None = None,

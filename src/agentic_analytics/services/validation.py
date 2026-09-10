@@ -4,6 +4,8 @@ from pathlib import Path
 
 from agentic_analytics.models import (
     AnalysisSession,
+    DataSource,
+    EvidenceItem,
     ValidationFinding,
     ValidationRun,
     ValidationRunStatus,
@@ -12,11 +14,14 @@ from agentic_analytics.models import (
 )
 from agentic_analytics.repositories import (
     EvidenceRepository,
+    ExecutionRepository,
     FindingRepository,
     SourceRepository,
     ValidationRunRepository,
 )
 from agentic_analytics.validators.core import DEFAULT_VALIDATORS, ValidationContext, Validator
+
+from .workspace import WorkspaceService
 
 
 class ValidationRequestError(ValueError):
@@ -31,12 +36,38 @@ class ValidationService:
         findings: FindingRepository,
         runs: ValidationRunRepository,
         validators: tuple[Validator, ...] = DEFAULT_VALIDATORS,
+        *,
+        executions: ExecutionRepository,
+        workspace: WorkspaceService | None = None,
     ) -> None:
         self.evidence = evidence
         self.sources = sources
         self.findings = findings
         self.runs = runs
         self.validators = validators
+        self.executions = executions
+        self.workspace = workspace
+
+    def _active_sources(self, session_id: str, evidence: list[EvidenceItem]) -> list[DataSource]:
+        sources = self.sources.list(session_id)
+        referenced = {source_id for item in evidence for source_id in item.source_ids}
+        execution_ids = {execution_id for item in evidence for execution_id in item.execution_ids}
+        for execution_id in execution_ids:
+            referenced.update(self.executions.get(session_id, execution_id).source_ids)
+        # Reinspection supersedes an unused version, but cited historical records remain
+        # active, including sources used by executions behind upstream evidence items.
+        # Repository order is by random ID and cannot identify the newest registration.
+        latest: dict[tuple[str | None, str | None], DataSource] = {}
+        for source in sources:
+            location = (source.relative_path, source.uri)
+            previous = latest.get(location)
+            if previous is None or source.registered_at > previous.registered_at:
+                latest[location] = source
+        return [
+            source for source in sources
+            if source.id in referenced
+            or source.registered_at == latest[(source.relative_path, source.uri)].registered_at
+        ]
 
     def validate(
         self,
@@ -66,13 +97,20 @@ class ValidationService:
             raise ValidationRequestError(
                 "validation requires at least one check; an empty check set has zero coverage"
             )
+        workspace_root = (
+            self.workspace.authorize_workspace(session.workspace_root)
+            if self.workspace is not None
+            else Path(session.workspace_root).resolve(strict=True)
+        )
+        evidence = self.evidence.list(session.id)
         context = ValidationContext(
             session=session,
-            evidence=self.evidence.list(session.id),
-            sources=self.sources.list(session.id),
-            workspace_root=Path(session.workspace_root).resolve(strict=True),
+            evidence=evidence,
+            sources=self._active_sources(session.id, evidence),
+            workspace_root=workspace_root,
             claim_texts=claim_texts or [],
             duplicate_keys=duplicate_keys or {},
+            workspace=self.workspace,
         )
         all_findings: list[ValidationFinding] = []
         checks_run: list[str] = []

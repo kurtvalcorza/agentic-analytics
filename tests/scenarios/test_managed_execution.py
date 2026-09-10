@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from agentic_analytics.models import AnalysisSession, SessionMode
 from agentic_analytics.runtime import Runtime
 from agentic_analytics.settings import Settings
@@ -60,7 +62,33 @@ def test_managed_execution_timeout_destroys_runaway_container(tmp_path: Path) ->
     runtime = _runtime(tmp_path, workspace, timeout=1)
     session = AnalysisSession(workspace_root=str(workspace), mode=SessionMode.STRICT)
     runtime.sessions.add(session)
-    record = runtime.execution.execute_python(
-        session, "while True:\n    pass\n", timeout_seconds=1
-    )
+    record = runtime.execution.execute_python(session, "while True:\n    pass\n", timeout_seconds=1)
     assert record.status.value == "timed_out"
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_managed_output_truncation_is_persisted(tmp_path: Path, timed_out: bool) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = Runtime.create(
+        Settings(
+            state_dir=tmp_path / "state",
+            allowed_workspace_roots=[workspace],
+            execution_backend="docker",
+            docker_image="agentic-analytics-exec:test",
+            max_output_chars=1024,
+        )
+    )
+    session = AnalysisSession(workspace_root=str(workspace), mode=SessionMode.STRICT)
+    runtime.sessions.add(session)
+    code = "import sys\nsys.stdout.write('o' * 2049)\nsys.stderr.write('e' * 2049)\n"
+    if timed_out:
+        code += "while True:\n    pass\n"
+    record = runtime.execution.execute_python(session, code, timeout_seconds=2)
+    assert record.status.value == ("timed_out" if timed_out else "succeeded")
+    assert record.stdout_preview == "o" * 1024
+    # Docker may prepend host capability warnings to the container's stderr stream.
+    assert len(record.stderr_preview) == 1024
+    assert record.stderr_preview.endswith("e" * 64)
+    assert record.truncated
+    assert runtime.executions.get(session.id, record.id).truncated

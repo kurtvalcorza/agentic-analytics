@@ -99,6 +99,10 @@ class JsonRecordRepository[RecordT: BaseModel]:
 
     @staticmethod
     def _fsync_dir(directory: Path) -> None:
+        # Windows cannot open directories with os.open; the record itself was fsynced
+        # before publication. Do not turn a successful publication into a failed call.
+        if os.name == "nt":
+            return
         dir_fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(dir_fd)

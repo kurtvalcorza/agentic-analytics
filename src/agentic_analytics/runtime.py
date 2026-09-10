@@ -52,7 +52,9 @@ class Runtime:
         evidence_repository = EvidenceRepository(resolved.state_dir)
         findings = FindingRepository(resolved.state_dir)
         validation_runs = ValidationRunRepository(resolved.state_dir)
-        workspace = WorkspaceService(resolved.normalized_allowed_roots())
+        workspace = WorkspaceService(
+            resolved.normalized_allowed_roots(), protected_roots=[resolved.state_dir]
+        )
         inspector = InspectorService(sources, workspace, resolved)
         registry = ArtifactRegistry(
             artifact_repository,
@@ -70,6 +72,7 @@ class Runtime:
                 cpus=resolved.docker_cpus,
                 pids_limit=resolved.docker_pids_limit,
                 max_output_chars=resolved.max_output_chars,
+                protected_state_root=resolved.state_dir,
             )
         else:
             backend = SubprocessDevBackend()
@@ -87,6 +90,8 @@ class Runtime:
             sources,
             findings,
             validation_runs,
+            executions=executions,
+            workspace=workspace,
         )
         return cls(
             resolved,

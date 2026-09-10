@@ -5,6 +5,8 @@ import pytest
 
 from agentic_analytics.models import (
     AnalysisSession,
+    Artifact,
+    ArtifactKind,
     DataSource,
     EvidenceClassification,
     ExecutionRecord,
@@ -153,3 +155,55 @@ def test_interpretation_rejects_recommendation_input(tmp_path: Path) -> None:
             "This builds on a recommendation.",
             evidence_ids=[recommendation.id],
         )
+
+
+@pytest.mark.parametrize("origin_status", [ExecutionStatus.FAILED, ExecutionStatus.SUCCEEDED])
+def test_derived_fact_rejects_artifact_from_unrelated_execution(
+    tmp_path: Path, origin_status: ExecutionStatus
+) -> None:
+    ledger, sources, executions = _ledger(tmp_path)
+    session = AnalysisSession(workspace_root=str(tmp_path))
+    source = sources.add(_source(session.id))
+    origin = executions.add(_execution(session.id, source.id, origin_status))
+    cited = executions.add(_execution(session.id, source.id, ExecutionStatus.SUCCEEDED))
+    artifact = ledger.artifacts.add(
+        Artifact(
+            session_id=session.id, execution_id=origin.id, kind=ArtifactKind.TABLE,
+            display_name="result", relative_path="result.csv", media_type="text/csv",
+            size_bytes=10, sha256="a" * 64,
+        )
+    )
+    with pytest.raises(EvidenceRegistrationError, match="unlinked artifacts"):
+        ledger.register(
+            session.id, EvidenceClassification.DERIVED_FACT, "The result is supported.",
+            source_ids=[source.id], execution_ids=[cited.id], artifact_ids=[artifact.id],
+        )
+    assert ledger.list(session.id) == []
+
+
+def test_derived_fact_requires_bidirectional_artifact_link(tmp_path: Path) -> None:
+    ledger, sources, executions = _ledger(tmp_path)
+    session = AnalysisSession(workspace_root=str(tmp_path))
+    source = sources.add(_source(session.id))
+    execution = _execution(session.id, source.id, ExecutionStatus.SUCCEEDED)
+    artifact = ledger.artifacts.add(
+        Artifact(
+            session_id=session.id, execution_id=execution.id, kind=ArtifactKind.TABLE,
+            display_name="result", relative_path="result.csv", media_type="text/csv",
+            size_bytes=10, sha256="a" * 64,
+        )
+    )
+    executions.add(execution)
+    with pytest.raises(EvidenceRegistrationError, match="unlinked artifacts"):
+        ledger.register(
+            session.id, EvidenceClassification.DERIVED_FACT, "The result is supported.",
+            source_ids=[source.id], execution_ids=[execution.id], artifact_ids=[artifact.id],
+        )
+    # A genuine runtime artifact appears in both canonical records.
+    execution.artifact_ids = [artifact.id]
+    executions.update(execution)
+    accepted = ledger.register(
+        session.id, EvidenceClassification.DERIVED_FACT, "The result is supported.",
+        source_ids=[source.id], execution_ids=[execution.id], artifact_ids=[artifact.id],
+    )
+    assert accepted.artifact_ids == [artifact.id]

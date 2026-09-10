@@ -21,7 +21,11 @@ class SubprocessDevBackend:
         session: AnalysisSession,
         script_path: Path,
         timeout_seconds: int,
+        *,
+        readonly_paths: tuple[Path, ...] = (),
     ) -> BackendResult:
+        # Host-native development execution cannot enforce read-only mounts.
+        del readonly_paths
         workspace = Path(session.workspace_root).resolve(strict=True)
         internal_home = workspace / ".agentic-analytics" / "dev-home"
         internal_home.mkdir(parents=True, exist_ok=True)
