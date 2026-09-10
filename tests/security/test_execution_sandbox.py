@@ -208,9 +208,12 @@ Path('aliases/deep/allowed-output.txt').write_text('allowed')
         record = runtime.execution.execute_python(session, code)
         assert record.status.value == "succeeded", record.stderr_preview
         for name in ancestors:
-            # Linux EBUSY proves the path itself is a mount boundary, rather than a
-            # failed rename caused by an earlier rename making this path disappear.
-            assert f"{name}=16" in record.stdout_preview
+            # Bind-mount boundaries can reject rename with EBUSY (16) or EXDEV (18),
+            # depending on the mount topology. Either result proves the rename was refused.
+            assert any(
+                f"{name}={error_number}" in record.stdout_preview
+                for error_number in (16, 18)
+            )
         assert sentinel.read_bytes() == b"SERVER_PRIVATE"
         assert source_path.read_bytes() == source_bytes
         assert alias.read_bytes() == source_bytes
