@@ -4,6 +4,7 @@ import csv
 import io
 import os
 import re
+import stat
 import subprocess
 import threading
 from collections.abc import Iterator
@@ -14,6 +15,12 @@ from uuid import uuid4
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
 
 from .base import BackendResult
+from .guards import DiskLimits, WorkspaceDiskGuard, drain_bounded
+
+# Fixed unprivileged identity baked into docker/Dockerfile.exec. Used whenever the host cannot
+# supply a non-root numeric identity (non-POSIX Docker Desktop hosts).
+DEFAULT_CONTAINER_USER = "10001:10001"
+_USER_PATTERN = re.compile(r"^[0-9]+:[0-9]+$")
 
 
 class DockerExecutionError(RuntimeError):
@@ -33,8 +40,14 @@ class DockerBackend:
         pids_limit: int = 128,
         max_output_chars: int = 65536,
         protected_state_root: Path | None = None,
+        disk_limits: DiskLimits | None = None,
+        user: str | None = None,
     ) -> None:
+        if user is not None and not _USER_PATTERN.fullmatch(user):
+            raise ValueError("docker user must be a numeric 'uid:gid' pair")
         self.image = image
+        self.disk_limits = disk_limits or DiskLimits()
+        self.user = user
         self.memory = memory
         self.cpus = cpus
         self.pids_limit = pids_limit
@@ -50,12 +63,32 @@ class DockerBackend:
         # are removed (with all descendant processes) when the run ends.
         return f"agentic-analytics-{self._session_suffix(session_id)}-{uuid4().hex[:12]}"
 
-    @staticmethod
-    def _user_args() -> list[str]:
+    def _user_args(self) -> list[str]:
+        """Always pass an explicit, non-root container identity.
+
+        POSIX hosts reuse the server's own uid/gid so bind-mounted workspace writes keep the
+        caller's ownership. Hosts without a numeric identity use the image's fixed unprivileged
+        user. A root server is refused rather than silently running managed code as uid 0;
+        operators can opt into a specific identity with ``docker_user``.
+        """
+
+        if self.user is not None:
+            uid = int(self.user.split(":", 1)[0])
+            if uid == 0:
+                raise DockerExecutionError(
+                    "refusing to run managed code as container root (docker_user uid 0)"
+                )
+            return ["--user", self.user]
         getuid = getattr(os, "getuid", None)
         getgid = getattr(os, "getgid", None)
         if os.name != "posix" or getuid is None or getgid is None:
-            return []
+            return ["--user", DEFAULT_CONTAINER_USER]
+        if getuid() == 0:
+            raise DockerExecutionError(
+                "refusing to run managed code as container root: the server is running as "
+                "root. Run it as an unprivileged user or set AGENTIC_ANALYTICS_DOCKER_USER "
+                "to a non-root 'uid:gid' that can write the workspace."
+            )
         return ["--user", f"{getuid()}:{getgid()}"]
 
     @staticmethod
@@ -97,6 +130,18 @@ class DockerBackend:
             ]
             for name in files:
                 path = parent / name
+                try:
+                    mode = path.lstat().st_mode
+                except OSError as exc:
+                    failed(exc)
+                # A Unix socket (for example a Docker daemon or agent control socket) or a device
+                # node would give managed code a control channel that --network none does not
+                # cover, so a workspace containing one is never mounted.
+                if stat.S_ISSOCK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
+                    raise DockerExecutionError(
+                        "workspace contains a socket or device node; refusing to mount it: "
+                        f"{path}"
+                    )
                 # Symlinks resolve through their target mount; bind mounting their link name
                 # could instead make Docker follow a target outside the container workspace.
                 if not path.is_symlink() and path.is_file():
@@ -164,7 +209,11 @@ class DockerBackend:
             mounts += self._mount("type=bind", f"src={parent}", f"dst={target}")
         if state.is_relative_to(workspace):
             target = "/workspace/" + state.relative_to(workspace).as_posix()
-            mounts += self._mount("type=tmpfs", f"dst={target}", "tmpfs-size=1048576", "readonly")
+            # Explicit mode: Docker otherwise copies the (private 0700) state directory's mode
+            # onto a root-owned mask, leaving managed code an unreadable rather than empty dir.
+            mounts += self._mount(
+                "type=tmpfs", f"dst={target}", "tmpfs-size=1048576", "tmpfs-mode=0555", "readonly"
+            )
         for path in protected_files:
             target = "/workspace/" + path.relative_to(workspace).as_posix()
             mounts += self._mount("type=bind", f"src={path}", f"dst={target}", "readonly")
@@ -238,15 +287,7 @@ class DockerBackend:
         prints gigabytes within its timeout, instead of buffering everything.
         """
 
-        total = 0
-        for chunk in iter(lambda: stream.read(65536), ""):
-            if len(chunk) > self.max_output_chars - total and truncated is not None:
-                truncated.set()
-            if total < self.max_output_chars:
-                take = chunk[: self.max_output_chars - total]
-                buffer.append(take)
-                total += len(take)
-        stream.close()
+        drain_bounded(stream, buffer, self.max_output_chars, truncated)
 
     def execute(
         self,
@@ -262,12 +303,20 @@ class DockerBackend:
             )
         container = self._container_name(session.id)
         runtime = {"backend": self.name, "image": self.image, "network": "none"}
+        run_args = self._run_args(session, container, script_path, readonly_paths=readonly_paths)
 
+        def kill_container(_: str = "") -> None:
+            # Killing the ephemeral container tears down the whole process tree; --rm removes it.
+            self._run(["kill", container], check=False, timeout=30)
+
+        # Baseline workspace usage before the container can write anything.
+        workspace = Path(session.workspace_root).resolve(strict=True)
+        excluded = (self.protected_state_root,) if self.protected_state_root else ()
+        guard = WorkspaceDiskGuard(
+            workspace, self.disk_limits, kill_container, excluded_roots=excluded
+        )
         proc = subprocess.Popen(
-            [
-                "docker",
-                *self._run_args(session, container, script_path, readonly_paths=readonly_paths),
-            ],
+            ["docker", *run_args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -289,21 +338,32 @@ class DockerBackend:
         err_thread.start()
 
         timed_out = False
-        try:
-            proc.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            # Killing the ephemeral container tears down the whole process tree; --rm removes it.
-            self._run(["kill", container], check=False, timeout=30)
+        with guard:
             try:
-                proc.wait(timeout=30)
+                proc.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                timed_out = True
+                kill_container()
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
         out_thread.join(timeout=10)
         err_thread.join(timeout=10)
         stdout = "".join(out_buffer)
         stderr = "".join(err_buffer)
 
+        if guard.reason is not None:
+            return BackendResult(
+                status=ExecutionStatus.FAILED,
+                stdout=stdout,
+                stderr=f"execution terminated: {guard.reason}",
+                exit_code=proc.returncode,
+                runtime={**runtime, "resource_limit": "disk"},
+                stdout_truncated=stdout_truncated.is_set(),
+                stderr_truncated=stderr_truncated.is_set(),
+                resource_limit="disk",
+            )
         if timed_out:
             return BackendResult(
                 status=ExecutionStatus.TIMED_OUT,

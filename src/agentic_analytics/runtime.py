@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .execution_backends import DockerBackend, ExecutionBackend, SubprocessDevBackend
+from .execution_backends.guards import DiskLimits
 from .repositories import (
     ArtifactRepository,
     EvidenceRepository,
@@ -65,6 +66,11 @@ class Runtime:
         )
         query = QueryService(sources, executions, workspace, registry, resolved)
         backend: ExecutionBackend
+        disk_limits = DiskLimits(
+            max_output_bytes=resolved.max_execution_output_bytes,
+            max_output_files=resolved.max_execution_output_files,
+            min_free_bytes=resolved.min_free_disk_bytes,
+        )
         if resolved.execution_backend == "docker":
             backend = DockerBackend(
                 resolved.docker_image,
@@ -73,9 +79,15 @@ class Runtime:
                 pids_limit=resolved.docker_pids_limit,
                 max_output_chars=resolved.max_output_chars,
                 protected_state_root=resolved.state_dir,
+                disk_limits=disk_limits,
+                user=resolved.docker_user,
             )
         else:
-            backend = SubprocessDevBackend()
+            backend = SubprocessDevBackend(
+                max_output_chars=resolved.max_output_chars,
+                disk_limits=disk_limits,
+                protected_state_root=resolved.state_dir,
+            )
         execution = ExecutionService(
             backend, executions, sources, registry, workspace, resolved
         )

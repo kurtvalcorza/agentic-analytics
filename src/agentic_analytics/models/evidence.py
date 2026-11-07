@@ -18,6 +18,17 @@ class EvidenceClassification(StrEnum):
     RECOMMENDATION = "recommendation"
 
 
+class SourceLineage(StrEnum):
+    """Assurance level of an evidence item's source -> claim lineage (see SourceAttestation).
+
+    ``enforced`` only when every execution behind the item (directly or through upstream
+    evidence) had runtime-enforced source access. It never means the claim value was checked.
+    """
+
+    DECLARED = "declared"
+    ENFORCED = "enforced"
+
+
 class EvidenceItem(CanonicalModel):
     id: str = Field(default_factory=lambda: new_id(EntityType.EVIDENCE))
     session_id: str
@@ -31,6 +42,7 @@ class EvidenceItem(CanonicalModel):
     value: Any | None = None
     units: str | None = None
     method_summary: str | None = None
+    source_lineage: SourceLineage = SourceLineage.DECLARED
     created_at: UtcDatetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,22 +32,51 @@ _MEDIA_TYPES: dict[str, str] = {
 }
 
 
+_CHUNK = 1024 * 1024
+
+
 class ArtifactLimitError(RuntimeError):
     pass
 
 
+class ArtifactIntegrityError(RuntimeError):
+    """A workspace file changed while it was being archived, so it cannot be attested."""
+
+
 @dataclass(frozen=True, slots=True)
 class FileMeta:
+    """Change-detection metadata for a workspace file.
+
+    ``ctime_ns`` and the inode identity catch rewrites that deliberately preserve size and
+    mtime (``os.utime`` cannot set ctime), and replacement of a file by a different inode.
+    """
+
     size_bytes: int
     mtime_ns: int
+    ctime_ns: int = 0
+    inode: int = 0
+    device: int = 0
+
+    @classmethod
+    def of(cls, info: os.stat_result) -> FileMeta:
+        return cls(info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev)
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: Path) -> tuple[str, int]:
+    """Return the digest and byte count of exactly the bytes read in one pass."""
+
     digest = hashlib.sha256()
+    size = 0
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        for chunk in iter(lambda: stream.read(_CHUNK), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def _private_mkdir(path: Path) -> None:
+    # Archive directories hold copies of analytical outputs; keep them owner-only.
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
 def snapshot_workspace(
@@ -73,8 +104,7 @@ def snapshot_workspace(
         relative = path.relative_to(root)
         if relative.parts and relative.parts[0] == _INTERNAL_DIR:
             continue
-        stat = path.stat()
-        snapshot[relative.as_posix()] = FileMeta(stat.st_size, stat.st_mtime_ns)
+        snapshot[relative.as_posix()] = FileMeta.of(path.stat())
     return snapshot
 
 
@@ -180,6 +210,15 @@ class ArtifactRegistry:
                 f"{self.max_artifact_bytes}"
             )
         # Hash outside the lock (it can be expensive) then reserve budget and persist atomically.
+        # Size and digest describe the same single read of the archived bytes.
+        sha256, size_bytes = _sha256(resolved)
+        if size_bytes > self.max_artifact_bytes:
+            raise ArtifactLimitError(
+                f"artifact {resolved.name} is {size_bytes} bytes; per-file limit is "
+                f"{self.max_artifact_bytes}"
+            )
+        with contextlib.suppress(OSError):
+            resolved.chmod(0o600)
         artifact = Artifact(
             session_id=session_id,
             execution_id=execution_id,
@@ -187,16 +226,16 @@ class ArtifactRegistry:
             display_name=resolved.name,
             relative_path=resolved.relative_to(archive_base).as_posix(),
             media_type=_media_type(resolved),
-            size_bytes=stat.st_size,
-            sha256=_sha256(resolved),
+            size_bytes=size_bytes,
+            sha256=sha256,
             lineage=lineage or {},
             metadata=metadata or {},
         )
         with self._session_lock(session_id):
             existing_bytes = self.session_artifact_bytes(session_id)
-            if existing_bytes + stat.st_size > self.max_total_bytes:
+            if existing_bytes + size_bytes > self.max_total_bytes:
                 raise ArtifactLimitError(
-                    f"registering {resolved.name} ({stat.st_size} bytes) would exceed the session "
+                    f"registering {resolved.name} ({size_bytes} bytes) would exceed the session "
                     f"artifact byte budget of {self.max_total_bytes}"
                 )
             return self.repository.add(artifact)
@@ -240,7 +279,9 @@ class ArtifactRegistry:
                     f"execution would bring session artifacts to {existing_bytes + total_bytes} "
                     f"bytes; limit is {self.max_total_bytes}"
                 )
-            return self._copy_and_register(session_id, execution_id, root, changed, before)
+            return self._copy_and_register(
+                session_id, execution_id, root, changed, before, after
+            )
 
     def _copy_and_register(
         self,
@@ -249,6 +290,7 @@ class ArtifactRegistry:
         root: Path,
         changed: list[str],
         before: dict[str, FileMeta],
+        after: dict[str, FileMeta],
     ) -> list[Artifact]:
         archive_base = self.archive_base(session_id, execution_id).resolve(strict=False)
         artifacts: list[Artifact] = []
@@ -263,7 +305,7 @@ class ArtifactRegistry:
                 continue
 
             destination = archive_base / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            _private_mkdir(destination.parent)
             # Never write through a symlinked archive destination: the resolved parent must stay
             # beneath the (managed-inaccessible) archive base.
             resolved_parent = destination.parent.resolve(strict=True)
@@ -272,9 +314,9 @@ class ArtifactRegistry:
                     f"artifact destination for {relative} escapes the archive root"
                 )
 
-            sha256 = _sha256(resolved_source)
-            self._copy_bytes(resolved_source, destination)
-            size_bytes = destination.stat().st_size
+            sha256, size_bytes = self._archive_file(
+                resolved_source, destination, expected=after[relative]
+            )
             artifact = Artifact(
                 session_id=session_id,
                 execution_id=execution_id,
@@ -294,11 +336,87 @@ class ArtifactRegistry:
             artifacts.append(artifact)
         return artifacts
 
+    def _archive_file(
+        self, source: Path, destination: Path, *, expected: FileMeta
+    ) -> tuple[str, int]:
+        """Copy ``source`` to ``destination`` atomically, attesting the archived bytes.
+
+        The digest and size are computed from exactly the bytes written to a private temporary
+        file in the destination directory, which is fsynced and then renamed into place, so the
+        recorded SHA-256 always describes the published archive. If the source's metadata
+        differs from the post-execution snapshot, or changes during the copy, the copy is
+        discarded and the artifact is refused rather than attested with mixed content.
+        """
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        temp = destination.with_name(f".{destination.name}.{os.urandom(8).hex()}.partial")
+        fd = os.open(temp, flags, 0o600)
+        published = False
+        try:
+            with source.open("rb") as src, os.fdopen(fd, "wb") as dst:
+                if FileMeta.of(os.fstat(src.fileno())) != expected:
+                    raise ArtifactIntegrityError(
+                        f"artifact {source.name} changed after execution finished"
+                    )
+                digest = hashlib.sha256()
+                size = 0
+                for chunk in self._read_chunks(src):
+                    digest.update(chunk)
+                    dst.write(chunk)
+                    size += len(chunk)
+                if size > self.max_artifact_bytes:
+                    raise ArtifactLimitError(
+                        f"artifact {source.name} grew to {size} bytes; per-file limit is "
+                        f"{self.max_artifact_bytes}"
+                    )
+                if FileMeta.of(os.fstat(src.fileno())) != expected:
+                    raise ArtifactIntegrityError(
+                        f"artifact {source.name} was modified while it was being archived"
+                    )
+                dst.flush()
+                os.fsync(dst.fileno())
+            if os.stat(temp, follow_symlinks=False).st_size != size:
+                raise ArtifactIntegrityError(f"archived copy of {source.name} is incomplete")
+            # Never write through a symlinked destination: replace() swaps the directory entry.
+            os.replace(temp, destination)
+            published = True
+            return digest.hexdigest(), size
+        finally:
+            if not published:
+                with contextlib.suppress(FileNotFoundError):
+                    temp.unlink()
+
     @staticmethod
-    def _copy_bytes(source: Path, destination: Path) -> None:
-        # Copy contents without following a symlinked destination file.
-        if destination.is_symlink() or destination.exists():
-            destination.unlink()
-        with source.open("rb") as src, destination.open("wb") as dst:
-            for chunk in iter(lambda: src.read(1024 * 1024), b""):
-                dst.write(chunk)
+    def _read_chunks(stream: Any) -> Any:
+        return iter(lambda: stream.read(_CHUNK), b"")
+
+    def discard_created_files(
+        self, workspace_root: Path, before: dict[str, FileMeta], after: dict[str, FileMeta]
+    ) -> int:
+        """Delete files an execution created (never pre-existing ones); return bytes freed.
+
+        Used when a workload is terminated for exceeding its disk budget so its partial output
+        does not keep consuming host storage. Modified pre-existing files are left in place.
+        """
+
+        root = workspace_root.resolve(strict=True)
+        freed = 0
+        for relative, meta in after.items():
+            if relative in before:
+                continue
+            path = root / relative
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            # Only remove the exact regular file observed in the snapshot.
+            if path.is_symlink() or FileMeta.of(info) != meta:
+                continue
+            parent = path.parent.resolve(strict=True)
+            if parent != root and root not in parent.parents:
+                continue
+            with contextlib.suppress(OSError):
+                path.unlink()
+                freed += meta.size_bytes
+        return freed

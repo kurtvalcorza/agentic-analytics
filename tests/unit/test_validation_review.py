@@ -60,7 +60,10 @@ def test_reinspection_supersedes_uncited_source_version(tmp_path: Path) -> None:
     assert execution.status is ExecutionStatus.SUCCEEDED
     run, findings = runtime.validation.validate(session, checks=["stale_sources"])
     assert findings == []
-    assert run.status.value == "validated"
+    # A clean subset of checks is "partial", never an unqualified "validated".
+    assert run.status.value == "partial"
+    assert run.checks_skipped
+    assert run.coverage_complete is False
     # Historical provenance is retained, even though it no longer blocks new work.
     assert runtime.sources.get(session.id, old.id).fingerprint != current.fingerprint
 

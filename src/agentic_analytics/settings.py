@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -24,12 +25,22 @@ class Settings(BaseSettings):
     docker_memory: str = "1g"
     docker_cpus: float = Field(default=1.0, gt=0, le=8)
     docker_pids_limit: int = Field(default=128, ge=16, le=4096)
+    # Explicit non-root container identity ("uid:gid"). Defaults to the server's own identity on
+    # POSIX hosts and to the image's unprivileged user elsewhere; uid 0 is always refused.
+    docker_user: str | None = Field(default=None, pattern=r"^[0-9]+:[0-9]+$")
     execution_timeout_seconds: int = Field(default=120, ge=1, le=3600)
     max_execution_timeout_seconds: int = Field(default=300, ge=1, le=3600)
     max_output_chars: int = Field(default=65536, ge=1024, le=1_000_000)
     max_artifacts_per_execution: int = Field(default=64, ge=1, le=10_000)
     max_artifact_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
     max_total_artifact_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
+    # Budget for bytes/files one execution may add to its writable workspace, enforced while it
+    # runs (not only at artifact registration), plus a host free-space reserve.
+    max_execution_output_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
+    max_execution_output_files: int = Field(default=10_000, ge=1)
+    min_free_disk_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+    max_list_page_size: int = Field(default=200, ge=1, le=10_000)
+    max_discovery_scan_entries: int = Field(default=100_000, ge=1)
     max_validation_findings: int = Field(default=200, ge=1, le=10_000)
     max_spill_rows: int = Field(default=1_000_000, ge=1)
     max_result_preview_bytes: int = Field(default=256 * 1024, ge=1024)
@@ -40,5 +51,9 @@ class Settings(BaseSettings):
         return [root.expanduser().resolve(strict=False) for root in self.allowed_workspace_roots]
 
     def ensure_directories(self) -> None:
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        # Server state (records, archived artifacts, request scripts) may contain sensitive
+        # analytical data, so it is private to the server's user regardless of umask.
+        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix" and self.state_dir.stat().st_uid == os.getuid():
+            self.state_dir.chmod(0o700)
         self.workspace_base_dir.mkdir(parents=True, exist_ok=True)

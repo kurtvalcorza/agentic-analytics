@@ -6,6 +6,8 @@ from agentic_analytics.models import (
     EvidenceClassification,
     EvidenceItem,
     ExecutionStatus,
+    SourceAttestation,
+    SourceLineage,
     ensure_acyclic_evidence,
 )
 from agentic_analytics.repositories import (
@@ -62,9 +64,36 @@ class EvidenceLedger:
             method_summary=method_summary,
         )
         self._validate_references(item)
+        item.source_lineage = self._source_lineage(item)
         existing = self.evidence.list(session_id)
         ensure_acyclic_evidence([*existing, item])
         return self.evidence.add(item)
+
+    def _source_lineage(self, item: EvidenceItem) -> SourceLineage:
+        """Label how strongly the runtime knows the item's sources were actually used.
+
+        Lineage is ``enforced`` only when every execution behind the item confined its data
+        access to the declared sources (managed SQL). Managed Python source_ids, and source
+        facts asserted directly by the caller, are ``declared``. This is about data access only;
+        it never asserts that the claim's value follows from the execution output.
+        """
+
+        match item.classification:
+            case EvidenceClassification.DERIVED_FACT:
+                enforced = all(
+                    self.executions.get(item.session_id, execution_id).source_attestation
+                    is SourceAttestation.ENFORCED
+                    for execution_id in item.execution_ids
+                )
+            case EvidenceClassification.INTERPRETATION | EvidenceClassification.RECOMMENDATION:
+                enforced = all(
+                    self.evidence.get(item.session_id, evidence_id).source_lineage
+                    is SourceLineage.ENFORCED
+                    for evidence_id in item.evidence_ids
+                )
+            case _:
+                enforced = False
+        return SourceLineage.ENFORCED if enforced else SourceLineage.DECLARED
 
     def _validate_references(self, item: EvidenceItem) -> None:
         for source_id in item.source_ids:
