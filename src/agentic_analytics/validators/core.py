@@ -503,8 +503,7 @@ class UnsupportedCausalLanguageValidator:
     def check(self, context: ValidationContext) -> CheckResult:
         design = str(context.session.metadata.get("analysis_design", "")).casefold()
         explicitly_supported = context.session.metadata.get("causal_design") is True
-        if explicitly_supported or design in _SUPPORTED_CAUSAL_DESIGNS:
-            return CheckResult(self.name)
+        declared_design = explicitly_supported or design in _SUPPORTED_CAUSAL_DESIGNS
         findings: list[ValidationFinding] = []
         # Track the originating evidence id so an evidence-derived finding can link back to it.
         if context.claim_texts:
@@ -521,6 +520,32 @@ class UnsupportedCausalLanguageValidator:
             entity_refs = (
                 [{"type": "evidence", "id": evidence_id}] if evidence_id is not None else []
             )
+            if declared_design:
+                # The design is session metadata supplied by the caller, not evidence the
+                # runtime checked. Accept the wording but disclose that it rests on an assertion.
+                findings.append(
+                    _finding(
+                        context,
+                        self.name,
+                        "CAUSAL_DESIGN_ASSERTED",
+                        ValidationSeverity.INFO,
+                        (
+                            "Causal language accepted on the caller's declared design, which "
+                            f"the runtime has not verified: {claim}"
+                        ),
+                        entity_refs=entity_refs,
+                        details={
+                            "analysis_design": design or None,
+                            "causal_design_declared": explicitly_supported,
+                            "claim": claim,
+                        },
+                        remediation=(
+                            "Document the identification strategy and supporting design "
+                            "evidence alongside the claim."
+                        ),
+                    )
+                )
+                continue
             findings.append(
                 _finding(
                     context,

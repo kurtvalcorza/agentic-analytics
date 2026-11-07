@@ -38,6 +38,7 @@ def test_masks_actual_nested_state_and_mounts_external_script(
         "type=tmpfs",
         f"dst=/workspace/{relative_state}",
         "tmpfs-size=1048576",
+        "tmpfs-mode=0555",
         "readonly",
     ] in _mounts(args)
     assert [
@@ -137,6 +138,7 @@ def test_protected_ancestor_mounts_precede_leaf_mounts_without_duplicates(tmp_pa
         "type=tmpfs",
         "dst=/workspace/shared/nested/state",
         "tmpfs-size=1048576",
+        "tmpfs-mode=0555",
         "readonly",
     ]
     source_mount = [

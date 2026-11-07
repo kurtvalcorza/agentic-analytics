@@ -65,11 +65,30 @@ class WorkspaceService:
             raise WorkspaceAuthorizationError("source must resolve to a regular file")
         return resolved
 
-    def discover(self, workspace_root: str | Path, recursive: bool = True) -> list[Path]:
+    def discover(
+        self,
+        workspace_root: str | Path,
+        recursive: bool = True,
+        *,
+        max_entries: int | None = None,
+        scan_state: dict[str, bool] | None = None,
+    ) -> list[Path]:
+        """Find supported sources, examining at most ``max_entries`` filesystem entries.
+
+        The scan cap bounds server work for huge workspaces; ``scan_state["scan_truncated"]``
+        reports when it was hit so callers can tell the listing is incomplete.
+        """
+
         root = self.authorize_workspace(workspace_root)
         iterator = root.rglob("*") if recursive else root.glob("*")
         discovered: list[Path] = []
-        for candidate in iterator:
+        if scan_state is not None:
+            scan_state["scan_truncated"] = False
+        for examined, candidate in enumerate(iterator):
+            if max_entries is not None and examined >= max_entries:
+                if scan_state is not None:
+                    scan_state["scan_truncated"] = True
+                break
             if candidate.suffix.lower() not in self.SUPPORTED_SUFFIXES:
                 continue
             try:

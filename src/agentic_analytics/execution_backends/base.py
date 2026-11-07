@@ -16,6 +16,9 @@ class BackendResult:
     runtime: dict[str, Any] = field(default_factory=dict)
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    # Set when the backend terminated the workload for exceeding a host resource budget
+    # (for example ``"disk"``); the execution service then discards its partial outputs.
+    resource_limit: str | None = None
 
 
 class ExecutionBackend(Protocol):

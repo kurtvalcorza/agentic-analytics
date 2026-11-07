@@ -7,7 +7,7 @@ from mcp.server import MCPServer
 from agentic_analytics.models import EvidenceClassification
 from agentic_analytics.runtime import Runtime
 
-from .errors import tool_errors
+from .errors import paginate, tool_errors
 
 
 def register_evidence_tools(server: MCPServer[Any], runtime: Runtime) -> None:
@@ -42,7 +42,12 @@ def register_evidence_tools(server: MCPServer[Any], runtime: Runtime) -> None:
             )
         return item.model_dump(mode="json", by_alias=True)
 
-    @server.tool(description="List session evidence with optional provenance filters.")
+    @server.tool(
+        description=(
+            "List session evidence with optional provenance filters, one bounded page at a "
+            "time (use next_offset to continue)."
+        )
+    )
     @tool_errors
     def list_evidence(
         session_id: str,
@@ -51,6 +56,8 @@ def register_evidence_tools(server: MCPServer[Any], runtime: Runtime) -> None:
         source_id: str | None = None,
         execution_id: str | None = None,
         upstream_evidence_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
         runtime.sessions.get(session_id, session_id)
         items = runtime.evidence_ledger.list(
@@ -61,5 +68,8 @@ def register_evidence_tools(server: MCPServer[Any], runtime: Runtime) -> None:
             execution_id=execution_id,
             upstream_evidence_id=upstream_evidence_id,
         )
-        serialized = [item.model_dump(mode="json", by_alias=True) for item in items]
-        return {"evidence": serialized, "count": len(serialized)}
+        items.sort(key=lambda item: (item.created_at, item.id))
+        page = paginate(items, limit, offset, runtime.settings.max_list_page_size)
+        selected = page.pop("page")
+        serialized = [item.model_dump(mode="json", by_alias=True) for item in selected]
+        return {"evidence": serialized, **page}

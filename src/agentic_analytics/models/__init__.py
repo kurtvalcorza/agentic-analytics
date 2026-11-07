@@ -1,6 +1,11 @@
 from .artifact import Artifact, ArtifactKind
-from .evidence import EvidenceClassification, EvidenceItem, ensure_acyclic_evidence
-from .execution import ExecutionRecord, ExecutionStatus, ExecutionType
+from .evidence import (
+    EvidenceClassification,
+    EvidenceItem,
+    SourceLineage,
+    ensure_acyclic_evidence,
+)
+from .execution import ExecutionRecord, ExecutionStatus, ExecutionType, SourceAttestation
 from .session import AnalysisSession, SessionMode, SessionStatus
 from .source import DataSource, SourceKind
 from .validation import (
@@ -24,7 +29,9 @@ __all__ = [
     "ExecutionType",
     "SessionMode",
     "SessionStatus",
+    "SourceAttestation",
     "SourceKind",
+    "SourceLineage",
     "ValidationFinding",
     "ValidationFindingStatus",
     "ValidationRun",

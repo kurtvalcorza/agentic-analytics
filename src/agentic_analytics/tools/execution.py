@@ -6,7 +6,7 @@ from mcp.server import MCPServer
 
 from agentic_analytics.runtime import Runtime
 
-from .errors import tool_errors
+from .errors import paginate, tool_errors
 
 
 def register_execution_tools(server: MCPServer[Any], runtime: Runtime) -> None:
@@ -29,18 +29,31 @@ def register_execution_tools(server: MCPServer[Any], runtime: Runtime) -> None:
             "stderr_preview": record.stderr_preview,
             "truncated": record.truncated,
             "artifact_ids": record.artifact_ids,
+            "source_attestation": record.source_attestation.value,
+            "error": record.error,
         }
 
-    @server.tool(description="List immutable artifacts registered for an analysis session.")
+    @server.tool(
+        description=(
+            "List immutable artifacts registered for an analysis session, one bounded page at "
+            "a time (use next_offset to continue)."
+        )
+    )
     @tool_errors
-    def list_artifacts(session_id: str, execution_id: str | None = None) -> dict[str, Any]:
+    def list_artifacts(
+        session_id: str,
+        execution_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> dict[str, Any]:
         artifacts = runtime.artifacts.list(session_id)
         if execution_id is not None:
             artifacts = [item for item in artifacts if item.execution_id == execution_id]
-        return {
-            "artifacts": [item.model_dump(mode="json") for item in artifacts],
-            "count": len(artifacts),
-        }
+        # Stable order so offset pagination is consistent across calls.
+        artifacts.sort(key=lambda item: (item.created_at, item.id))
+        page = paginate(artifacts, limit, offset, runtime.settings.max_list_page_size)
+        items = page.pop("page")
+        return {"artifacts": [item.model_dump(mode="json") for item in items], **page}
 
     @server.tool(description="Return canonical artifact metadata and a resolvable resource URI.")
     @tool_errors

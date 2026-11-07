@@ -27,6 +27,9 @@ class ValidationRunStatus(StrEnum):
     VALIDATED = "validated"
     WARNINGS = "warnings"
     BLOCKED = "blocked"
+    # No findings, but the run did not cover the full default check baseline (some checks were
+    # deselected), so it is not an unqualified pass.
+    PARTIAL = "partial"
 
 
 class ValidationScope(StrEnum):
@@ -59,4 +62,6 @@ class ValidationRun(CanonicalModel):
     checks_run: list[str] = Field(default_factory=list)
     checks_skipped: list[str] = Field(default_factory=list)
     checks_inconclusive: list[dict[str, str]] = Field(default_factory=list)
+    # True only when every default check was selected and reached a verdict.
+    coverage_complete: bool = False
     created_at: UtcDatetime = Field(default_factory=utc_now)

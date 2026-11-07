@@ -17,6 +17,7 @@ from agentic_analytics.models import (
     ExecutionRecord,
     ExecutionStatus,
     ExecutionType,
+    SourceAttestation,
     SourceKind,
 )
 from agentic_analytics.repositories import ExecutionRepository, SourceRepository
@@ -381,8 +382,22 @@ class QueryService:
             )
 
     def execute(
-        self, session: AnalysisSession, sql: str, max_rows: int | None = None
+        self,
+        session: AnalysisSession,
+        sql: str,
+        max_rows: int | None = None,
+        *,
+        require_complete: bool = False,
     ) -> dict[str, Any]:
+        """Run bounded SQL and report whether the *full result* is available.
+
+        ``truncated`` means the inline preview is partial. ``result_complete`` says whether the
+        preview (when not truncated) or the spilled artifact holds every result row; it is false
+        when the result exceeded ``max_spill_rows`` and the artifact holds only a prefix (an
+        arbitrary one unless the query has a total ``ORDER BY``). With ``require_complete`` such
+        a result fails instead of producing a partial artifact.
+        """
+
         normalized = self._validate_sql(sql)
         requested_limit = max_rows if max_rows is not None else self.settings.max_query_rows
         limit = min(max(requested_limit, 1), self.settings.max_query_rows)
@@ -446,7 +461,11 @@ class QueryService:
             # Materialize the full result ONCE, bounded by a row cap and the interrupt timer, so
             # the preview and the spilled artifact are the same evaluation (deterministic even
             # for nondeterministic SQL) and materialization cannot run unbounded.
-            spill_cap = self.settings.max_spill_rows
+            # The artifact row budget is never smaller than the preview row limit. Otherwise a
+            # result could overflow the spill cap while still fitting the preview, leaving
+            # result_complete=False with no artifact. With this floor, overflowing the cap
+            # always also truncates the preview, so a capped result is always spilled.
+            spill_cap = max(self.settings.max_spill_rows, limit)
             materialize_sql = (
                 f'CREATE TEMP TABLE "{result_table}" AS '
                 f"SELECT * FROM ({rewritten}) AS _q LIMIT {spill_cap + 1}"
@@ -477,6 +496,20 @@ class QueryService:
             # (which COPYs the complete result_table) must carry the full-fidelity data.
             truncated = row_truncated or preview_truncated or column_truncated
             spill_capped = materialized > spill_cap
+            # Invariant relied on by clients: an incomplete result always has a truncated
+            # preview and a published (capped) artifact.
+            assert truncated or not spill_capped
+            if spill_capped and require_complete:
+                incomplete = QueryExecutionError(
+                    f"query result exceeds max_spill_rows ({spill_cap}); refusing to produce a "
+                    "partial result because require_complete was set. Aggregate or filter the "
+                    "query, or raise AGENTIC_ANALYTICS_MAX_SPILL_ROWS."
+                )
+                self._persist_failure(
+                    session, normalized, limit, source_ids, fingerprints, incomplete
+                )
+                raise incomplete
+            artifact_rows = min(materialized, spill_cap)
 
             artifact_id: str | None = None
             artifact_ids: list[str] = []
@@ -492,8 +525,10 @@ class QueryService:
                 try:
                     self._write_spill_bounded(
                         connection,
-                        f'COPY "{result_table}" TO {spill_literal} '
-                        "(FORMAT PARQUET, COMPRESSION ZSTD)",
+                        # The table holds spill_cap + 1 rows only to detect overflow; the
+                        # artifact carries exactly the advertised row budget.
+                        f'COPY (SELECT * FROM "{result_table}" LIMIT {spill_cap}) '
+                        f"TO {spill_literal} (FORMAT PARQUET, COMPRESSION ZSTD)",
                         spill_path,
                         byte_ceiling,
                     )
@@ -509,8 +544,10 @@ class QueryService:
                             "format": "parquet",
                             "preview_rows": len(serial_rows),
                             "query_truncated": True,
-                            "spill_row_count": materialized,
+                            "spill_row_count": artifact_rows,
                             "spill_truncated": spill_capped,
+                            "result_complete": not spill_capped,
+                            "max_spill_rows": spill_cap,
                         },
                     )
                 except (duckdb.Error, TimeoutError, ArtifactLimitError) as exc:
@@ -531,14 +568,29 @@ class QueryService:
                 request={"sql": normalized, "max_rows": limit},
                 source_ids=source_ids,
                 source_fingerprints=fingerprints,
+                # DuckDB can only reach the registered source views (allowed_paths, external
+                # access disabled), so source use is runtime-enforced, not merely declared.
+                source_attestation=SourceAttestation.ENFORCED,
                 started_at=started,
                 completed_at=datetime.now(UTC),
                 runtime={"backend": "duckdb", "duckdb": duckdb.__version__},
-                result_preview={"columns": columns, "rows": serial_rows},
+                result_preview={
+                    "columns": columns,
+                    "rows": serial_rows,
+                    "result_complete": not spill_capped,
+                    "spill_truncated": spill_capped,
+                },
                 truncated=truncated,
                 artifact_ids=artifact_ids,
             )
             self.executions.add(execution)
+            completeness_note = (
+                f"Result exceeded max_spill_rows ({spill_cap}); the artifact holds only "
+                f"{artifact_rows} rows, an arbitrary subset unless the query has a total "
+                "ORDER BY. Do not treat it as the complete result."
+                if spill_capped
+                else None
+            )
             return {
                 "execution_id": execution.id,
                 "columns": columns,
@@ -546,6 +598,14 @@ class QueryService:
                 "row_count_returned": len(serial_rows),
                 "truncated": truncated,
                 "artifact_id": artifact_id,
+                # Full-result completeness, distinct from preview truncation.
+                "result_complete": not spill_capped,
+                "spill_truncated": spill_capped,
+                "max_spill_rows": spill_cap,
+                "artifact_row_count": artifact_rows if artifact_id is not None else None,
+                "result_row_count": None if spill_capped else materialized,
+                "completeness_note": completeness_note,
+                "source_attestation": SourceAttestation.ENFORCED.value,
             }
         finally:
             connection.close()

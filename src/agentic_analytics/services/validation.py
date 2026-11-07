@@ -140,8 +140,14 @@ class ValidationService:
             # Coverage gaps must not read as a clean pass: if any selected check could not
             # reach a verdict, the run is not a confident "validated".
             status = ValidationRunStatus.WARNINGS
+        elif checks_skipped:
+            # A clean subset is not a full pass. Reserve "validated" for runs that covered the
+            # whole default baseline so a caller cannot select one trivially passing check
+            # (e.g. only causal_language with no claims) and report the analysis as validated.
+            status = ValidationRunStatus.PARTIAL
         else:
             status = ValidationRunStatus.VALIDATED
+        coverage_complete = not checks_skipped and not checks_inconclusive
         run = self.runs.add(
             ValidationRun(
                 session_id=session.id,
@@ -151,6 +157,7 @@ class ValidationService:
                 checks_run=checks_run,
                 checks_skipped=checks_skipped,
                 checks_inconclusive=checks_inconclusive,
+                coverage_complete=coverage_complete,
             )
         )
         return run, persisted

@@ -35,6 +35,21 @@ class ExecutionStatus(StrEnum):
         }
 
 
+class SourceAttestation(StrEnum):
+    """How strongly the runtime knows which sources an execution actually read.
+
+    ``declared``: the caller listed ``source_ids``; the runtime fingerprinted them but did not
+    observe or confine the program's reads (managed Python can read any workspace file).
+    ``enforced``: the runtime confined data access to exactly the listed sources (managed SQL
+    can only reach registered source views and DuckDB's ``allowed_paths``).
+
+    Neither level verifies that a claim's *value* follows from the execution's output.
+    """
+
+    DECLARED = "declared"
+    ENFORCED = "enforced"
+
+
 class ExecutionRecord(CanonicalModel):
     id: str = Field(default_factory=lambda: new_id(EntityType.EXECUTION))
     session_id: str
@@ -43,6 +58,8 @@ class ExecutionRecord(CanonicalModel):
     request: dict[str, Any]
     source_ids: list[str] = Field(default_factory=list)
     source_fingerprints: dict[str, Any] = Field(default_factory=dict)
+    # Records predating this field default to the weaker, honest label.
+    source_attestation: SourceAttestation = SourceAttestation.DECLARED
     started_at: UtcDatetime = Field(default_factory=utc_now)
     completed_at: UtcDatetime | None = None
     runtime: dict[str, Any] = Field(default_factory=dict)

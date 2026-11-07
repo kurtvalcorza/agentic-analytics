@@ -15,6 +15,7 @@ from agentic_analytics.models import (
     ExecutionType,
     SessionMode,
     SessionStatus,
+    SourceAttestation,
 )
 from agentic_analytics.repositories import ExecutionRepository, SourceRepository
 from agentic_analytics.settings import Settings
@@ -112,10 +113,15 @@ class ExecutionService:
                     result = self.backend.execute(
                         session, script_path, timeout, readonly_paths=readonly_paths
                     )
-                    after = snapshot_workspace(workspace_root, excluded_roots=(state_root,))
-                    artifacts = self.artifacts.register_changes(
-                        session.id, execution_id, workspace_root, before, after
-                    )
+                    if result.resource_limit is not None:
+                        # The workload was killed for exceeding its host resource budget and
+                        # the backend reclaimed what it created; nothing is attested.
+                        artifacts = []
+                    else:
+                        after = snapshot_workspace(workspace_root, excluded_roots=(state_root,))
+                        artifacts = self.artifacts.register_changes(
+                            session.id, execution_id, workspace_root, before, after
+                        )
                 except Exception as exc:
                     # Registration failures happen after code has already changed files.
                     # Preserve their audit record and any artifacts published before failure.
@@ -140,6 +146,11 @@ class ExecutionService:
                 "message": stderr or f"execution ended with status {result.status.value}",
                 "exit_code": result.exit_code,
             }
+            if result.resource_limit is not None:
+                error["type"] = "resource_limit_exceeded"
+                error["resource"] = result.resource_limit
+                # Growth of pre-existing files is not reverted; surface how much remains.
+                error["retained_output_bytes"] = result.runtime.get("retained_output_bytes", 0)
         completed_at = datetime.now(UTC) if result.status.terminal else None
         record = ExecutionRecord(
             id=execution_id,
@@ -149,6 +160,9 @@ class ExecutionService:
             request={"code": code, "source_ids": source_ids, "timeout_seconds": timeout},
             source_ids=source_ids,
             source_fingerprints=source_fingerprints,
+            # Managed Python can read any workspace file; source_ids are the caller's
+            # declaration, fingerprinted but not observed.
+            source_attestation=SourceAttestation.DECLARED,
             started_at=started_at,
             completed_at=completed_at,
             runtime=result.runtime,

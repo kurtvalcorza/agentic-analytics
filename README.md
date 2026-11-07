@@ -63,7 +63,7 @@ The runtime exposes a versioned MCP tool surface over a host-neutral core:
 - **Data plane** — `list_sources` discovers CSV/Parquet sources (bounded), `inspect_source` registers and profiles them in a single scan, and `query_data` runs bounded, read-only DuckDB SQL over registered sources with enforced memory/time limits, source-fingerprint integrity checks, and audit records for successful and failed runs.
 - **Managed execution** — `execute_python` runs code in an isolated, ephemeral Docker sandbox (network-disabled, read-only root filesystem, dropped capabilities, resource-capped) and registers generated files as immutable artifacts stored outside the writable workspace; `list_artifacts` / `get_artifact` expose metadata, and artifact bytes are retrievable through a registered MCP resource. A non-conformant subprocess backend is available for development (permissive sessions only).
 - **Evidence ledger** — `register_evidence` / `list_evidence` record a source → execution → artifact → evidence provenance chain with validated links, lineage enforcement, and cycle detection.
-- **Validation** — `validate_analysis` runs deterministic checks (evidence coverage, stale sources, duplicates, missingness, denominator consistency, unsupported causal language) and returns bounded, provenance-linked findings; incomplete coverage never reports a clean pass.
+- **Validation** — `validate_analysis` runs deterministic checks (evidence coverage, stale sources, duplicates, missingness, denominator consistency, unsupported causal language) and returns bounded, provenance-linked findings. Only a run covering the full default baseline with no findings or inconclusive checks reports `validated`; a clean subset reports `partial`, and every response carries `coverage_complete` and an `assurance` statement.
 - **Large results** — query results that exceed the row or response-size budget spill to a Parquet artifact, with a bounded in-context preview derived from the same evaluation.
 
 Persistence is append-only and session-scoped, with atomic record publication, canonical typed IDs, and UTC-normalized timestamps. Quality gates (ruff, mypy, pytest, and the sandbox image build) run in CI.
@@ -79,32 +79,53 @@ Two capabilities appear in the contracts (`specs/.../contracts/mcp-tools.md`) bu
 
 ## How it works
 
-You bring your own data — local CSV/Parquet files — and point an MCP-capable coding agent (Claude Code, Codex, …) at the runtime. The agent does the reasoning and decides which tools to call; the runtime provides a bounded, sandboxed environment and records provenance so every result is reproducible and independently checkable. Full datasets never flood the model's context.
+You bring your own data — local CSV/Parquet files — and point an MCP-capable coding agent (Claude Code, Codex, …) at the runtime. The agent does the reasoning and decides which tools to call; the runtime provides a bounded, sandboxed environment and records provenance so results are auditable (see [Guarantees and limitations](#guarantees-and-limitations) for exactly what is and is not verified). Full datasets never flood the model's context.
 
 A typical end-to-end flow over a `survey.csv` in your workspace (subsequent calls carry the `session_id` returned by the first):
 
 1. **Authorize the data.** `create_session(workspace_root=".")` opens a session scoped to your workspace and returns `ses_…`. Only directories under the server's configured allowlist are accepted.
 2. **Discover and inspect.** `list_sources()` finds `survey.csv`; `inspect_source(source="survey.csv")` registers it and returns schema, row count, null counts, duplicate-row count, and a small sample — plus a content fingerprint. The full file is never sent to the model.
-3. **Query without loading everything.** `query_data(sql="SELECT region, avg(score) AS mean FROM source('src_…') GROUP BY region")` runs bounded, read-only DuckDB SQL. Small results return inline; oversized results spill to a Parquet artifact with a bounded preview.
+3. **Query without loading everything.** `query_data(sql="SELECT region, avg(score) AS mean FROM source('src_…') GROUP BY region")` runs bounded, read-only DuckDB SQL. Small results return inline; oversized results spill to a Parquet artifact with a bounded preview. `truncated` describes the preview; check `result_complete` before treating the artifact as the full result (pass `require_complete=true` to fail instead of producing a capped artifact).
 4. **Run richer analysis in a sandbox.** `execute_python(code=...)` runs pandas / scikit-learn / matplotlib in an isolated, network-disabled Docker container over the workspace. Generated files (a chart, a cleaned dataset) are captured as immutable artifacts.
 5. **Record evidence.** `register_evidence(classification="derived_fact", claim="Mean score in NCR is 4.2", source_ids=[...], execution_ids=[...])` links the claim to the exact source and execution that produced it.
 6. **Validate the analysis.** `validate_analysis(claim_texts=[...])` runs deterministic checks — stale/changed sources, duplicate observations, high missingness, denominator sanity, unsupported causal language, and whether each material claim is backed by registered evidence — and returns findings to act on.
 7. **Retrieve outputs.** `list_artifacts()` / `get_artifact(artifact_id="art_…")` return the generated tables, charts, and datasets with metadata and content hashes.
 
-The agent chooses *which* steps to take and in what order; the runtime guarantees they run in a bounded sandbox, over authorized data, with a verifiable source → execution → artifact → evidence trail.
+The agent chooses *which* steps to take and in what order; the runtime runs them in a bounded sandbox, over authorized data, and records a source → execution → artifact → evidence trail whose assurance level is stated explicitly.
+
+## Guarantees and limitations
+
+The runtime separates **provenance bookkeeping** from **analytical truth**. What it does and does not establish:
+
+| Area | Guaranteed | Not guaranteed |
+| --- | --- | --- |
+| Managed Python (Docker) | No network, read-only root FS, all capabilities dropped, `no-new-privileges`, explicit non-root UID (a root server is refused unless `AGENTIC_ANALYTICS_DOCKER_USER` names a non-root identity), memory/CPU/PID/time limits, server state masked, registered sources read-only, and a workspace **output budget** (`MAX_EXECUTION_OUTPUT_BYTES` / `_FILES`) plus a host free-space reserve (`MIN_FREE_DISK_BYTES`; settings take the `AGENTIC_ANALYTICS_` env prefix) enforced *while the code runs*. Usage is counted per entry (files, directories, and the workspace's `.agentic-analytics/` area), deletions never offset new output, an unmeasurable entry fails closed, and a final check runs after exit so a short burst is still caught. A breach kills the container, removes every file and directory the run created, and records `resource_limit_exceeded` with `retained_output_bytes`. | This is **detection and termination, not a filesystem quota**: the guard polls, so a workload can overshoot by its write throughput × ~0.25 s (the free-space reserve absorbs this). Growth of files that existed before the run is **reported, not reverted** (`retained_output_bytes`). A quota-enforced writable output mount would be needed for a hard guarantee. Workspaces containing Unix sockets or device nodes are refused, but other host-specific Docker hardening (rootless Docker, user namespaces, seccomp/AppArmor profiles) is the deployment's responsibility. |
+| SQL / inspection (DuckDB) | Read-only SQL over registered sources only; external access, extension loading, and configuration changes disabled; memory and time limits; source fingerprints re-checked before each query. | DuckDB runs **inside the MCP server process**. It is not an isolation boundary for hostile SQL or crafted data files — treat untrusted datasets accordingly (see SEC-02 in the hardening RFC). |
+| Source lineage | Every execution and evidence item carries an assurance label. `managed_sql` executions are `enforced`: DuckDB can only reach the declared sources. Evidence is `source_lineage: "enforced"` only when every execution behind it is enforced. | Managed Python `source_ids` are **`declared`**: fingerprinted, but the program can read any workspace file, so declared lineage is not proof of data usage. Direct `source_fact` items are also caller-declared. |
+| Artifacts | The recorded SHA-256 and size are computed from exactly the bytes written to a private temporary archive file, which is fsynced and atomically renamed. A source file whose metadata (size, mtime, ctime, inode) changed after the execution snapshot or during the copy is refused, not attested. Archive files are `0600` and server state `0700`. | Archived bytes are what the workspace held at registration; they are not proof the code computed them correctly. |
+| Query results | `result_complete`, `spill_truncated`, `artifact_row_count`, and `max_spill_rows` distinguish preview truncation from an incomplete spilled artifact. | A capped artifact is an arbitrary row subset unless the query has a total `ORDER BY`. |
+| Validation | Deterministic structural checks with explicit coverage. | Claim **values** are not compared with execution outputs (a claim of 4.2 backed by an execution that printed 3.1 is not detected), and statistical validity and causal identification are not verified. `causal_design` / `analysis_design` are caller declarations; causal wording accepted on that basis produces an informational `CAUSAL_DESIGN_ASSERTED` finding. |
+
+**Prompt-injection boundary.** Sample rows, query previews, stdout, and every other value derived from a dataset are **untrusted data**. Text in a CSV cell or a script's output must never be treated as instructions or as authority for tool calls; the MCP host and agent orchestration are responsible for keeping tool results in the data channel.
+
+**Deployment assumptions.** The development backend (`subprocess_dev`) is not a security boundary and is limited to permissive sessions. Do not place privileged control sockets (for example `docker.sock`) or host control filesystems inside an authorized workspace. List responses (`list_artifacts`, `list_evidence`) are paginated with `limit` / `offset` / `next_offset`, and source discovery stops after `MAX_DISCOVERY_SCAN_ENTRIES` filesystem entries (`scan_truncated`).
+
+The remaining hardening work is tracked in the security-hardening RFC (issue #10).
 
 ## Development
 
 Requires Python 3.12+.
 
+CI installs exactly the reviewed `uv.lock` (`uv sync --frozen`), pins GitHub Actions and the sandbox base image by digest, and runs a dependency vulnerability scan plus SBOM generation. To reproduce locally:
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
-python -m pip install -e '.[dev]'
-ruff check .
-mypy src
-pytest
+uv sync --frozen --extra dev
+uv run ruff check .
+uv run mypy src
+uv run pytest
 ```
+
+Without uv, `python -m pip install -e '.[dev]'` installs from the version ranges in `pyproject.toml` instead of the lockfile.
 
 Run the MCP server over stdio:
 

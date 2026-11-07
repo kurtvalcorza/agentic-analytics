@@ -124,7 +124,8 @@ Executes read-only DuckDB analytical SQL against registered sources.
 {
   "session_id": "ses_...",
   "sql": "SELECT region, count(*) AS n FROM source('src_...') GROUP BY region",
-  "max_rows": 200
+  "max_rows": 200,
+  "require_complete": false
 }
 ```
 
@@ -135,6 +136,9 @@ Executes read-only DuckDB analytical SQL against registered sources.
 - Oversized result sets produce an artifact and bounded preview. The preview is bounded before values are materialized — per cell (in SQL), per row (byte budget, including the first row), and by column count — so neither a very large cell, a very wide row, nor unbounded column metadata can exhaust server memory. Dropped rows/cells/columns are preserved in the artifact.
 - A spilled artifact is subject to the configured artifact byte limits; the write is interrupted at the remaining session budget so it cannot over-write on disk, and a spill that exceeds the limits is rejected rather than persisted. The session-cumulative quota is reserved atomically per session, so concurrent spills cannot jointly exceed it.
 - Returns an `execution_id` even for successful inline results.
+- The effective artifact row budget is `max(max_spill_rows, max_rows)`, so an incomplete result always has `truncated: true` and a published artifact.
+- `truncated` describes the inline preview only. Full-result completeness is reported separately: `result_complete` is false when the result exceeded `max_spill_rows` and the artifact holds only `artifact_row_count` rows (an arbitrary subset unless the query has a total `ORDER BY`). With `require_complete: true` such a query fails, is audited as a failed execution, and produces no artifact.
+- `source_attestation` is `enforced`: DuckDB can only read the referenced registered sources.
 
 ### Output
 
@@ -145,7 +149,14 @@ Executes read-only DuckDB analytical SQL against registered sources.
   "rows": [["NCR", 42]],
   "row_count_returned": 1,
   "truncated": false,
-  "artifact_id": null
+  "artifact_id": null,
+  "result_complete": true,
+  "spill_truncated": false,
+  "max_spill_rows": 1000000,
+  "artifact_row_count": null,
+  "result_row_count": 1,
+  "completeness_note": null,
+  "source_attestation": "enforced"
 }
 ```
 
@@ -173,9 +184,18 @@ Runs Python inside the managed execution backend.
   "stdout_preview": "...",
   "stderr_preview": "",
   "truncated": false,
-  "artifact_ids": ["art_..."]
+  "artifact_ids": ["art_..."],
+  "source_attestation": "declared",
+  "error": null
 }
 ```
+
+### Requirements
+
+- `source_ids` are a caller **declaration**: they are fingerprinted, but managed Python can read any workspace file, so `source_attestation` is always `declared`.
+- Execution runs as an explicit non-root container user; a server running as root is refused unless a non-root `docker_user` is configured. Workspaces containing Unix sockets or device nodes are never mounted.
+- Writes to the workspace are bounded while the code runs (bytes, entry count, and a host free-space reserve), with a final check after exit. Accounting is per entry, never offset by deletions, and fails closed on entries it cannot measure. A breach terminates the workload, removes every entry it created, registers no artifacts, and records `status: "failed"` with `error.type: "resource_limit_exceeded"` and `error.retained_output_bytes` (growth of pre-existing files, which is not reverted). This is polling detection, not a hard filesystem quota.
+- Artifact digests are computed from the archived bytes, published atomically; a file modified after the execution snapshot or during archiving is refused.
 
 ## `register_external_execution`
 
@@ -227,11 +247,11 @@ Adds an immutable evidence item.
 
 ### Output
 
-Canonical `EvidenceItem`.
+Canonical `EvidenceItem`, including `source_lineage`: `enforced` only when every execution behind the item (directly or via upstream evidence) is `enforced`; otherwise `declared`. Lineage concerns data access only; claim values are never checked against execution output.
 
 ## `list_evidence`
 
-Returns evidence ledger entries with filters by classification, materiality, source, execution, or upstream relationship.
+Returns evidence ledger entries with filters by classification, materiality, source, execution, or upstream relationship. Results are paginated: `limit` (capped by `max_list_page_size`) and `offset` in; `count`, `total`, `offset`, `next_offset`, and `truncated` out.
 
 ## `validate_analysis`
 
@@ -256,6 +276,8 @@ Runs deterministic provenance and analytical validation.
 - `scope` selects the analytical stage under review (`final` or `interim`, default `final`) and is echoed back on the run.
 - `checks` accepts the `default`/`all` selector or an explicit array. An explicit empty array has zero coverage and is rejected rather than reported as a clean pass.
 - Unknown check names are rejected so a typo cannot silently skip every check.
+- Status precedence: `blocked` (any blocking finding) > `warnings` (error/warning findings or any inconclusive check) > `partial` (no findings, but some default checks were not selected) > `validated` (full default baseline, every check reached a verdict, no findings). `coverage_complete` is true only for the full baseline with no inconclusive checks.
+- Every response includes an `assurance` statement: checks are structural and do not verify claim values, declared Python lineage, statistical validity, or causal identification. A declared causal design is reported as an informational `CAUSAL_DESIGN_ASSERTED` finding when causal wording relies on it.
 
 ### Output
 
@@ -266,6 +288,9 @@ Runs deterministic provenance and analytical validation.
   "scope": "final",
   "checks_run": ["evidence_coverage", "causal_language", "duplicates", "missingness"],
   "checks_skipped": [],
+  "checks_inconclusive": [],
+  "coverage_complete": false,
+  "assurance": "Deterministic structural checks ... Not verified: ...",
   "findings": [
     {
       "id": "val_...",
@@ -300,7 +325,7 @@ Structured check coverage plus findings and optional recommended follow-up analy
 
 ## `list_artifacts`
 
-Returns canonical artifact metadata and lineage.
+Returns canonical artifact metadata and lineage, paginated like `list_evidence` (`limit`, `offset`, `next_offset`).
 
 ## `get_artifact`
 

@@ -29,6 +29,7 @@
         "value": {},
         "units": {"type": ["string", "null"]},
         "method_summary": {"type": ["string", "null"]},
+        "source_lineage": {"type": "string", "enum": ["declared", "enforced"]},
         "created_at": {"type": "string", "format": "date-time"}
       },
       "additionalProperties": false
