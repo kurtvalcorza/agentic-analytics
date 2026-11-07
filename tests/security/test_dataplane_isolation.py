@@ -156,10 +156,13 @@ def test_query_memory_exhaustion_is_contained(tmp_path: Path) -> None:
     runtime, session, _ = _runtime(
         tmp_path,
         data_plane_memory_bytes=512 * 1024**2,
-        query_memory_limit="8GB",
+        query_memory_limit="128MB",
         query_timeout_seconds=60,
     )
     source, _ = runtime.inspector.inspect(session, "data.csv")
+    # Settings validation forbids this combination; force it after validation so the OS
+    # address-space limit, not DuckDB's own memory_limit, is what stops the allocation.
+    runtime.settings.query_memory_limit = "8GB"
 
     with pytest.raises(QueryExecutionError):
         runtime.query.execute(
@@ -173,7 +176,7 @@ def test_query_memory_exhaustion_is_contained(tmp_path: Path) -> None:
         if record.status is ExecutionStatus.FAILED
     ]
     assert failed and failed[0].error is not None
-    assert failed[0].error["category"] in {"out_of_memory", "crashed"}
+    assert failed[0].error["category"] == "out_of_memory"
     _assert_server_still_works(runtime, session)
 
 
@@ -330,7 +333,83 @@ def test_unknown_duplicate_key_is_a_caller_error(tmp_path: Path) -> None:
     runtime, session, _ = _runtime(tmp_path)
     runtime.inspector.inspect(session, "data.csv")
 
-    with pytest.raises(ValueError, match="validation query failed"):
+    with pytest.raises(ValueError, match="unknown duplicate key column") as caught:
         runtime.validation.validate(
             session, checks=["duplicates"], duplicate_keys={"data.csv": ["no_such_column"]}
         )
+    # DuckDB's binder error quotes the SQL, including the absolute source path; it must never
+    # reach the caller.
+    assert "no_such_column" in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+    assert "read_csv" not in str(caught.value)
+
+
+def test_file_size_limit_is_its_own_category_without_paths(tmp_path: Path) -> None:
+    # A sort far larger than DuckDB's memory limit must spill to a temp file, which hits the
+    # worker's 1 MiB file-size cap.
+    runtime, session, _ = _runtime(
+        tmp_path,
+        query_memory_limit="64MB",
+        data_plane_max_file_bytes=1024**2,
+        max_artifact_bytes=1024**2,
+        max_total_artifact_bytes=1024**2,
+        query_timeout_seconds=120,
+    )
+    source, _ = runtime.inspector.inspect(session, "data.csv")
+
+    with pytest.raises(QueryExecutionError) as caught:
+        runtime.query.execute(
+            session,
+            "SELECT count(*) FROM (SELECT i, repeat('x', 100) AS s FROM source('"
+            + source.id
+            + "'), range(5000000) AS r(i) ORDER BY s, i DESC)",
+        )
+
+    assert "file-size limit" in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+    [failed] = [
+        record
+        for record in runtime.executions.list(session.id)
+        if record.status is ExecutionStatus.FAILED
+    ]
+    assert failed.error is not None and failed.error["category"] == "disk_limit"
+    _assert_server_still_works(runtime, session)
+
+
+def test_many_threads_fit_the_default_address_space(tmp_path: Path) -> None:
+    runtime, session, _ = _runtime(tmp_path, data_plane_threads=64)
+
+    _assert_server_still_works(runtime, session)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"query_memory_limit": "8GB"},
+        {"data_plane_memory_bytes": 256 * 1024**2},
+        {"max_artifact_bytes": 9 * 1024**3},
+    ],
+    ids=["duckdb-limit-exceeds-worker", "below-floor", "artifact-exceeds-file-cap"],
+)
+def test_settings_reject_worker_configurations_that_cannot_run(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError):
+        Settings(state_dir=tmp_path / "state", **overrides)
+
+
+def test_stale_scratch_directories_are_swept(tmp_path: Path) -> None:
+    client = _fake(tmp_path, "import json\nprint(json.dumps({'result': {}}))\n")
+    client.work_root.mkdir(parents=True)
+    stale = client.work_root / "query-stale"
+    stale.mkdir()
+    old = time.time() - 3 * 24 * 3600
+    os.utime(stale, (old, old))
+    fresh = client.work_root / "query-live"
+    fresh.mkdir()
+
+    _call(client)
+
+    assert not stale.exists()
+    # A recent directory may belong to another live server process sharing this state dir.
+    assert fresh.exists()

@@ -504,7 +504,13 @@ def table_stats(request: dict[str, Any]) -> dict[str, Any]:
                 result["distinct"] = scalar_int(
                     connection, f"SELECT count(*) FROM (SELECT DISTINCT * FROM {relation})"
                 )
-            keys = request.get("duplicate_keys") or []
+            keys = [str(key) for key in request.get("duplicate_keys") or []]
+            unknown = [key for key in keys if key not in columns]
+            if unknown:
+                # Report by name rather than letting DuckDB's binder error (which quotes the
+                # SQL, including the absolute source path) reach the caller.
+                result["unknown_keys"] = unknown
+                keys = []
             if keys:
                 quoted = ", ".join(sql_identifier(str(key)) for key in keys)
                 result["duplicate_key_rows"] = scalar_int(

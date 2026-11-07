@@ -21,6 +21,7 @@ memory-fault containment through process separation, but not OS resource limits.
 
 from __future__ import annotations
 
+import errno
 import json
 import signal
 import sys
@@ -68,8 +69,12 @@ def _classify_duckdb(exc: BaseException) -> str:
         return "timeout"
     if isinstance(exc, SpillLimitError):
         return "spill_limit"
-    if isinstance(exc, (MemoryError, duckdb.OutOfMemoryException)):
+    if isinstance(exc, (MemoryError, duckdb.OutOfMemoryException)) or _thread_exhaustion(exc):
         return "out_of_memory"
+    if _file_too_large(exc):
+        # RLIMIT_FSIZE (or the spill/temp file) hit its cap. Checked before the generic IO
+        # mapping so it is never mistaken for an unreadable source.
+        return "disk_limit"
     if isinstance(
         exc, (duckdb.InvalidInputException, duckdb.IOException, duckdb.ConversionException)
     ):
@@ -77,6 +82,26 @@ def _classify_duckdb(exc: BaseException) -> str:
     if isinstance(exc, duckdb.Error):
         return "sql"
     return "internal"
+
+
+def _file_too_large(exc: BaseException) -> bool:
+    if isinstance(exc, OSError) and exc.errno == errno.EFBIG:
+        return True
+    return "file too large" in str(exc).lower()
+
+
+def _thread_exhaustion(exc: BaseException) -> bool:
+    return isinstance(exc, RuntimeError) and "can't start new thread" in str(exc)
+
+
+# Categories whose underlying message may name server-internal paths (scratch, state, or
+# archive directories). The client receives a fixed description instead.
+_FIXED_MESSAGES = {
+    "disk_limit": (
+        "data-plane worker exceeded its file-size limit (data_plane_max_file_bytes); the "
+        "query needed more temporary or output space than allowed"
+    ),
+}
 
 
 def _respond(payload: dict[str, Any]) -> None:
@@ -100,12 +125,13 @@ def main() -> int:
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
+        category = _classify(exc)
         _respond(
             {
                 "error": {
-                    "category": _classify(exc),
+                    "category": category,
                     "type": type(exc).__name__,
-                    "message": str(exc)[:_MAX_MESSAGE_CHARS],
+                    "message": _FIXED_MESSAGES.get(category, str(exc)[:_MAX_MESSAGE_CHARS]),
                 }
             }
         )

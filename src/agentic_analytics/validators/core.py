@@ -53,8 +53,11 @@ class ValidationContext:
             )
         except DataPlaneError as exc:
             if exc.category == "sql":
-                # A malformed request (e.g. an unknown duplicate-key column) is a caller error.
-                raise ValueError(f"validation query failed: {exc}") from exc
+                # Never embed the worker message: DuckDB errors quote the SQL, which contains
+                # the absolute source path.
+                raise ValueError(
+                    f"validation query failed for source {source.id} ({exc.error_type})"
+                ) from exc
             raise
 
     def resolve_source_file(self, source: DataSource) -> Path | None:
@@ -265,6 +268,11 @@ class DuplicateObservationValidator:
             except DataPlaneError as exc:
                 _source_read_failure(result, source, exc)
                 continue
+            if stats.get("unknown_keys"):
+                raise ValueError(
+                    f"unknown duplicate key column(s) for source {source.id}: "
+                    f"{', '.join(stats['unknown_keys'])}"
+                )
             duplicate_rows = int(stats["total"]) - int(stats["distinct"])
             if duplicate_rows > 0:
                 findings.append(

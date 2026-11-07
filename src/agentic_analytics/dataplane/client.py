@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import IO, Any
 
@@ -31,12 +32,14 @@ from agentic_analytics.settings import Settings
 # interpreter start-up and the worker's graceful in-process interrupt.
 _KILL_GRACE_SECONDS = 10.0
 _MAX_STDERR_BYTES = 64 * 1024
+# Scratch directories older than this belong to workers whose server died mid-operation.
+_STALE_SCRATCH_SECONDS = 24 * 3600
 
 
 class DataPlaneError(RuntimeError):
     """A data-plane operation failed. ``category`` is stable; ``error_type`` is diagnostic.
 
-    Categories: ``timeout``, ``out_of_memory``, ``spill_limit``, ``source_read``, ``sql``,
+    Categories: ``timeout``, ``out_of_memory``, ``disk_limit``, ``spill_limit``, ``source_read``, ``sql``,
     ``crashed``, ``response_too_large``, ``internal``.
     """
 
@@ -65,6 +68,7 @@ class DataPlaneClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.work_root = settings.state_dir.resolve(strict=False) / "tmp" / "dataplane"
+        self._swept = False
 
     def limits(self, timeout_seconds: float) -> dict[str, Any]:
         """Engine limits shared by every operation."""
@@ -96,7 +100,14 @@ class DataPlaneClient:
     @staticmethod
     def _environment() -> dict[str, str]:
         # Never hand server secrets (API keys, tokens) to a process parsing untrusted files.
-        env = {"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+        env = {
+            "PATH": os.defpath,
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            # glibc reserves a 64 MiB malloc arena per thread by default, which can exhaust the
+            # worker's address-space limit with many DuckDB threads. Bound the arena count.
+            "MALLOC_ARENA_MAX": "2",
+        }
         # Coverage measurement settings only (no credentials), so test runs can measure the
         # worker the same way they measure the server.
         env.update({key: value for key, value in os.environ.items() if key.startswith("COVERAGE_")})
@@ -107,50 +118,59 @@ class DataPlaneClient:
         return env
 
     @staticmethod
-    def _kill(proc: subprocess.Popen[bytes]) -> None:
+    def _kill_group(pgid: int) -> None:
         if os.name == "posix":
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
+
+    def _kill(self, proc: subprocess.Popen[bytes]) -> None:
+        self._kill_group(proc.pid)
         with contextlib.suppress(OSError):
             proc.kill()
 
-    def call(self, op: str, payload: dict[str, Any], *, deadline_seconds: float) -> dict[str, Any]:
-        """Run one operation in a fresh worker and return its result or raise DataPlaneError."""
+    def _run_worker(
+        self, workdir: Path, request: bytes, deadline_seconds: float
+    ) -> tuple[int | None, bytes, bool, bool]:
+        """Run the worker; return (returncode, stdout, stdout_overflowed, timed_out).
 
-        self.work_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        workdir = Path(tempfile.mkdtemp(prefix=f"{op}-", dir=self.work_root))
+        The worker is always reaped, even if setting up the pipes or threads fails. The process
+        group is only signalled while it is known to exist (before the leader is reaped, or
+        while a descendant still holds the pipes), so a recycled group id is never targeted.
+        """
+
+        proc = subprocess.Popen(
+            self.worker_command(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=workdir,
+            env=self._environment(),
+            start_new_session=os.name == "posix",
+        )
+        reaped = False
         try:
-            payload = dict(payload)
-            payload["limits"] = {**payload["limits"], "temp_directory": str(workdir / "duckdb")}
-            request = json.dumps(
-                {"op": op, "payload": payload, "os_limits": self._os_limits(deadline_seconds)}
-            ).encode("utf-8")
-            proc = subprocess.Popen(
-                self.worker_command(),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=workdir,
-                env=self._environment(),
-                start_new_session=os.name == "posix",
-            )
             assert proc.stdin and proc.stdout and proc.stderr
-            response_limit = self.settings.data_plane_max_response_bytes
             out = bytearray()
             err = bytearray()
             out_overflow = threading.Event()
-            err_overflow = threading.Event()
             readers = [
                 threading.Thread(
                     target=_read_bounded,
-                    args=(proc.stdout, out, response_limit, out_overflow),
+                    args=(
+                        proc.stdout,
+                        out,
+                        self.settings.data_plane_max_response_bytes,
+                        out_overflow,
+                    ),
                 ),
                 threading.Thread(
-                    target=_read_bounded, args=(proc.stderr, err, _MAX_STDERR_BYTES, err_overflow)
+                    target=_read_bounded,
+                    args=(proc.stderr, err, _MAX_STDERR_BYTES, threading.Event()),
                 ),
             ]
             for reader in readers:
                 reader.start()
+            # Readers start first, so a large request cannot deadlock against a full pipe.
             with contextlib.suppress(BrokenPipeError):
                 proc.stdin.write(request)
             with contextlib.suppress(BrokenPipeError):
@@ -160,16 +180,59 @@ class DataPlaneClient:
                 proc.wait(timeout=deadline_seconds + self.kill_grace_seconds)
             except subprocess.TimeoutExpired:
                 timed_out = True
-            # Reap anything the worker left behind, then let the readers finish draining.
-            self._kill(proc)
+                self._kill(proc)  # leader not reaped yet: its group id is still ours
             proc.wait()
+            reaped = True
             for reader in readers:
-                reader.join(timeout=10)
+                reader.join(timeout=5)
+            if any(reader.is_alive() for reader in readers):
+                # A descendant still holds the pipes, so the group still exists; kill it.
+                self._kill_group(proc.pid)
+                for reader in readers:
+                    reader.join(timeout=5)
+            return proc.returncode, bytes(out), out_overflow.is_set(), timed_out
+        finally:
+            if not reaped:
+                self._kill(proc)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=30)
+
+    def _sweep_stale(self) -> None:
+        """Remove scratch directories left by workers whose server died mid-operation.
+
+        Only directories older than any possible operation are removed, so concurrent server
+        processes sharing this state directory are never disturbed.
+        """
+
+        cutoff = time.time() - _STALE_SCRATCH_SECONDS
+        with contextlib.suppress(OSError):
+            for entry in self.work_root.iterdir():
+                with contextlib.suppress(OSError):
+                    if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                        shutil.rmtree(entry, ignore_errors=True)
+
+    def call(self, op: str, payload: dict[str, Any], *, deadline_seconds: float) -> dict[str, Any]:
+        """Run one operation in a fresh worker and return its result or raise DataPlaneError."""
+
+        self.work_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not self._swept:
+            self._sweep_stale()
+            self._swept = True
+        workdir = Path(tempfile.mkdtemp(prefix=f"{op}-", dir=self.work_root))
+        try:
+            payload = dict(payload)
+            payload["limits"] = {**payload["limits"], "temp_directory": str(workdir / "duckdb")}
+            request = json.dumps(
+                {"op": op, "payload": payload, "os_limits": self._os_limits(deadline_seconds)}
+            ).encode("utf-8")
+            returncode, out, out_overflow, timed_out = self._run_worker(
+                workdir, request, deadline_seconds
+            )
             if timed_out:
                 raise DataPlaneError(
                     "timeout", "TimeoutError", "query exceeded the configured execution time limit"
                 )
-            if out_overflow.is_set():
+            if out_overflow:
                 raise DataPlaneError(
                     "response_too_large",
                     "ResponseTooLarge",
@@ -180,7 +243,7 @@ class DataPlaneClient:
             except json.JSONDecodeError:
                 response = None
             if not isinstance(response, dict):
-                code = proc.returncode
+                code = returncode
                 how = (
                     f"signal {signal.Signals(-code).name}"
                     if code is not None and code < 0 and -code in signal.Signals._value2member_map_
