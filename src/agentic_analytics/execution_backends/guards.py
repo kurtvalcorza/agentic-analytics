@@ -22,7 +22,11 @@ Accounting model and its limits:
   the poll interval. The free-space reserve exists so that overshoot cannot reach zero. It is
   detection and termination, not a filesystem quota.
 * On a breach, :meth:`WorkspaceDiskGuard.reclaim` removes every entry the workload created.
-  Growth of files that existed before the run is reported but never reverted.
+  Growth of files that existed before the run is reported but never reverted, and content
+  that existed before the run is never deleted, even if the workload renamed or hard-linked
+  it (reclaim protects pre-existing inodes, not just pre-existing paths).
+* Accounting is path-keyed, so a renamed pre-existing file counts as new output. This errs
+  toward over-counting (a possible false breach), never toward under-counting.
 """
 
 from __future__ import annotations
@@ -140,6 +144,9 @@ class WorkspaceDiskGuard:
             raise DiskGuardError(
                 f"cannot measure workspace before execution; refusing to run: {exc}"
             ) from exc
+        # Inodes that existed before the run. Reclaim never deletes these, even under a new
+        # name, so renaming or hard-linking pre-existing data cannot get it destroyed.
+        self._baseline_inodes = {(dev, ino) for _, dev, ino, _ in self._baseline}
         self._thread = threading.Thread(target=self._run, name="workspace-disk-guard", daemon=True)
 
     def __enter__(self) -> WorkspaceDiskGuard:
@@ -234,7 +241,10 @@ class WorkspaceDiskGuard:
                 is_dir = stat.S_ISDIR(info.st_mode)
                 relative = path.relative_to(self.workspace).as_posix()
                 key = (relative, info.st_dev, info.st_ino, is_dir)
-                if key not in self._baseline:
+                if (
+                    key not in self._baseline
+                    and (info.st_dev, info.st_ino) not in self._baseline_inodes
+                ):
                     created.append(path)
                 if is_dir:
                     stack.append(path)

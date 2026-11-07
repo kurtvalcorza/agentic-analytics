@@ -301,3 +301,23 @@ Path({str(marker)!r}).write_text("alive")
     assert record.status is ExecutionStatus.SUCCEEDED
     time.sleep(3)
     assert not marker.exists()
+
+
+def test_reclaim_never_deletes_renamed_preexisting_data(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    original = b"precious,data\n" * 10
+    (workspace / "data.csv").write_bytes(original)
+    # Rename pre-existing data, hard-link the input, then breach the budget.
+    code = (
+        "import os\n"
+        "os.rename('data.csv', 'moved.csv')\n"
+        "os.link('input.csv', 'alias.csv')\n"
+        "open('burst.bin', 'wb').write(b'x' * (2 * 1024 * 1024))\n"
+    )
+
+    record = runtime.execution.execute_python(session, code, timeout_seconds=30)
+
+    assert record.error is not None and record.error["type"] == "resource_limit_exceeded"
+    assert not (workspace / "burst.bin").exists()
+    assert (workspace / "moved.csv").read_bytes() == original
+    assert (workspace / "input.csv").read_text(encoding="utf-8") == "x\n1\n"
