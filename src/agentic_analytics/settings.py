@@ -1,9 +1,30 @@
 import os
+import re
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]i?b?|b|bytes)?\s*$", re.IGNORECASE)
+_UNITS = {"": 1, "b": 1, "bytes": 1}
+for _index, _prefix in enumerate("kmgt", start=1):
+    _UNITS[_prefix] = _UNITS[_prefix + "b"] = 1000**_index
+    _UNITS[_prefix + "i"] = _UNITS[_prefix + "ib"] = 1024**_index
+# Address space the worker needs beyond DuckDB's own memory_limit: the interpreter, DuckDB's
+# shared library, and per-thread stacks (glibc arenas are capped via MALLOC_ARENA_MAX).
+_WORKER_BASE_BYTES = 256 * 1024**2
+_WORKER_PER_THREAD_BYTES = 16 * 1024**2
+
+
+def parse_size(value: str) -> int | None:
+    """Parse a DuckDB-style size ("1GB", "512MiB"); None when not understood."""
+
+    match = _SIZE.match(value)
+    if match is None:
+        return None
+    unit = (match.group(2) or "").lower()
+    return int(float(match.group(1)) * _UNITS[unit])
 
 
 class Settings(BaseSettings):
@@ -20,6 +41,17 @@ class Settings(BaseSettings):
     max_discovered_sources: int = Field(default=500, ge=1, le=100_000)
     query_timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
     query_memory_limit: str = Field(default="1GB")
+    # Isolated data-plane worker (SEC-02). Every DuckDB operation (query, inspection,
+    # validation statistics) runs in a separate process with these OS limits.
+    data_plane_timeout_seconds: float = Field(default=300.0, gt=0, le=86_400)
+    data_plane_memory_bytes: int = Field(default=3 * 1024**3, ge=512 * 1024**2)
+    # Caps each file the worker writes, including DuckDB's temp file for large sorts/joins.
+    data_plane_max_file_bytes: int = Field(default=8 * 1024**3, ge=1024**2)
+    # Aggregate DuckDB temp-spill budget per operation (max_temp_directory_size). DuckDB's own
+    # default is 90% of free disk; RLIMIT_FSIZE alone only caps each individual file.
+    data_plane_max_temp_bytes: int = Field(default=8 * 1024**3, ge=1024**2)
+    data_plane_threads: int = Field(default=2, ge=1, le=64)
+    data_plane_max_response_bytes: int = Field(default=64 * 1024**2, ge=1024**2)
     execution_backend: Literal["docker", "subprocess_dev"] = "docker"
     docker_image: str = "agentic-analytics-exec:dev"
     docker_memory: str = "1g"
@@ -46,6 +78,27 @@ class Settings(BaseSettings):
     max_result_preview_bytes: int = Field(default=256 * 1024, ge=1024)
     max_result_cell_chars: int = Field(default=8192, ge=64)
     log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def validate_data_plane_capacity(self) -> Self:
+        # Reject configurations where the worker could never run: DuckDB's own memory limit
+        # plus interpreter and thread overhead must fit inside the worker's address space.
+        duckdb_bytes = parse_size(self.query_memory_limit)
+        if duckdb_bytes is not None:
+            required = (
+                duckdb_bytes
+                + _WORKER_BASE_BYTES
+                + self.data_plane_threads * _WORKER_PER_THREAD_BYTES
+            )
+            if self.data_plane_memory_bytes < required:
+                raise ValueError(
+                    f"data_plane_memory_bytes ({self.data_plane_memory_bytes}) must be at least "
+                    f"{required}: query_memory_limit plus worker and per-thread overhead"
+                )
+        # A spill must be able to reach its artifact size limit before the OS file cap stops it.
+        if self.max_artifact_bytes > self.data_plane_max_file_bytes:
+            raise ValueError("max_artifact_bytes must not exceed data_plane_max_file_bytes")
+        return self
 
     def normalized_allowed_roots(self) -> list[Path]:
         return [root.expanduser().resolve(strict=False) for root in self.allowed_workspace_roots]

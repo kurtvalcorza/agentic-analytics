@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agentic_analytics.dataplane import DataPlaneClient
 from agentic_analytics.models import (
     AnalysisSession,
     DataSource,
@@ -39,7 +40,9 @@ class ValidationService:
         *,
         executions: ExecutionRepository,
         workspace: WorkspaceService | None = None,
+        data_plane: DataPlaneClient | None = None,
     ) -> None:
+        self.data_plane = data_plane
         self.evidence = evidence
         self.sources = sources
         self.findings = findings
@@ -111,6 +114,7 @@ class ValidationService:
             claim_texts=claim_texts or [],
             duplicate_keys=duplicate_keys or {},
             workspace=self.workspace,
+            data_plane=self.data_plane,
         )
         all_findings: list[ValidationFinding] = []
         checks_run: list[str] = []
