@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     max_discovered_sources: int = Field(default=500, ge=1, le=100_000)
     query_timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
     query_memory_limit: str = Field(default="1GB")
+    # Isolated data-plane worker (SEC-02). Every DuckDB operation (query, inspection,
+    # validation statistics) runs in a separate process with these OS limits.
+    data_plane_timeout_seconds: float = Field(default=300.0, gt=0, le=86_400)
+    data_plane_memory_bytes: int = Field(default=3 * 1024**3, ge=256 * 1024**2)
+    data_plane_max_file_bytes: int = Field(default=2 * 1024**3, ge=1024**2)
+    data_plane_threads: int = Field(default=2, ge=1, le=64)
+    data_plane_max_response_bytes: int = Field(default=64 * 1024**2, ge=1024**2)
     execution_backend: Literal["docker", "subprocess_dev"] = "docker"
     docker_image: str = "agentic-analytics-exec:dev"
     docker_memory: str = "1g"

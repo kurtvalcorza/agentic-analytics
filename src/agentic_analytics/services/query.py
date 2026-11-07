@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import contextlib
-import json
+import importlib.metadata
 import re
-import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import duckdb
-
+from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
 from agentic_analytics.ids import EntityType, new_id
 from agentic_analytics.models import (
     AnalysisSession,
@@ -25,11 +23,11 @@ from agentic_analytics.settings import Settings
 
 from .artifact_registry import ArtifactLimitError, ArtifactRegistry
 from .inspector import fingerprint_file
-from .preview import cell_bound_expr as _cell_bound_expr
-from .preview import json_value as _json_value
 from .sql_tokens import SqlToken, tokenize_sql
 from .workspace import WorkspaceService
 
+# Read from package metadata: the server process never imports DuckDB itself (SEC-02).
+_DUCKDB_VERSION = importlib.metadata.version("duckdb")
 _SOURCE_ID = re.compile(r"src_[0-9a-f]{32}", re.IGNORECASE)
 _FORBIDDEN = re.compile(
     r"\b(insert|update|delete|create|drop|alter|copy|attach|detach|install|load|call|pragma|set|"
@@ -47,23 +45,6 @@ _CATALOG_RELATIONS = {
     "sqlite_master",
     "sqlite_temp_master",
 }
-# The preview is streamed one row at a time so no more than a single (already cell-capped) row
-# is ever materialized in Python before the byte budget is re-checked.
-_MIN_PREVIEW_CELL_CHARS = 16
-# Absolute cap on previewed columns so a result with an extreme column count cannot produce
-# unbounded column metadata or a row that no per-cell cap can shrink under the budget.
-_MAX_PREVIEW_COLUMNS = 512
-# Worst-case JSON bytes a pass-through (non-string) scalar cell can contribute; used to derive a
-# column count that keeps even an all-scalar row within the byte budget.
-_MAX_SCALAR_BYTES_PER_COL = 64
-# Cap on the length of each returned column name so long aliases cannot inflate the response.
-_MAX_COLUMN_NAME_CHARS = 256
-# How often the spill watchdog samples the growing Parquet file to bound bytes written to disk.
-_SPILL_POLL_SECONDS = 0.02
-
-
-def _sql_string(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
 
 
 def _source_references(tokens: list[SqlToken]) -> list[tuple[int, int, str]]:
@@ -98,7 +79,9 @@ class QueryService:
         workspace: WorkspaceService,
         artifacts: ArtifactRegistry,
         settings: Settings,
+        data_plane: DataPlaneClient | None = None,
     ) -> None:
+        self.data_plane = data_plane or DataPlaneClient(settings)
         self.sources = sources
         self.executions = executions
         self.workspace = workspace
@@ -148,17 +131,6 @@ class QueryService:
                 )
         return normalized
 
-    def _secure_connection(self, connection: duckdb.DuckDBPyConnection, paths: list[str]) -> None:
-        allowed_paths = ", ".join(_sql_string(path) for path in paths)
-        connection.execute(f"SET allowed_paths = [{allowed_paths}]")
-        connection.execute("SET autoinstall_known_extensions = false")
-        connection.execute("SET autoload_known_extensions = false")
-        connection.execute("SET allow_community_extensions = false")
-        connection.execute("SET enable_external_access = false")
-        # Bound memory before locking configuration so a single query cannot exhaust the host.
-        connection.execute(f"SET memory_limit = {_sql_string(self.settings.query_memory_limit)}")
-        connection.execute("SET lock_configuration = true")
-
     @staticmethod
     def _prepare_spill_path(archive_base: Path) -> Path:
         """Create the archive directory and return the validated spill file path.
@@ -176,210 +148,6 @@ class QueryService:
         if resolved_base != archive_root and archive_root not in resolved_base.parents:
             raise QueryRejected("spill directory escapes the artifact archive root")
         return resolved_base / "query-result.parquet"
-
-    def _preview_projection(
-        self, connection: duckdb.DuckDBPyConnection, result_table: str
-    ) -> tuple[str, int, bool]:
-        """Build a SELECT list that caps each column's cell size in SQL for the preview.
-
-        Two bounds keep a single row within ``max_result_preview_bytes``:
-
-        * The number of previewed columns is capped so even an all-scalar row (whose cells pass
-          through the projection uncapped) cannot exceed the budget through column count alone,
-          and column metadata stays bounded.
-        * The per-cell cap is the smaller of the configured cell budget and an even share of the
-          byte budget across the previewed columns, bounding the string/blob/nested cells.
-
-        Returns the projection, the effective per-cell cap, and whether columns were dropped.
-        """
-
-        described = connection.execute(f'DESCRIBE "{result_table}"').fetchall()
-        budget = self.settings.max_result_preview_bytes
-        column_budget = max(1, budget // _MAX_SCALAR_BYTES_PER_COL)
-        column_limit = min(len(described), _MAX_PREVIEW_COLUMNS, column_budget)
-        shown = described[:column_limit]
-        column_truncated = len(shown) < len(described)
-        column_count = max(1, len(shown))
-        # Halve the per-column share to leave headroom for JSON structure (quotes, commas).
-        row_share = budget // column_count // 2
-        cell_cap = min(
-            self.settings.max_result_cell_chars,
-            max(_MIN_PREVIEW_CELL_CHARS, row_share),
-        )
-        projection = ", ".join(
-            _cell_bound_expr(str(row[0]), str(row[1]), cell_cap) for row in shown
-        )
-        return projection, cell_cap, column_truncated
-
-    @staticmethod
-    def _row_bytes(row: list[Any]) -> int:
-        return len(json.dumps(row, default=str).encode("utf-8"))
-
-    def _shrink_row(self, row: list[Any], budget: int) -> list[Any]:
-        """Trim a single row's string cells until it fits the byte budget.
-
-        Used only to guarantee a non-empty preview: when even the first streamed row exceeds the
-        whole budget, its largest string cells are halved repeatedly so at least a bounded slice
-        is returned instead of an empty preview or an over-budget row.
-        """
-
-        shrunk = list(row)
-        while self._row_bytes(shrunk) > budget:
-            index = max(
-                (i for i, value in enumerate(shrunk) if isinstance(value, str) and value),
-                key=lambda i: len(shrunk[i]),
-                default=None,
-            )
-            if index is None:
-                break  # nothing left to trim (only small non-string cells remain)
-            shrunk[index] = shrunk[index][: len(shrunk[index]) // 2]
-        return shrunk
-
-    def _fetch_preview_bounded(
-        self, connection: duckdb.DuckDBPyConnection, sql: str, limit: int, cell_cap: int
-    ) -> tuple[list[str], list[list[Any]], bool]:
-        """Stream a preview whose cells were already SQL-capped, bounding total bytes as well.
-
-        Rows are pulled one at a time under the wall-clock interrupt so at most a single
-        (already cell-capped) row is materialized before the byte budget is re-checked. The
-        budget bounds every row including the first — an oversized first row is shrunk to fit
-        rather than kept whole — so the preview can never exceed ``max_result_preview_bytes`` in
-        server memory. Returns (columns, rows, truncated) where ``truncated`` marks a preview
-        that dropped rows/cells the full artifact still carries.
-        """
-
-        budget = self.settings.max_result_preview_bytes
-        timed_out = threading.Event()
-
-        def _interrupt() -> None:
-            timed_out.set()
-            connection.interrupt()
-
-        timer = threading.Timer(self.settings.query_timeout_seconds, _interrupt)
-        timer.start()
-        try:
-            cursor = connection.execute(sql)
-            columns = [str(item[0])[:_MAX_COLUMN_NAME_CHARS] for item in (cursor.description or [])]
-            kept: list[list[Any]] = []
-            used = 0
-            truncated = False
-            while len(kept) < limit:
-                raw = cursor.fetchone()
-                if raw is None:
-                    break
-                row: list[Any] = []
-                for value in (_json_value(item) for item in raw):
-                    # A cell at the SQL cap length means its source value was longer and was
-                    # trimmed for the preview; flag it so the full value is preserved by spilling.
-                    # The trim is also a defensive backstop for a type the projection passed
-                    # through.
-                    if isinstance(value, str) and len(value) > cell_cap:
-                        value = value[:cell_cap]
-                        truncated = True
-                    row.append(value)
-                size = self._row_bytes(row)
-                if used + size > budget:
-                    truncated = True
-                    if not kept:
-                        # Guarantee at least one bounded row rather than an empty preview.
-                        kept.append(self._shrink_row(row, budget))
-                    break
-                kept.append(row)
-                used += size
-            return columns, kept, truncated
-        except duckdb.Error as exc:
-            if timed_out.is_set():
-                raise TimeoutError("query exceeded the configured execution time limit") from exc
-            raise
-        finally:
-            timer.cancel()
-
-    @staticmethod
-    def _scalar_int(connection: duckdb.DuckDBPyConnection, sql: str) -> int:
-        row = connection.execute(sql).fetchone()
-        return int(row[0]) if row else 0
-
-    def _run_bounded(
-        self, connection: duckdb.DuckDBPyConnection, sql: str
-    ) -> tuple[list[str], list[tuple[Any, ...]]]:
-        """Execute ``sql`` with a wall-clock interrupt so runaway queries cannot hang the server."""
-
-        timed_out = threading.Event()
-
-        def _interrupt() -> None:
-            timed_out.set()
-            connection.interrupt()
-
-        timer = threading.Timer(self.settings.query_timeout_seconds, _interrupt)
-        timer.start()
-        try:
-            cursor = connection.execute(sql)
-            columns = [str(item[0]) for item in (cursor.description or [])]
-            rows = cursor.fetchall()
-            return columns, rows
-        except duckdb.Error as exc:
-            if timed_out.is_set():
-                raise TimeoutError("query exceeded the configured execution time limit") from exc
-            raise
-        finally:
-            timer.cancel()
-
-    def _write_spill_bounded(
-        self,
-        connection: duckdb.DuckDBPyConnection,
-        copy_sql: str,
-        spill_path: Path,
-        byte_ceiling: int,
-    ) -> None:
-        """Run the spill ``COPY`` under both a time and a bytes-written bound.
-
-        A watchdog thread samples the growing Parquet file and interrupts the write once it
-        crosses ``byte_ceiling``, so an oversized spill cannot fill the disk before a post-write
-        size check would reject it — DuckDB flushes row groups incrementally, so the bytes
-        actually written are bounded to roughly the ceiling plus one row group. A final exact
-        check catches a small over-ceiling file that completed between samples.
-        """
-
-        timed_out = threading.Event()
-        over_limit = threading.Event()
-        stop_watch = threading.Event()
-
-        def _interrupt_timeout() -> None:
-            timed_out.set()
-            connection.interrupt()
-
-        def _watch_size() -> None:
-            while not stop_watch.wait(_SPILL_POLL_SECONDS):
-                try:
-                    if spill_path.stat().st_size > byte_ceiling:
-                        over_limit.set()
-                        connection.interrupt()
-                        return
-                except FileNotFoundError:
-                    continue
-
-        timer = threading.Timer(self.settings.query_timeout_seconds, _interrupt_timeout)
-        watcher = threading.Thread(target=_watch_size, daemon=True)
-        timer.start()
-        watcher.start()
-        try:
-            connection.execute(copy_sql)
-        except duckdb.Error as exc:
-            if over_limit.is_set():
-                raise ArtifactLimitError(
-                    f"spill exceeded the artifact byte limit of {byte_ceiling}"
-                ) from exc
-            if timed_out.is_set():
-                raise TimeoutError("query exceeded the configured execution time limit") from exc
-            raise
-        finally:
-            stop_watch.set()
-            timer.cancel()
-            watcher.join(timeout=1)
-        if spill_path.exists() and spill_path.stat().st_size > byte_ceiling:
-            raise ArtifactLimitError(
-                f"spill is {spill_path.stat().st_size} bytes; artifact limit is {byte_ceiling}"
-            )
 
     def execute(
         self,
@@ -430,185 +198,147 @@ class QueryService:
         archive_base = self.artifacts.archive_base(session.id, execution_id)
         spill_path = self._prepare_spill_path(archive_base)
 
-        connection = duckdb.connect(database=":memory:")
-        fingerprints: dict[str, Any] = {}
-        view_names: dict[str, str] = {}
+        fingerprints = {source_id: fingerprint for source_id, _, _, fingerprint in resolved_sources}
         # Unguessable per-execution view/table names cannot be shadowed by a caller CTE.
         token = uuid4().hex
-        result_table = f"_result_{token}"
+        view_names = {
+            source_id: f"_src_{token}_{index}"
+            for index, (source_id, _, _, _) in enumerate(resolved_sources)
+        }
+        rewritten = normalized
+        for start, end, source_id in reversed(references):
+            rewritten = rewritten[:start] + f'"{view_names[source_id]}"' + rewritten[end:]
+        # The artifact row budget is never smaller than the preview row limit. Otherwise a
+        # result could overflow the spill cap while still fitting the preview, leaving
+        # result_complete=False with no artifact. With this floor, overflowing the cap always
+        # also truncates the preview, so a capped result is always spilled.
+        spill_cap = max(self.settings.max_spill_rows, limit)
+        timeout = self.settings.query_timeout_seconds
+        payload = {
+            "sources": [
+                {"view": view_names[source_id], "kind": kind.value, "path": file_path}
+                for source_id, kind, file_path, _ in resolved_sources
+            ],
+            "sql": rewritten,
+            "result_table": f"_result_{token}",
+            "limit": limit,
+            "spill_cap": spill_cap,
+            "spill_path": str(spill_path),
+            # Bound the spill as it is written at the *remaining* session budget, so a session
+            # that already holds artifacts cannot over-write before registration rejects it.
+            "spill_byte_ceiling": self.artifacts.spill_byte_ceiling(session.id),
+            "require_complete": require_complete,
+            "limits": self.data_plane.limits(timeout),
+        }
+        started = datetime.now(UTC)
         try:
-            allowed_paths = [item[2] for item in resolved_sources]
-            allowed_paths.append(str(spill_path))
-            self._secure_connection(connection, allowed_paths)
-            for index, (source_id, kind, file_path, fingerprint) in enumerate(resolved_sources):
-                view_name = f"_src_{token}_{index}"
-                path_literal = _sql_string(file_path)
-                if kind is SourceKind.CSV:
-                    reader = f"read_csv({path_literal}, strict_mode = true)"
-                elif kind is SourceKind.PARQUET:
-                    reader = f"read_parquet({path_literal})"
-                else:
-                    raise QueryRejected(f"unsupported source kind: {kind}")
-                connection.execute(f'CREATE TEMP VIEW "{view_name}" AS SELECT * FROM {reader}')
-                view_names[source_id] = view_name
-                fingerprints[source_id] = fingerprint
+            # Materialize, preview, and spill each have their own deadline inside the worker.
+            outcome = self.data_plane.call("query", payload, deadline_seconds=3 * timeout)
+        except DataPlaneError as exc:
+            # Never register a partial or over-limit spill: drop the file and audit the failure.
+            with contextlib.suppress(FileNotFoundError):
+                spill_path.unlink()
+            self._persist_failure(session, normalized, limit, source_ids, fingerprints, exc)
+            raise QueryExecutionError(str(exc)) from exc
 
-            rewritten = normalized
-            for start, end, source_id in reversed(references):
-                rewritten = rewritten[:start] + f'"{view_names[source_id]}"' + rewritten[end:]
-
-            started = datetime.now(UTC)
-            # Materialize the full result ONCE, bounded by a row cap and the interrupt timer, so
-            # the preview and the spilled artifact are the same evaluation (deterministic even
-            # for nondeterministic SQL) and materialization cannot run unbounded.
-            # The artifact row budget is never smaller than the preview row limit. Otherwise a
-            # result could overflow the spill cap while still fitting the preview, leaving
-            # result_complete=False with no artifact. With this floor, overflowing the cap
-            # always also truncates the preview, so a capped result is always spilled.
-            spill_cap = max(self.settings.max_spill_rows, limit)
-            materialize_sql = (
-                f'CREATE TEMP TABLE "{result_table}" AS '
-                f"SELECT * FROM ({rewritten}) AS _q LIMIT {spill_cap + 1}"
+        columns: list[str] = outcome["columns"]
+        serial_rows: list[list[Any]] = outcome["rows"]
+        materialized = int(outcome["materialized"])
+        truncated = bool(outcome["truncated"])
+        spill_capped = bool(outcome["spill_capped"])
+        # Invariant relied on by clients: an incomplete result always has a truncated preview
+        # and (unless require_complete refused it) a published, capped artifact.
+        assert truncated or not spill_capped
+        if spill_capped and require_complete:
+            incomplete = QueryExecutionError(
+                f"query result exceeds max_spill_rows ({spill_cap}); refusing to produce a "
+                "partial result because require_complete was set. Aggregate or filter the "
+                "query, or raise AGENTIC_ANALYTICS_MAX_SPILL_ROWS."
             )
+            self._persist_failure(
+                session, normalized, limit, source_ids, fingerprints, incomplete
+            )
+            raise incomplete
+        artifact_rows = min(materialized, spill_cap)
+
+        artifact_id: str | None = None
+        artifact_ids: list[str] = []
+        if outcome["spilled"]:
             try:
-                self._run_bounded(connection, materialize_sql)
-                materialized = self._scalar_int(
-                    connection, f'SELECT count(*) FROM "{result_table}"'
+                artifact = self.artifacts.register_file(
+                    session.id,
+                    execution_id,
+                    spill_path,
+                    lineage={"change": "query_result_spill", "source_ids": source_ids},
+                    metadata={
+                        "format": "parquet",
+                        "preview_rows": len(serial_rows),
+                        "query_truncated": True,
+                        "spill_row_count": artifact_rows,
+                        "spill_truncated": spill_capped,
+                        "result_complete": not spill_capped,
+                        "max_spill_rows": spill_cap,
+                    },
                 )
-                # Cap each column's cells in SQL, then stream the preview under the byte budget
-                # so an oversized string/blob (or many wide rows) never fully materializes in
-                # Python.
-                projection, preview_cell_cap, column_truncated = self._preview_projection(
-                    connection, result_table
-                )
-                columns, serial_rows, preview_truncated = self._fetch_preview_bounded(
-                    connection,
-                    f'SELECT {projection} FROM "{result_table}" LIMIT {limit + 1}',
-                    limit,
-                    preview_cell_cap,
-                )
-            except (duckdb.Error, TimeoutError) as exc:
+            except ArtifactLimitError as exc:
+                with contextlib.suppress(FileNotFoundError):
+                    spill_path.unlink()
                 self._persist_failure(session, normalized, limit, source_ids, fingerprints, exc)
                 raise QueryExecutionError(str(exc)) from exc
+            artifact_id = artifact.id
+            artifact_ids.append(artifact.id)
 
-            row_truncated = materialized > limit
-            # A dropped column means the preview no longer renders the full result, so the spill
-            # (which COPYs the complete result_table) must carry the full-fidelity data.
-            truncated = row_truncated or preview_truncated or column_truncated
-            spill_capped = materialized > spill_cap
-            # Invariant relied on by clients: an incomplete result always has a truncated
-            # preview and a published (capped) artifact.
-            assert truncated or not spill_capped
-            if spill_capped and require_complete:
-                incomplete = QueryExecutionError(
-                    f"query result exceeds max_spill_rows ({spill_cap}); refusing to produce a "
-                    "partial result because require_complete was set. Aggregate or filter the "
-                    "query, or raise AGENTIC_ANALYTICS_MAX_SPILL_ROWS."
-                )
-                self._persist_failure(
-                    session, normalized, limit, source_ids, fingerprints, incomplete
-                )
-                raise incomplete
-            artifact_rows = min(materialized, spill_cap)
-
-            artifact_id: str | None = None
-            artifact_ids: list[str] = []
-            if truncated:
-                spill_literal = _sql_string(str(spill_path))
-                # Bound the spill in bytes as it is written (a watchdog interrupts the COPY once
-                # the file crosses the ceiling) and in time (wall-clock interrupt), so an
-                # oversized spill cannot fill the disk; register_file then enforces the precise
-                # per-file and session-cumulative quotas before the artifact is recorded. The
-                # ceiling is the *remaining* session budget, not the full cumulative cap, so a
-                # session that already holds artifacts cannot over-write before rejection.
-                byte_ceiling = self.artifacts.spill_byte_ceiling(session.id)
-                try:
-                    self._write_spill_bounded(
-                        connection,
-                        # The table holds spill_cap + 1 rows only to detect overflow; the
-                        # artifact carries exactly the advertised row budget.
-                        f'COPY (SELECT * FROM "{result_table}" LIMIT {spill_cap}) '
-                        f"TO {spill_literal} (FORMAT PARQUET, COMPRESSION ZSTD)",
-                        spill_path,
-                        byte_ceiling,
-                    )
-                    artifact = self.artifacts.register_file(
-                        session.id,
-                        execution_id,
-                        spill_path,
-                        lineage={
-                            "change": "query_result_spill",
-                            "source_ids": source_ids,
-                        },
-                        metadata={
-                            "format": "parquet",
-                            "preview_rows": len(serial_rows),
-                            "query_truncated": True,
-                            "spill_row_count": artifact_rows,
-                            "spill_truncated": spill_capped,
-                            "result_complete": not spill_capped,
-                            "max_spill_rows": spill_cap,
-                        },
-                    )
-                except (duckdb.Error, TimeoutError, ArtifactLimitError) as exc:
-                    # Never register a partial or over-limit spill: drop the file and record the
-                    # failure so the oversized artifact does not silently bypass the quota.
-                    with contextlib.suppress(FileNotFoundError):
-                        spill_path.unlink()
-                    self._persist_failure(session, normalized, limit, source_ids, fingerprints, exc)
-                    raise QueryExecutionError(str(exc)) from exc
-                artifact_id = artifact.id
-                artifact_ids.append(artifact.id)
-
-            execution = ExecutionRecord(
-                id=execution_id,
-                session_id=session.id,
-                execution_type=ExecutionType.MANAGED_SQL,
-                status=ExecutionStatus.SUCCEEDED,
-                request={"sql": normalized, "max_rows": limit},
-                source_ids=source_ids,
-                source_fingerprints=fingerprints,
-                # DuckDB can only reach the registered source views (allowed_paths, external
-                # access disabled), so source use is runtime-enforced, not merely declared.
-                source_attestation=SourceAttestation.ENFORCED,
-                started_at=started,
-                completed_at=datetime.now(UTC),
-                runtime={"backend": "duckdb", "duckdb": duckdb.__version__},
-                result_preview={
-                    "columns": columns,
-                    "rows": serial_rows,
-                    "result_complete": not spill_capped,
-                    "spill_truncated": spill_capped,
-                },
-                truncated=truncated,
-                artifact_ids=artifact_ids,
-            )
-            self.executions.add(execution)
-            completeness_note = (
-                f"Result exceeded max_spill_rows ({spill_cap}); the artifact holds only "
-                f"{artifact_rows} rows, an arbitrary subset unless the query has a total "
-                "ORDER BY. Do not treat it as the complete result."
-                if spill_capped
-                else None
-            )
-            return {
-                "execution_id": execution.id,
+        execution = ExecutionRecord(
+            id=execution_id,
+            session_id=session.id,
+            execution_type=ExecutionType.MANAGED_SQL,
+            status=ExecutionStatus.SUCCEEDED,
+            request={"sql": normalized, "max_rows": limit},
+            source_ids=source_ids,
+            source_fingerprints=fingerprints,
+            # DuckDB can only reach the registered source views (allowed_paths, external
+            # access disabled), so source use is runtime-enforced, not merely declared.
+            source_attestation=SourceAttestation.ENFORCED,
+            started_at=started,
+            completed_at=datetime.now(UTC),
+            runtime=self._runtime(),
+            result_preview={
                 "columns": columns,
                 "rows": serial_rows,
-                "row_count_returned": len(serial_rows),
-                "truncated": truncated,
-                "artifact_id": artifact_id,
-                # Full-result completeness, distinct from preview truncation.
                 "result_complete": not spill_capped,
                 "spill_truncated": spill_capped,
-                "max_spill_rows": spill_cap,
-                "artifact_row_count": artifact_rows if artifact_id is not None else None,
-                "result_row_count": None if spill_capped else materialized,
-                "completeness_note": completeness_note,
-                "source_attestation": SourceAttestation.ENFORCED.value,
-            }
-        finally:
-            connection.close()
+            },
+            truncated=truncated,
+            artifact_ids=artifact_ids,
+        )
+        self.executions.add(execution)
+        completeness_note = (
+            f"Result exceeded max_spill_rows ({spill_cap}); the artifact holds only "
+            f"{artifact_rows} rows, an arbitrary subset unless the query has a total "
+            "ORDER BY. Do not treat it as the complete result."
+            if spill_capped
+            else None
+        )
+        return {
+            "execution_id": execution.id,
+            "columns": columns,
+            "rows": serial_rows,
+            "row_count_returned": len(serial_rows),
+            "truncated": truncated,
+            "artifact_id": artifact_id,
+            # Full-result completeness, distinct from preview truncation.
+            "result_complete": not spill_capped,
+            "spill_truncated": spill_capped,
+            "max_spill_rows": spill_cap,
+            "artifact_row_count": artifact_rows if artifact_id is not None else None,
+            "result_row_count": None if spill_capped else materialized,
+            "completeness_note": completeness_note,
+            "source_attestation": SourceAttestation.ENFORCED.value,
+        }
+
+    @staticmethod
+    def _runtime() -> dict[str, Any]:
+        return {"backend": "duckdb", "duckdb": _DUCKDB_VERSION, "isolation": "process"}
 
     def _persist_failure(
         self,
@@ -619,9 +349,12 @@ class QueryService:
         fingerprints: dict[str, Any],
         exc: BaseException,
     ) -> None:
-        status = (
-            ExecutionStatus.TIMED_OUT if isinstance(exc, TimeoutError) else ExecutionStatus.FAILED
-        )
+        timed_out = isinstance(exc, DataPlaneError) and exc.category == "timeout"
+        status = ExecutionStatus.TIMED_OUT if timed_out else ExecutionStatus.FAILED
+        error: dict[str, Any] = {"type": type(exc).__name__, "message": str(exc)}
+        if isinstance(exc, DataPlaneError):
+            # Report the worker-side error type (e.g. BinderException) and its category.
+            error = {"type": exc.error_type, "category": exc.category, "message": str(exc)}
         record = ExecutionRecord(
             session_id=session.id,
             execution_type=ExecutionType.MANAGED_SQL,
@@ -630,7 +363,7 @@ class QueryService:
             source_ids=source_ids,
             source_fingerprints=fingerprints,
             completed_at=datetime.now(UTC),
-            runtime={"backend": "duckdb", "duckdb": duckdb.__version__},
-            error={"type": type(exc).__name__, "message": str(exc)},
+            runtime=self._runtime(),
+            error=error,
         )
         self.executions.add(record)

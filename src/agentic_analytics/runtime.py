@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .dataplane import DataPlaneClient
 from .execution_backends import DockerBackend, ExecutionBackend, SubprocessDevBackend
 from .execution_backends.guards import DiskLimits
 from .repositories import (
@@ -56,7 +57,9 @@ class Runtime:
         workspace = WorkspaceService(
             resolved.normalized_allowed_roots(), protected_roots=[resolved.state_dir]
         )
-        inspector = InspectorService(sources, workspace, resolved)
+        # Every DuckDB operation runs in an isolated worker process (SEC-02).
+        data_plane = DataPlaneClient(resolved)
+        inspector = InspectorService(sources, workspace, resolved, data_plane)
         registry = ArtifactRegistry(
             artifact_repository,
             resolved.state_dir / "artifacts",
@@ -64,7 +67,7 @@ class Runtime:
             max_artifact_bytes=resolved.max_artifact_bytes,
             max_total_bytes=resolved.max_total_artifact_bytes,
         )
-        query = QueryService(sources, executions, workspace, registry, resolved)
+        query = QueryService(sources, executions, workspace, registry, resolved, data_plane)
         backend: ExecutionBackend
         disk_limits = DiskLimits(
             max_output_bytes=resolved.max_execution_output_bytes,
@@ -104,6 +107,7 @@ class Runtime:
             validation_runs,
             executions=executions,
             workspace=workspace,
+            data_plane=data_plane,
         )
         return cls(
             resolved,

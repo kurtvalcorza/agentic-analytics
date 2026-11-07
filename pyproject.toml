@@ -56,3 +56,6 @@ packages = ["agentic_analytics"]
 [tool.coverage.run]
 source = ["agentic_analytics"]
 branch = true
+# Measure the isolated data-plane worker processes too.
+patch = ["subprocess"]
+parallel = true

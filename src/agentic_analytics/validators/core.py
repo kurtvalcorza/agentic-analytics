@@ -3,10 +3,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, TypeGuard
+from typing import Any, Protocol, TypeGuard
 
-import duckdb
-
+from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
 from agentic_analytics.models import (
     AnalysisSession,
     DataSource,
@@ -19,14 +18,8 @@ from agentic_analytics.services.inspector import fingerprint_file
 from agentic_analytics.services.workspace import WorkspaceAuthorizationError, WorkspaceService
 
 _SUPPORTED_TABULAR = {SourceKind.CSV, SourceKind.PARQUET}
-# Source-format, filesystem, and resource failures are incomplete data checks. SQL
-# programming errors (for example ParserException or BinderException) still propagate.
-_SOURCE_READ_ERRORS = (
-    duckdb.InvalidInputException,
-    duckdb.IOException,
-    duckdb.ConversionException,
-    duckdb.OutOfMemoryException,
-)
+# Source-format, filesystem, resource, timeout, and worker-crash failures make a data check
+# incomplete (inconclusive). SQL programming errors are raised as caller errors instead.
 
 
 @dataclass(slots=True)
@@ -40,6 +33,29 @@ class ValidationContext:
     # source relative_path or source id. Makes the key-based duplicate check reachable via MCP.
     duplicate_keys: dict[str, list[str]] = field(default_factory=dict)
     workspace: WorkspaceService | None = None
+    # Isolated DuckDB worker (SEC-02); required by the checks that read source data.
+    data_plane: DataPlaneClient | None = None
+
+    def table_stats(self, source: DataSource, path: Path, **request: Any) -> dict[str, Any]:
+        if self.data_plane is None:
+            raise RuntimeError("data-reading validation checks require a data-plane client")
+        timeout = self.data_plane.settings.data_plane_timeout_seconds
+        try:
+            return self.data_plane.call(
+                "table_stats",
+                {
+                    "path": str(path),
+                    "kind": source.kind.value,
+                    "limits": self.data_plane.limits(timeout),
+                    **request,
+                },
+                deadline_seconds=timeout,
+            )
+        except DataPlaneError as exc:
+            if exc.category == "sql":
+                # A malformed request (e.g. an unknown duplicate-key column) is a caller error.
+                raise ValueError(f"validation query failed: {exc}") from exc
+            raise
 
     def resolve_source_file(self, source: DataSource) -> Path | None:
         if self.workspace is not None and source.relative_path is not None:
@@ -135,28 +151,9 @@ def _inconclusive(check: str, reason: str) -> CheckResult:
 def _source_read_failure(result: CheckResult, source: DataSource, error: Exception) -> None:
     result.outcome = "inconclusive"
     # Keep diagnostics bounded and avoid returning DuckDB's full source contents/host path.
-    reason = f"could not read source {source.id}: {type(error).__name__}"
+    name = error.error_type if isinstance(error, DataPlaneError) else type(error).__name__
+    reason = f"could not read source {source.id}: {name}"
     result.reason = f"{result.reason}; {reason}" if result.reason else reason
-
-
-def _reader_sql(source: DataSource, path: Path) -> str:
-    literal = "'" + str(path).replace("'", "''") + "'"
-    if source.kind is SourceKind.CSV:
-        return f"read_csv({literal}, strict_mode = true)"
-    if source.kind is SourceKind.PARQUET:
-        return f"read_parquet({literal})"
-    raise ValueError(f"unsupported source kind for validation: {source.kind}")
-
-
-def _scalar_int(connection: duckdb.DuckDBPyConnection, sql: str) -> int:
-    row = connection.execute(sql).fetchone()
-    if row is None:
-        raise RuntimeError("validation query returned no row")
-    return int(row[0])
-
-
-def _sql_identifier(value: str) -> str:
-    return '"' + value.replace('"', '""') + '"'
 
 
 class EvidenceCoverageValidator:
@@ -262,73 +259,49 @@ class DuplicateObservationValidator:
                 # Missing/escaped sources are reported by stale_sources; do not abort here.
                 continue
             supported += 1
-            reader = _reader_sql(source, path)
-            connection = duckdb.connect(database=":memory:")
+            keys = context.source_duplicate_keys(source)
             try:
-                total = _scalar_int(connection, f"SELECT count(*) FROM {reader}")
-                distinct = _scalar_int(
-                    connection,
-                    f"SELECT count(*) FROM (SELECT DISTINCT * FROM {reader})",
-                )
-                duplicate_rows = total - distinct
-                keys = context.source_duplicate_keys(source)
-                if duplicate_rows > 0:
-                    findings.append(
-                        _finding(
-                            context,
-                            self.name,
-                            "DUPLICATE_ROWS",
-                            ValidationSeverity.WARNING,
-                            (
-                                f"Source contains {duplicate_rows} duplicate "
-                                "whole-row observations."
-                            ),
-                            entity_refs=[{"type": "source", "id": source.id}],
-                            details={
-                                "duplicate_rows": duplicate_rows,
-                                "mode": "whole_row",
-                            },
-                            remediation=(
-                                "Confirm whether duplicate rows are legitimate repeated "
-                                "observations."
-                            ),
-                        )
-                    )
-                if keys:
-                    quoted = ", ".join(_sql_identifier(key) for key in keys)
-                    query = (
-                        "SELECT coalesce(sum(n - 1), 0) FROM ("
-                        f"SELECT count(*) AS n FROM {reader} GROUP BY {quoted} "
-                        "HAVING count(*) > 1)"
-                    )
-                    duplicate_keys = _scalar_int(connection, query)
-                    if duplicate_keys > 0:
-                        findings.append(
-                            _finding(
-                                context,
-                                self.name,
-                                "DUPLICATE_KEYS",
-                                ValidationSeverity.ERROR,
-                                (
-                                    "Configured observation key is duplicated "
-                                    f"{duplicate_keys} times."
-                                ),
-                                entity_refs=[{"type": "source", "id": source.id}],
-                                details={
-                                    "duplicate_rows": duplicate_keys,
-                                    "mode": "configured_key",
-                                    "keys": keys,
-                                },
-                                remediation=(
-                                    "Resolve duplicate primary observations or register "
-                                    "the correct analytical grain."
-                                ),
-                            )
-                        )
-            except _SOURCE_READ_ERRORS as exc:
+                stats = context.table_stats(source, path, distinct=True, duplicate_keys=keys)
+            except DataPlaneError as exc:
                 _source_read_failure(result, source, exc)
-            finally:
-                connection.close()
+                continue
+            duplicate_rows = int(stats["total"]) - int(stats["distinct"])
+            if duplicate_rows > 0:
+                findings.append(
+                    _finding(
+                        context,
+                        self.name,
+                        "DUPLICATE_ROWS",
+                        ValidationSeverity.WARNING,
+                        f"Source contains {duplicate_rows} duplicate whole-row observations.",
+                        entity_refs=[{"type": "source", "id": source.id}],
+                        details={"duplicate_rows": duplicate_rows, "mode": "whole_row"},
+                        remediation=(
+                            "Confirm whether duplicate rows are legitimate repeated observations."
+                        ),
+                    )
+                )
+            duplicate_keys = int(stats.get("duplicate_key_rows", 0))
+            if keys and duplicate_keys > 0:
+                findings.append(
+                    _finding(
+                        context,
+                        self.name,
+                        "DUPLICATE_KEYS",
+                        ValidationSeverity.ERROR,
+                        f"Configured observation key is duplicated {duplicate_keys} times.",
+                        entity_refs=[{"type": "source", "id": source.id}],
+                        details={
+                            "duplicate_rows": duplicate_keys,
+                            "mode": "configured_key",
+                            "keys": keys,
+                        },
+                        remediation=(
+                            "Resolve duplicate primary observations or register the correct "
+                            "analytical grain."
+                        ),
+                    )
+                )
         if supported == 0:
             return _inconclusive(self.name, "no supported tabular sources")
         return result
@@ -348,63 +321,51 @@ class MissingnessValidator:
             if path is None:
                 continue
             supported += 1
-            reader = _reader_sql(source, path)
-            connection = duckdb.connect(database=":memory:")
             try:
-                cursor = connection.execute(f"SELECT * FROM {reader} LIMIT 0")
-                columns = [str(item[0]) for item in cursor.description or []]
-                total = _scalar_int(connection, f"SELECT count(*) FROM {reader}")
-                if total == 0:
-                    continue
-                meta = source.profile.get("validation", {})
-                if isinstance(meta, dict):
-                    warning_threshold = float(
-                        meta.get("missingness_warning_threshold", 0.10)
-                    )
-                    error_threshold = float(
-                        meta.get("missingness_error_threshold", 0.30)
-                    )
-                else:
-                    warning_threshold = 0.10
-                    error_threshold = 0.30
-                for column in columns:
-                    quoted = _sql_identifier(column)
-                    missing = _scalar_int(
-                        connection,
-                        f"SELECT count(*) FROM {reader} WHERE {quoted} IS NULL",
-                    )
-                    rate = missing / total
-                    if rate < warning_threshold:
-                        continue
-                    severity = (
-                        ValidationSeverity.ERROR
-                        if rate >= error_threshold
-                        else ValidationSeverity.WARNING
-                    )
-                    findings.append(
-                        _finding(
-                            context,
-                            self.name,
-                            "HIGH_MISSINGNESS",
-                            severity,
-                            f"Column {column!r} has {rate:.1%} missing values.",
-                            entity_refs=[{"type": "source", "id": source.id}],
-                            details={
-                                "column": column,
-                                "missing": missing,
-                                "total": total,
-                                "rate": rate,
-                            },
-                            remediation=(
-                                "Assess the missing-data mechanism and document or revise "
-                                "the handling strategy."
-                            ),
-                        )
-                    )
-            except _SOURCE_READ_ERRORS as exc:
+                stats = context.table_stats(source, path, null_counts=True)
+            except DataPlaneError as exc:
                 _source_read_failure(result, source, exc)
-            finally:
-                connection.close()
+                continue
+            total = int(stats["total"])
+            if total == 0:
+                continue
+            meta = source.profile.get("validation", {})
+            if isinstance(meta, dict):
+                warning_threshold = float(meta.get("missingness_warning_threshold", 0.10))
+                error_threshold = float(meta.get("missingness_error_threshold", 0.30))
+            else:
+                warning_threshold = 0.10
+                error_threshold = 0.30
+            for column in stats["columns"]:
+                missing = int(stats["null_counts"][column])
+                rate = missing / total
+                if rate < warning_threshold:
+                    continue
+                severity = (
+                    ValidationSeverity.ERROR
+                    if rate >= error_threshold
+                    else ValidationSeverity.WARNING
+                )
+                findings.append(
+                    _finding(
+                        context,
+                        self.name,
+                        "HIGH_MISSINGNESS",
+                        severity,
+                        f"Column {column!r} has {rate:.1%} missing values.",
+                        entity_refs=[{"type": "source", "id": source.id}],
+                        details={
+                            "column": column,
+                            "missing": missing,
+                            "total": total,
+                            "rate": rate,
+                        },
+                        remediation=(
+                            "Assess the missing-data mechanism and document or revise the "
+                            "handling strategy."
+                        ),
+                    )
+                )
         if supported == 0:
             return _inconclusive(self.name, "no supported tabular sources")
         return result
