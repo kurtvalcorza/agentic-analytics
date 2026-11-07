@@ -15,7 +15,7 @@ from uuid import uuid4
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
 
 from .base import BackendResult
-from .guards import DiskLimits, WorkspaceDiskGuard, drain_bounded
+from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard, drain_bounded
 
 # Fixed unprivileged identity baked into docker/Dockerfile.exec. Used whenever the host cannot
 # supply a non-root numeric identity (non-POSIX Docker Desktop hosts).
@@ -312,9 +312,12 @@ class DockerBackend:
         # Baseline workspace usage before the container can write anything.
         workspace = Path(session.workspace_root).resolve(strict=True)
         excluded = (self.protected_state_root,) if self.protected_state_root else ()
-        guard = WorkspaceDiskGuard(
-            workspace, self.disk_limits, kill_container, excluded_roots=excluded
-        )
+        try:
+            guard = WorkspaceDiskGuard(
+                workspace, self.disk_limits, kill_container, excluded_roots=excluded
+            )
+        except DiskGuardError as exc:
+            raise DockerExecutionError(str(exc)) from exc
         proc = subprocess.Popen(
             ["docker", *run_args],
             stdout=subprocess.PIPE,
@@ -353,13 +356,19 @@ class DockerBackend:
         stdout = "".join(out_buffer)
         stderr = "".join(err_buffer)
 
-        if guard.reason is not None:
+        # Catch writers that finished before the first poll, then reclaim their output.
+        if guard.final_check() is not None:
+            guard.reclaim()
             return BackendResult(
                 status=ExecutionStatus.FAILED,
                 stdout=stdout,
                 stderr=f"execution terminated: {guard.reason}",
                 exit_code=proc.returncode,
-                runtime={**runtime, "resource_limit": "disk"},
+                runtime={
+                    **runtime,
+                    "resource_limit": "disk",
+                    "retained_output_bytes": guard.retained_bytes,
+                },
                 stdout_truncated=stdout_truncated.is_set(),
                 stderr_truncated=stderr_truncated.is_set(),
                 resource_limit="disk",

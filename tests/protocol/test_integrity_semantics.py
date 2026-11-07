@@ -81,6 +81,37 @@ async def test_query_reports_full_result_completeness(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("rows", "complete", "artifact_rows"), [(6, True, None), (20, False, 10)],
+    ids=["fits-preview", "overflows-both"],
+)
+async def test_spill_cap_below_preview_limit_stays_consistent(
+    tmp_path: Path, rows: int, complete: bool, artifact_rows: int | None
+) -> None:
+    # Asymmetric limits: max_spill_rows (5) < max_query_rows (10).
+    server, session_id, sources, _ = await _session(
+        tmp_path, rows=rows, max_spill_rows=5, max_query_rows=10
+    )
+    body = await _call(
+        server,
+        "query_data",
+        {
+            "session_id": session_id,
+            "sql": f"SELECT * FROM source('{sources['a.csv']}')",
+            "max_rows": 10,
+        },
+    )
+
+    assert body["result_complete"] is complete
+    # An incomplete result always has a truncated preview and a published artifact.
+    assert body["truncated"] is (not complete)
+    assert (body["artifact_id"] is None) is complete
+    assert body["artifact_row_count"] == artifact_rows
+    if complete:
+        assert body["row_count_returned"] == rows
+
+
+@pytest.mark.anyio
 async def test_small_query_is_complete_without_artifact(tmp_path: Path) -> None:
     server, session_id, sources, _ = await _session(tmp_path, rows=3)
     body = await _call(

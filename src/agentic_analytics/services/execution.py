@@ -113,13 +113,12 @@ class ExecutionService:
                     result = self.backend.execute(
                         session, script_path, timeout, readonly_paths=readonly_paths
                     )
-                    after = snapshot_workspace(workspace_root, excluded_roots=(state_root,))
                     if result.resource_limit is not None:
-                        # The workload was killed for exceeding its host resource budget. Its
-                        # partial outputs are neither attested nor kept on the host disk.
-                        self.artifacts.discard_created_files(workspace_root, before, after)
+                        # The workload was killed for exceeding its host resource budget and
+                        # the backend reclaimed what it created; nothing is attested.
                         artifacts = []
                     else:
+                        after = snapshot_workspace(workspace_root, excluded_roots=(state_root,))
                         artifacts = self.artifacts.register_changes(
                             session.id, execution_id, workspace_root, before, after
                         )
@@ -150,6 +149,8 @@ class ExecutionService:
             if result.resource_limit is not None:
                 error["type"] = "resource_limit_exceeded"
                 error["resource"] = result.resource_limit
+                # Growth of pre-existing files is not reverted; surface how much remains.
+                error["retained_output_bytes"] = result.runtime.get("retained_output_bytes", 0)
         completed_at = datetime.now(UTC) if result.status.terminal else None
         record = ExecutionRecord(
             id=execution_id,

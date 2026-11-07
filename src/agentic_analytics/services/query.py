@@ -461,7 +461,11 @@ class QueryService:
             # Materialize the full result ONCE, bounded by a row cap and the interrupt timer, so
             # the preview and the spilled artifact are the same evaluation (deterministic even
             # for nondeterministic SQL) and materialization cannot run unbounded.
-            spill_cap = self.settings.max_spill_rows
+            # The artifact row budget is never smaller than the preview row limit. Otherwise a
+            # result could overflow the spill cap while still fitting the preview, leaving
+            # result_complete=False with no artifact. With this floor, overflowing the cap
+            # always also truncates the preview, so a capped result is always spilled.
+            spill_cap = max(self.settings.max_spill_rows, limit)
             materialize_sql = (
                 f'CREATE TEMP TABLE "{result_table}" AS '
                 f"SELECT * FROM ({rewritten}) AS _q LIMIT {spill_cap + 1}"
@@ -492,6 +496,9 @@ class QueryService:
             # (which COPYs the complete result_table) must carry the full-fidelity data.
             truncated = row_truncated or preview_truncated or column_truncated
             spill_capped = materialized > spill_cap
+            # Invariant relied on by clients: an incomplete result always has a truncated
+            # preview and a published (capped) artifact.
+            assert truncated or not spill_capped
             if spill_capped and require_complete:
                 incomplete = QueryExecutionError(
                     f"query result exceeds max_spill_rows ({spill_cap}); refusing to produce a "

@@ -136,6 +136,7 @@ Executes read-only DuckDB analytical SQL against registered sources.
 - Oversized result sets produce an artifact and bounded preview. The preview is bounded before values are materialized — per cell (in SQL), per row (byte budget, including the first row), and by column count — so neither a very large cell, a very wide row, nor unbounded column metadata can exhaust server memory. Dropped rows/cells/columns are preserved in the artifact.
 - A spilled artifact is subject to the configured artifact byte limits; the write is interrupted at the remaining session budget so it cannot over-write on disk, and a spill that exceeds the limits is rejected rather than persisted. The session-cumulative quota is reserved atomically per session, so concurrent spills cannot jointly exceed it.
 - Returns an `execution_id` even for successful inline results.
+- The effective artifact row budget is `max(max_spill_rows, max_rows)`, so an incomplete result always has `truncated: true` and a published artifact.
 - `truncated` describes the inline preview only. Full-result completeness is reported separately: `result_complete` is false when the result exceeded `max_spill_rows` and the artifact holds only `artifact_row_count` rows (an arbitrary subset unless the query has a total `ORDER BY`). With `require_complete: true` such a query fails, is audited as a failed execution, and produces no artifact.
 - `source_attestation` is `enforced`: DuckDB can only read the referenced registered sources.
 
@@ -193,7 +194,7 @@ Runs Python inside the managed execution backend.
 
 - `source_ids` are a caller **declaration**: they are fingerprinted, but managed Python can read any workspace file, so `source_attestation` is always `declared`.
 - Execution runs as an explicit non-root container user; a server running as root is refused unless a non-root `docker_user` is configured. Workspaces containing Unix sockets or device nodes are never mounted.
-- Writes to the workspace are bounded while the code runs (bytes, file count, and a host free-space reserve). A breach terminates the workload, deletes the files it created, registers no artifacts, and records `status: "failed"` with `error.type: "resource_limit_exceeded"`.
+- Writes to the workspace are bounded while the code runs (bytes, entry count, and a host free-space reserve), with a final check after exit. Accounting is per entry, never offset by deletions, and fails closed on entries it cannot measure. A breach terminates the workload, removes every entry it created, registers no artifacts, and records `status: "failed"` with `error.type: "resource_limit_exceeded"` and `error.retained_output_bytes` (growth of pre-existing files, which is not reverted). This is polling detection, not a hard filesystem quota.
 - Artifact digests are computed from the archived bytes, published atomically; a file modified after the execution snapshot or during archiving is refused.
 
 ## `register_external_execution`

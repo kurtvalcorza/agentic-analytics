@@ -390,33 +390,3 @@ class ArtifactRegistry:
     @staticmethod
     def _read_chunks(stream: Any) -> Any:
         return iter(lambda: stream.read(_CHUNK), b"")
-
-    def discard_created_files(
-        self, workspace_root: Path, before: dict[str, FileMeta], after: dict[str, FileMeta]
-    ) -> int:
-        """Delete files an execution created (never pre-existing ones); return bytes freed.
-
-        Used when a workload is terminated for exceeding its disk budget so its partial output
-        does not keep consuming host storage. Modified pre-existing files are left in place.
-        """
-
-        root = workspace_root.resolve(strict=True)
-        freed = 0
-        for relative, meta in after.items():
-            if relative in before:
-                continue
-            path = root / relative
-            try:
-                info = path.lstat()
-            except FileNotFoundError:
-                continue
-            # Only remove the exact regular file observed in the snapshot.
-            if path.is_symlink() or FileMeta.of(info) != meta:
-                continue
-            parent = path.parent.resolve(strict=True)
-            if parent != root and root not in parent.parents:
-                continue
-            with contextlib.suppress(OSError):
-                path.unlink()
-                freed += meta.size_bytes
-        return freed

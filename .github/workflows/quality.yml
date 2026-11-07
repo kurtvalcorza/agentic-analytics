@@ -30,6 +30,22 @@ jobs:
         run: uv run --frozen mypy src
       - name: Build execution image
         run: docker build -t agentic-analytics-exec:test -f docker/Dockerfile.exec .
+      - name: Scan execution image (OS packages and installed Python libraries)
+        # Severity policy: report HIGH and CRITICAL; fail the build on any CRITICAL finding
+        # that has a fixed version available. Trivy runs from an image pinned by digest.
+        env:
+          TRIVY_IMAGE: aquasec/trivy@sha256:e2b22eac59c02003d8749f5b8d9bd073b62e30fefaef5b7c8371204e0a4b0c08
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          scan() {
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              "$TRIVY_IMAGE" image --quiet --scanners vuln --ignore-unfixed "$@" \
+              agentic-analytics-exec:test
+          }
+          scan --severity HIGH,CRITICAL --exit-code 0 --format table
+          scan --severity CRITICAL --exit-code 1 --skip-db-update --format table
       - name: Tests
         run: uv run --frozen pytest --cov=agentic_analytics --cov-report=term-missing
 

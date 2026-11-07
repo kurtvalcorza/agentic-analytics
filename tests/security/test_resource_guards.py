@@ -169,3 +169,135 @@ time.sleep(60)
     assert record.status is ExecutionStatus.TIMED_OUT
     time.sleep(4)
     assert not marker.exists()
+
+
+# --- Review follow-ups on PR 11 ---------------------------------------------------------
+
+
+def test_writer_that_exits_before_first_poll_is_caught(tmp_path: Path) -> None:
+    # No sleeps: the workload finishes long before the 0.25 s poll interval.
+    runtime, session, workspace = _runtime(tmp_path)
+    code = "open('burst.bin', 'wb').write(b'x' * (2 * 1024 * 1024))"
+
+    record = runtime.execution.execute_python(session, code, timeout_seconds=30)
+
+    assert record.status is ExecutionStatus.FAILED
+    assert record.error is not None and record.error["type"] == "resource_limit_exceeded"
+    assert not (workspace / "burst.bin").exists()
+    assert record.artifact_ids == []
+
+
+def test_internal_directory_output_counts_and_is_reclaimed(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    code = (
+        "import os\n"
+        "os.makedirs('.agentic-analytics/hidden', exist_ok=True)\n"
+        "open('.agentic-analytics/hidden/junk.bin', 'wb').write(b'x' * (2 * 1024 * 1024))\n"
+    )
+
+    record = runtime.execution.execute_python(session, code, timeout_seconds=30)
+
+    assert record.error is not None and record.error["type"] == "resource_limit_exceeded"
+    assert not (workspace / ".agentic-analytics" / "hidden").exists()
+
+
+def test_empty_directories_count_toward_entry_budget_and_are_reclaimed(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    code = "import os\nfor i in range(200):\n    os.makedirs(f'd{i}/inner')\n"
+
+    record = runtime.execution.execute_python(session, code, timeout_seconds=30)
+
+    assert record.error is not None and record.error["type"] == "resource_limit_exceeded"
+    assert sorted(path.name for path in workspace.iterdir()) == [".agentic-analytics", "input.csv"]
+
+
+def test_directory_entries_and_allocations_are_counted(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    by_entries = WorkspaceDiskGuard(
+        workspace, DiskLimits(max_output_bytes=10**12, max_output_files=5, min_free_bytes=0),
+        lambda _: None,
+    )
+    by_bytes = WorkspaceDiskGuard(
+        workspace, DiskLimits(max_output_bytes=1, max_output_files=10**6, min_free_bytes=0),
+        lambda _: None,
+    )
+    for index in range(6):
+        (workspace / f"empty{index}").mkdir()
+
+    entries_reason = by_entries.check()
+    assert entries_reason is not None and "entries" in entries_reason
+    # Some filesystems (tmpfs) report zero blocks for directories; assert only where allocated.
+    if getattr((workspace / "empty0").stat(), "st_blocks", 0):
+        bytes_reason = by_bytes.check()
+        assert bytes_reason is not None and "bytes" in bytes_reason
+
+
+def test_deleting_existing_files_does_not_offset_new_output(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "old.bin").write_bytes(b"x" * 400_000)
+    limits = DiskLimits(max_output_bytes=100_000, max_output_files=10, min_free_bytes=0)
+    guard = WorkspaceDiskGuard(workspace, limits, lambda _: None)
+
+    (workspace / "old.bin").unlink()
+    (workspace / "new.bin").write_bytes(b"y" * 300_000)
+
+    reason = guard.check()
+    assert reason is not None and "output budget" in reason
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0, reason="needs POSIX permissions as non-root"
+)
+def test_unmeasurable_workspace_fails_closed(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    # The workload hides output inside a directory it then makes unreadable.
+    code = (
+        "import os\n"
+        "os.makedirs('vault')\n"
+        "open('vault/data.bin', 'wb').write(b'x' * 1024)\n"
+        "os.chmod('vault', 0)\n"
+    )
+
+    record = runtime.execution.execute_python(session, code, timeout_seconds=30)
+
+    assert record.error is not None and record.error["type"] == "resource_limit_exceeded"
+    assert "failing closed" in record.stderr_preview
+    # Reclaim reopens the directory (same owner) and removes it.
+    assert not (workspace / "vault").exists()
+
+
+def test_growth_of_preexisting_file_is_reported_not_reverted(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    existing = workspace / "log.txt"
+    existing.write_bytes(b"start\n")
+    code = "open('log.txt', 'ab').write(b'x' * (2 * 1024 * 1024))"
+
+    record = runtime.execution.execute_python(session, code, timeout_seconds=30)
+
+    assert record.error is not None and record.error["type"] == "resource_limit_exceeded"
+    # Pre-existing files are never deleted; their remaining growth is surfaced instead.
+    assert existing.exists()
+    assert record.error["retained_output_bytes"] >= 2 * 1024 * 1024
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX specific")
+def test_dev_backend_kills_descendants_after_parent_exits(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    marker = workspace / "orphan-alive.txt"
+    code = f"""
+import subprocess, sys
+subprocess.Popen([sys.executable, '-c', '''
+import time
+from pathlib import Path
+time.sleep(2)
+Path({str(marker)!r}).write_text("alive")
+'''], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+"""
+    # The direct child exits immediately and successfully, leaving the grandchild behind.
+    record = runtime.execution.execute_python(session, code, timeout_seconds=30)
+
+    assert record.status is ExecutionStatus.SUCCEEDED
+    time.sleep(3)
+    assert not marker.exists()

@@ -107,22 +107,6 @@ def test_file_modified_during_copy_is_refused_and_not_published(
     assert not archive.exists() or list(archive.rglob("*")) == []
 
 
-def test_discard_created_files_keeps_preexisting_files(tmp_path: Path) -> None:
-    registry, workspace = _registry(tmp_path)
-    (workspace / "keep.csv").write_bytes(b"keep")
-    before = snapshot_workspace(workspace)
-    (workspace / "keep.csv").write_bytes(b"modified")
-    (workspace / "nested").mkdir()
-    (workspace / "nested" / "new.bin").write_bytes(b"x" * 100)
-    after = snapshot_workspace(workspace)
-
-    freed = registry.discard_created_files(workspace, before, after)
-
-    assert freed == 100
-    assert not (workspace / "nested" / "new.bin").exists()
-    assert (workspace / "keep.csv").read_bytes() == b"modified"
-
-
 @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
 def test_state_directory_is_private(tmp_path: Path) -> None:
     settings = Settings(state_dir=tmp_path / "state", allowed_workspace_roots=[tmp_path])

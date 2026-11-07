@@ -123,3 +123,30 @@ with open('fill.bin', 'wb') as stream:
     assert "uid=0" not in record.stdout_preview
     assert not (workspace / "fill.bin").exists()
     assert (workspace / "input.csv").read_text(encoding="utf-8") == "x\n1\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Docker integration runs on Linux CI")
+def test_docker_burst_writer_exiting_before_first_poll_is_reclaimed(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = Runtime.create(
+        Settings(
+            state_dir=tmp_path / "state",
+            allowed_workspace_roots=[workspace],
+            execution_backend="docker",
+            docker_image="agentic-analytics-exec:test",
+            max_execution_output_bytes=1024 * 1024,
+            min_free_disk_bytes=0,
+        )
+    )
+    session = runtime.sessions.add(
+        AnalysisSession(workspace_root=str(workspace), mode=SessionMode.STRICT)
+    )
+    code = "open('burst.bin', 'wb').write(b'x' * (4 * 1024 * 1024))"
+    try:
+        record = runtime.execution.execute_python(session, code, timeout_seconds=60)
+    finally:
+        runtime.execution_backend.close_session(session.id)
+
+    assert record.error is not None and record.error["type"] == "resource_limit_exceeded"
+    assert not (workspace / "burst.bin").exists()

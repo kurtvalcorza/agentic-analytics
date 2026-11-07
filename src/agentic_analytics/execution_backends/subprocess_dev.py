@@ -11,7 +11,7 @@ from pathlib import Path
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
 
 from .base import BackendResult
-from .guards import DiskLimits, WorkspaceDiskGuard, drain_bounded
+from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard, drain_bounded
 
 
 class SubprocessDevBackend:
@@ -38,10 +38,10 @@ class SubprocessDevBackend:
 
     @staticmethod
     def _kill_tree(proc: subprocess.Popen[str]) -> None:
-        if proc.poll() is not None:
-            return
         if os.name == "posix":
-            # The child leads its own session, so this reaches every descendant it spawned.
+            # The child leads its own session, so this reaches every descendant it spawned,
+            # including ones that outlive the direct child (the group persists while any
+            # member does, so its id cannot be reused by an unrelated process meanwhile).
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(proc.pid, signal.SIGKILL)
         else:
@@ -85,7 +85,12 @@ class SubprocessDevBackend:
             if holder:
                 self._kill_tree(holder[0])
 
-        guard = WorkspaceDiskGuard(workspace, self.disk_limits, on_breach, excluded_roots=excluded)
+        try:
+            guard = WorkspaceDiskGuard(
+                workspace, self.disk_limits, on_breach, excluded_roots=excluded
+            )
+        except DiskGuardError as exc:
+            raise PermissionError(str(exc)) from exc
         proc = subprocess.Popen(
             [sys.executable, str(script_path)],
             cwd=workspace,
@@ -132,11 +137,14 @@ class SubprocessDevBackend:
         stderr = "".join(err_buffer)
         resource_limit: str | None = None
         exit_code: int | None = proc.returncode
-        if guard.reason is not None:
+        # Catch writers that finished before the first poll, then reclaim their output.
+        if guard.final_check() is not None:
+            guard.reclaim()
             status = ExecutionStatus.FAILED
             stderr = f"execution terminated: {guard.reason}"
             resource_limit = "disk"
             runtime["resource_limit"] = "disk"
+            runtime["retained_output_bytes"] = guard.retained_bytes
         elif timed_out:
             status = ExecutionStatus.TIMED_OUT
             stderr = stderr or f"execution exceeded {timeout_seconds} seconds"
