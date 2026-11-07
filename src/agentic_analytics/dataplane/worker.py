@@ -63,18 +63,18 @@ def _classify(exc: BaseException) -> str:
 def _classify_duckdb(exc: BaseException) -> str:
     import duckdb
 
-    from .engine import SpillLimitError
+    from .engine import OutputWriteError, SpillLimitError
 
     if isinstance(exc, TimeoutError):
         return "timeout"
     if isinstance(exc, SpillLimitError):
         return "spill_limit"
+    # Output and temp-space failures are checked before the generic IO and memory mappings:
+    # they are resource limits on what the worker writes, never an unreadable source.
+    if isinstance(exc, OutputWriteError) or _write_side_failure(exc):
+        return "disk_limit"
     if isinstance(exc, (MemoryError, duckdb.OutOfMemoryException)) or _thread_exhaustion(exc):
         return "out_of_memory"
-    if _file_too_large(exc):
-        # RLIMIT_FSIZE (or the spill/temp file) hit its cap. Checked before the generic IO
-        # mapping so it is never mistaken for an unreadable source.
-        return "disk_limit"
     if isinstance(
         exc, (duckdb.InvalidInputException, duckdb.IOException, duckdb.ConversionException)
     ):
@@ -84,10 +84,20 @@ def _classify_duckdb(exc: BaseException) -> str:
     return "internal"
 
 
-def _file_too_large(exc: BaseException) -> bool:
-    if isinstance(exc, OSError) and exc.errno == errno.EFBIG:
+_WRITE_FAILURE_MARKERS = (
+    "file too large",  # EFBIG: RLIMIT_FSIZE or a filesystem file-size cap
+    "no space left on device",  # ENOSPC
+    "disk quota exceeded",  # EDQUOT
+    "max_temp_directory_size",  # DuckDB's aggregate temp-spill budget
+    "could not write file",  # any other DuckDB temp/output write failure
+)
+
+
+def _write_side_failure(exc: BaseException) -> bool:
+    if isinstance(exc, OSError) and exc.errno in {errno.EFBIG, errno.ENOSPC, errno.EDQUOT}:
         return True
-    return "file too large" in str(exc).lower()
+    message = str(exc).lower()
+    return any(marker in message for marker in _WRITE_FAILURE_MARKERS)
 
 
 def _thread_exhaustion(exc: BaseException) -> bool:
@@ -98,8 +108,9 @@ def _thread_exhaustion(exc: BaseException) -> bool:
 # archive directories). The client receives a fixed description instead.
 _FIXED_MESSAGES = {
     "disk_limit": (
-        "data-plane worker exceeded its file-size limit (data_plane_max_file_bytes); the "
-        "query needed more temporary or output space than allowed"
+        "data-plane worker ran out of allowed disk space (data_plane_max_temp_bytes for "
+        "temporary spill, data_plane_max_file_bytes per file, or a full disk); the operation "
+        "needed more temporary or output space than allowed"
     ),
 }
 

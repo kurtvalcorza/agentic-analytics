@@ -365,7 +365,7 @@ def test_file_size_limit_is_its_own_category_without_paths(tmp_path: Path) -> No
             + "'), range(5000000) AS r(i) ORDER BY s, i DESC)",
         )
 
-    assert "file-size limit" in str(caught.value)
+    assert "disk space" in str(caught.value)
     assert str(tmp_path) not in str(caught.value)
     [failed] = [
         record
@@ -413,3 +413,89 @@ def test_stale_scratch_directories_are_swept(tmp_path: Path) -> None:
     assert not stale.exists()
     # A recent directory may belong to another live server process sharing this state dir.
     assert fresh.exists()
+
+
+# --- review follow-ups (PR 20) -------------------------------------------------------------
+
+
+def test_worker_that_never_reads_stdin_cannot_block_past_deadline(tmp_path: Path) -> None:
+    # The request is several times a pipe buffer (64 KiB on Linux) and the worker never reads
+    # it, so a blocking write in the caller would hang forever.
+    client = _fake(tmp_path, "import time\ntime.sleep(120)\n")
+    payload = {"limits": client.limits(1), "padding": "x" * (8 * 1024 * 1024)}
+    started = time.monotonic()
+
+    with pytest.raises(DataPlaneError) as caught:
+        client.call("profile", payload, deadline_seconds=1)
+
+    assert caught.value.category == "timeout"
+    assert time.monotonic() - started < 10
+
+
+def test_aggregate_temp_spill_budget_is_enforced(tmp_path: Path) -> None:
+    # Per-file cap is generous; only the aggregate temp budget can stop this spill.
+    runtime, session, _ = _runtime(
+        tmp_path,
+        query_memory_limit="64MB",
+        data_plane_max_temp_bytes=8 * 1024**2,
+        query_timeout_seconds=120,
+    )
+    source, _ = runtime.inspector.inspect(session, "data.csv")
+
+    with pytest.raises(QueryExecutionError) as caught:
+        runtime.query.execute(
+            session,
+            "SELECT count(*) FROM (SELECT i, repeat('x', 100) AS s FROM source('"
+            + source.id
+            + "'), range(3000000) AS r(i) ORDER BY s, i DESC)",
+        )
+
+    assert "disk space" in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+    [failed] = [
+        record
+        for record in runtime.executions.list(session.id)
+        if record.status is ExecutionStatus.FAILED
+    ]
+    assert failed.error is not None and failed.error["category"] == "disk_limit"
+    _assert_server_still_works(runtime, session)
+
+
+def test_spill_write_failure_is_not_reported_as_source_read(tmp_path: Path) -> None:
+    # Drive the worker directly so the spill's byte-ceiling watchdog is out of the way and the
+    # write itself fails on the worker's 1 MiB file-size limit.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = workspace / "data.parquet"
+    pq.write_table(
+        pa.table({"s": [os.urandom(64).hex() for _ in range(200_000)]}), data
+    )
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    client = DataPlaneClient(
+        Settings(
+            state_dir=tmp_path / "state",
+            data_plane_max_file_bytes=1024**2,
+            max_artifact_bytes=1024**2,
+            max_total_artifact_bytes=1024**2,
+        )
+    )
+
+    with pytest.raises(DataPlaneError) as caught:
+        client.call(
+            "query",
+            {
+                "sources": [{"view": "v", "kind": "parquet", "path": str(data)}],
+                "sql": 'SELECT * FROM "v"',
+                "result_table": "t",
+                "limit": 1,
+                "spill_cap": 1_000_000,
+                "spill_path": str(archive / "spill.parquet"),
+                "spill_byte_ceiling": 10 * 1024**3,
+                "limits": client.limits(120),
+            },
+            deadline_seconds=120,
+        )
+
+    assert caught.value.category == "disk_limit"
+    assert str(tmp_path) not in str(caught.value)

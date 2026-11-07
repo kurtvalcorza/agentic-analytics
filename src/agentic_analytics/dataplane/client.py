@@ -39,8 +39,8 @@ _STALE_SCRATCH_SECONDS = 24 * 3600
 class DataPlaneError(RuntimeError):
     """A data-plane operation failed. ``category`` is stable; ``error_type`` is diagnostic.
 
-    Categories: ``timeout``, ``out_of_memory``, ``disk_limit``, ``spill_limit``, ``source_read``, ``sql``,
-    ``crashed``, ``response_too_large``, ``internal``.
+    Categories: ``timeout``, ``out_of_memory``, ``disk_limit``, ``spill_limit``,
+    ``source_read``, ``sql``, ``crashed``, ``response_too_large``, ``internal``.
     """
 
     def __init__(self, category: str, error_type: str, message: str) -> None:
@@ -61,6 +61,13 @@ def _read_bounded(
     stream.close()
 
 
+def _write_request(stream: IO[bytes], request: bytes) -> None:
+    with contextlib.suppress(OSError):  # BrokenPipeError once the worker exits or is killed
+        stream.write(request)
+    with contextlib.suppress(OSError):
+        stream.close()
+
+
 class DataPlaneClient:
     # Seconds allowed beyond an operation's own deadline before the worker is killed.
     kill_grace_seconds = _KILL_GRACE_SECONDS
@@ -79,6 +86,7 @@ class DataPlaneClient:
             "preview_bytes": self.settings.max_result_preview_bytes,
             "cell_chars": self.settings.max_result_cell_chars,
             "threads": self.settings.data_plane_threads,
+            "max_temp_bytes": self.settings.data_plane_max_temp_bytes,
         }
 
     def _os_limits(self, deadline_seconds: float) -> dict[str, Any]:
@@ -168,13 +176,12 @@ class DataPlaneClient:
                     args=(proc.stderr, err, _MAX_STDERR_BYTES, threading.Event()),
                 ),
             ]
-            for reader in readers:
-                reader.start()
-            # Readers start first, so a large request cannot deadlock against a full pipe.
-            with contextlib.suppress(BrokenPipeError):
-                proc.stdin.write(request)
-            with contextlib.suppress(BrokenPipeError):
-                proc.stdin.close()
+            # The request is written from its own thread, so a worker that never reads stdin
+            # cannot block the server on a full pipe: the deadline below still applies, and
+            # killing the worker closes the pipe, which releases the writer.
+            writer = threading.Thread(target=_write_request, args=(proc.stdin, request))
+            for thread in (*readers, writer):
+                thread.start()
             timed_out = False
             try:
                 proc.wait(timeout=deadline_seconds + self.kill_grace_seconds)
@@ -183,13 +190,14 @@ class DataPlaneClient:
                 self._kill(proc)  # leader not reaped yet: its group id is still ours
             proc.wait()
             reaped = True
+            writer.join(timeout=5)
             for reader in readers:
                 reader.join(timeout=5)
-            if any(reader.is_alive() for reader in readers):
+            if any(thread.is_alive() for thread in (*readers, writer)):
                 # A descendant still holds the pipes, so the group still exists; kill it.
                 self._kill_group(proc.pid)
-                for reader in readers:
-                    reader.join(timeout=5)
+                for thread in (*readers, writer):
+                    thread.join(timeout=5)
             return proc.returncode, bytes(out), out_overflow.is_set(), timed_out
         finally:
             if not reaped:

@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     data_plane_memory_bytes: int = Field(default=3 * 1024**3, ge=512 * 1024**2)
     # Caps each file the worker writes, including DuckDB's temp file for large sorts/joins.
     data_plane_max_file_bytes: int = Field(default=8 * 1024**3, ge=1024**2)
+    # Aggregate DuckDB temp-spill budget per operation (max_temp_directory_size). DuckDB's own
+    # default is 90% of free disk; RLIMIT_FSIZE alone only caps each individual file.
+    data_plane_max_temp_bytes: int = Field(default=8 * 1024**3, ge=1024**2)
     data_plane_threads: int = Field(default=2, ge=1, le=64)
     data_plane_max_response_bytes: int = Field(default=64 * 1024**2, ge=1024**2)
     execution_backend: Literal["docker", "subprocess_dev"] = "docker"

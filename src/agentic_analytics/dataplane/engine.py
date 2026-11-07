@@ -39,6 +39,14 @@ class SpillLimitError(RuntimeError):
     """The spilled result crossed its byte ceiling and was interrupted."""
 
 
+class OutputWriteError(RuntimeError):
+    """Writing an output (the spilled result) failed: disk full, file cap, or similar.
+
+    Raised in place of DuckDB's IOException for the write phase so an output/resource failure
+    is never reported as an unreadable source.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class EngineLimits:
     timeout_seconds: float
@@ -47,6 +55,7 @@ class EngineLimits:
     cell_chars: int
     threads: int | None = None
     temp_directory: str | None = None
+    max_temp_bytes: int | None = None
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> EngineLimits:
@@ -57,6 +66,9 @@ class EngineLimits:
             cell_chars=int(value["cell_chars"]),
             threads=None if value.get("threads") is None else int(value["threads"]),
             temp_directory=value.get("temp_directory"),
+            max_temp_bytes=(
+                None if value.get("max_temp_bytes") is None else int(value["max_temp_bytes"])
+            ),
         )
 
 
@@ -86,6 +98,9 @@ def secure_connection(
     # them. The temp directory is the worker's private scratch directory.
     if limits.temp_directory is not None:
         connection.execute(f"SET temp_directory = {sql_string(limits.temp_directory)}")
+    if limits.max_temp_bytes is not None:
+        # Aggregate cap across every temp file of this operation (RLIMIT_FSIZE is per file).
+        connection.execute(f"SET max_temp_directory_size = '{int(limits.max_temp_bytes)}B'")
     if limits.threads is not None:
         connection.execute(f"SET threads = {int(limits.threads)}")
     allowed = ", ".join(sql_string(path) for path in allowed_paths)
@@ -269,6 +284,8 @@ def write_spill_bounded(
             raise SpillLimitError(
                 f"spill exceeded the artifact byte limit of {byte_ceiling}"
             ) from exc
+        if isinstance(exc, duckdb.IOException):
+            raise OutputWriteError("writing the spilled result failed") from exc
         raise
     finally:
         stop_watch.set()
