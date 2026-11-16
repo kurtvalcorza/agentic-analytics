@@ -17,6 +17,9 @@ Limits applied on POSIX before any data is read:
 
 On hosts without the ``resource`` module (Windows) the worker still provides crash, hang, and
 memory-fault containment through process separation, but not OS resource limits.
+
+After the limits, and still before DuckDB is imported, the worker binds its lifetime to the
+server and confines itself (Landlock on Linux); see :mod:`agentic_analytics.dataplane.sandbox`.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ import json
 import signal
 import sys
 from typing import Any
+
+from . import sandbox
 
 _MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _MAX_MESSAGE_CHARS = 2000
@@ -112,6 +117,12 @@ _FIXED_MESSAGES = {
         "temporary spill, data_plane_max_file_bytes per file, or a full disk); the operation "
         "needed more temporary or output space than allowed"
     ),
+    "sandbox_unavailable": (
+        "data-plane worker could not confine itself (it needs Linux Landlock and seccomp, a "
+        "supported CPU architecture, authorized sources that are still regular files, and no "
+        "runtime read location that covers a workspace or the server state directory). Set "
+        "AGENTIC_ANALYTICS_DATA_PLANE_SANDBOX=off to run without confinement"
+    ),
 }
 
 
@@ -128,6 +139,31 @@ def main() -> int:
     request = json.loads(raw)
     # Limits first, before DuckDB is imported or any source byte is read.
     _apply_limits(request.get("os_limits", {}))
+    parent = request.get("parent", {})
+    parent_pid = parent.get("pid")
+    death_signal_armed = sandbox.bind_to_parent(
+        parent_pid, pdeathsig=bool(parent.get("pdeathsig", True))
+    )
+    try:
+        # Privilege isolation next, still single-threaded and before DuckDB is imported.
+        sandbox.enter(sandbox.SandboxPolicy.from_json(request.get("sandbox", {})))
+    except (sandbox.SandboxUnavailable, OSError) as exc:
+        # The detail can name server paths, so the response carries fixed text; the detail goes
+        # to stderr (drained, not returned) for anyone running the worker by hand.
+        sys.stderr.write(f"sandbox_unavailable: {exc}\n"[:_MAX_MESSAGE_CHARS])
+        sys.stderr.flush()
+        _respond(
+            {
+                "error": {
+                    "category": "sandbox_unavailable",
+                    "type": type(exc).__name__,
+                    "message": _FIXED_MESSAGES["sandbox_unavailable"],
+                }
+            }
+        )
+        return 1
+    if not death_signal_armed:
+        sandbox.start_parent_watchdog(parent_pid)
     try:
         from .engine import OPERATIONS
 

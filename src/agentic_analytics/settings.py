@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     data_plane_max_temp_bytes: int = Field(default=8 * 1024**3, ge=1024**2)
     data_plane_threads: int = Field(default=2, ge=1, le=64)
     data_plane_max_response_bytes: int = Field(default=64 * 1024**2, ge=1024**2)
+    # Confinement of the data-plane worker (Landlock + seccomp). "auto": enforced on Linux,
+    # failing closed when the kernel lacks either; not available on other platforms.
+    # "required": fail closed on any host without it. "off": explicit opt-out.
+    data_plane_sandbox: Literal["auto", "required", "off"] = "auto"
     execution_backend: Literal["docker", "subprocess_dev"] = "docker"
     docker_image: str = "agentic-analytics-exec:dev"
     docker_memory: str = "1g"
