@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     # Explicit non-root container identity ("uid:gid"). Defaults to the server's own identity on
     # POSIX hosts and to the image's unprivileged user elsewhere; uid 0 is always refused.
     docker_user: str | None = Field(default=None, pattern=r"^[0-9]+:[0-9]+$")
+    # SEC-01 (#22): size of each run's tmpfs at /workspace/outputs, the only writable output
+    # location. 256 MiB is inferred from test and quickstart outputs (CSV + PNG, a few MB),
+    # not measured on real workloads; raise it for larger datasets or figures.
+    docker_output_quota_bytes: int = Field(default=256 * 1024**2, ge=1024**2, le=64 * 1024**3)
     execution_timeout_seconds: int = Field(default=120, ge=1, le=3600)
     max_execution_timeout_seconds: int = Field(default=300, ge=1, le=3600)
     max_output_chars: int = Field(default=65536, ge=1024, le=1_000_000)

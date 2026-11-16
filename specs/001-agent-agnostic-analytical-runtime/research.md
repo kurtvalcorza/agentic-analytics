@@ -109,3 +109,22 @@
 **Decision**: Host adapters contain only installation, discovery hints, and optional workflow guidance. Tool descriptions and schemas must be sufficient for direct use.
 
 **Rationale**: This is the main defense against accidentally building a Claude/Codex-specific plugin while claiming MCP portability.
+
+## Decision 11 — Managed outputs go to a quota-limited, per-run tmpfs (SEC-01, #22)
+
+**Decision**: The Docker backend mounts the workspace read-only and gives each run a fresh tmpfs at `/workspace/outputs` sized by `docker_output_quota_bytes` (default 256 MiB). A supervisor (the container's main process, mounted read-only from the server) runs the request script as a child, samples free space and inodes on the tmpfs, and writes an HMAC-authenticated verdict with a per-run key that only it receives. The quota counts as exhausted, and the run fails closed with its outputs discarded, when free space reaches max(64 KiB, 1% of the quota) or inodes reach zero, regardless of the script's exit code. Otherwise the server streams `outputs/` out with `docker exec tar` (cap: 2 × quota + 1 MiB), validates the whole archive (regular files and directories only, no absolute or `..` paths, quota on extracted bytes), and only then writes the files into `workspace/outputs/` without following symlinks or overwriting registered sources. Closing the supervisor's stdin lets the container exit; `--rm`, and `docker rm -f` on every path, remove it together with its tmpfs.
+
+**Privilege**: The Docker daemon mounts the tmpfs, as it already does for `/tmp` and the state mask. The server needs no new privilege, no sudo helper, and no user namespace, and the container keeps `--cap-drop ALL`, `no-new-privileges`, and a non-root UID. This works on GitHub-hosted `ubuntu-latest` and inside Docker Desktop's Linux VM on macOS and Windows.
+
+**Quota default**: 256 MiB, configurable. It is inferred from the test and quickstart outputs (a CSV and a PNG, a few MB), leaving room for cleaned datasets and figure sets; it was not measured on real workloads. Raise it for larger outputs.
+
+**Rationale**: The previous polling budget detected and reclaimed oversized output but could overshoot by write throughput × poll interval, and it could not bound host disk use. A tmpfs quota is a hard kernel limit with no host-disk exposure during the run. The supervisor is needed because a tmpfs-backed Docker volume is emptied when its container stops and `docker cp` cannot read tmpfs mounts, so outputs must leave while the container is alive. It is also needed because managed code can catch `ENOSPC` and exit 0, so the exit code alone cannot show that the quota was hit.
+
+**Alternatives considered**:
+
+- Host tmpfs mounted by a small sudo helper and bind-mounted in: simpler retrieval, but needs a sudoers rule in every deployment. Rejected.
+- `unshare -rm` user-namespace tmpfs: invisible to the Docker daemon's mount namespace, so it cannot back a container mount. Rejected.
+- Loop-device or quota-enabled volumes: need root and filesystem tooling on the host. Rejected.
+
+**Residual limits**: free-space sampling every 20 ms can miss a fill-and-free within one interval followed by exit 0. Files already in the host `outputs/` are hidden during the run and overwritten by same-named outputs. `subprocess_dev` has no tmpfs and keeps the polling budget (non-conformant, permissive sessions only).
+

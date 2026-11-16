@@ -47,7 +47,15 @@ def test_masks_actual_nested_state_and_mounts_external_script(
         "dst=/run/agentic-analytics/request.py",
         "readonly",
     ] in _mounts(args)
-    assert args[-1] == "/run/agentic-analytics/request.py"
+    # The supervisor runs the request script and judges the outputs quota (SEC-01).
+    assert args[-2] == "/run/agentic-analytics/supervisor.py"
+    assert ["type=bind", f"src={workspace}", "dst=/workspace", "readonly"] in _mounts(args)
+    assert [
+        "type=tmpfs",
+        "dst=/workspace/outputs",
+        f"tmpfs-size={256 * 1024 * 1024}",
+        "tmpfs-mode=1777",
+    ] in _mounts(args)
 
 
 def test_state_outside_workspace_is_not_mounted(tmp_path: Path) -> None:
@@ -55,7 +63,9 @@ def test_state_outside_workspace_is_not_mounted(tmp_path: Path) -> None:
     state = tmp_path / "state"
     state.mkdir()
     args = DockerBackend("test", protected_state_root=state)._run_args(session, "test", script)
-    assert not any("type=tmpfs" in mount for mount in _mounts(args))
+    # Only the run's outputs tmpfs; no state mask.
+    tmpfs = [mount for mount in _mounts(args) if "type=tmpfs" in mount]
+    assert [mount[1] for mount in tmpfs] == ["dst=/workspace/outputs"]
 
 
 @pytest.mark.parametrize("is_nested", [False, True])
@@ -128,11 +138,17 @@ def test_protected_ancestor_mounts_precede_leaf_mounts_without_duplicates(tmp_pa
             session, "test", script, readonly_paths=(source,)
         )
     )
-    shared_mount = ["type=bind", f"src={workspace / 'shared'}", "dst=/workspace/shared"]
+    shared_mount = [
+        "type=bind",
+        f"src={workspace / 'shared'}",
+        "dst=/workspace/shared",
+        "readonly",
+    ]
     nested_mount = [
         "type=bind",
         f"src={workspace / 'shared/nested'}",
         "dst=/workspace/shared/nested",
+        "readonly",
     ]
     state_mount = [
         "type=tmpfs",

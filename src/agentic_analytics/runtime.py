@@ -84,6 +84,7 @@ class Runtime:
                 protected_state_root=resolved.state_dir,
                 disk_limits=disk_limits,
                 user=resolved.docker_user,
+                output_quota_bytes=resolved.docker_output_quota_bytes,
             )
         else:
             backend = SubprocessDevBackend(
