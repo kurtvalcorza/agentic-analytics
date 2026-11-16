@@ -309,6 +309,9 @@ class DockerBackend:
             "--security-opt",
             "no-new-privileges:true",
             "--read-only",
+            # The supervisor must be PID 1 so kill(-1) clears every other process; a daemon-wide
+            # `"init": true` would otherwise make an init PID 1 and every run would fail closed.
+            "--init=false",
             *self._user_args(),
             "--tmpfs",
             "/tmp:rw,nosuid,nodev,size=128m",
