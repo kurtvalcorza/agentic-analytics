@@ -92,9 +92,7 @@ class Runtime:
                 disk_limits=disk_limits,
                 protected_state_root=resolved.state_dir,
             )
-        execution = ExecutionService(
-            backend, executions, sources, registry, workspace, resolved
-        )
+        execution = ExecutionService(backend, executions, sources, registry, workspace, resolved)
         evidence_ledger = EvidenceLedger(
             evidence_repository,
             sources,

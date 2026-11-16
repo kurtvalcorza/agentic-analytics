@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from agentic_analytics.execution_backends import output_quota
 from agentic_analytics.execution_backends.output_quota import (
     OutputArchiveError,
     _members,
@@ -430,6 +431,25 @@ def test_quota_must_leave_room_in_container_memory(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="docker_memory"):
         Settings(state_dir=tmp_path, docker_memory="512m", docker_output_quota_bytes=512 * 1024**2)
     Settings(state_dir=tmp_path, docker_memory="1g", docker_output_quota_bytes=256 * 1024**2)
+    # /dev/shm (64 MiB) is counted with /tmp (128 MiB): 448 MiB + 192 MiB = 640 MiB = 80% of 800m.
+    with pytest.raises(ValueError, match="docker_memory"):
+        Settings(state_dir=tmp_path, docker_memory="799m", docker_output_quota_bytes=448 * 1024**2)
+    Settings(state_dir=tmp_path, docker_memory="800m", docker_output_quota_bytes=448 * 1024**2)
+
+
+@pytest.mark.parametrize("memory", ["1.5g", "1536MiB", "1 g", "0.001t", "1610612736"])
+def test_docker_memory_forms_docker_accepts_are_checked_against_the_quota(
+    tmp_path: Path, memory: str
+) -> None:
+    Settings(state_dir=tmp_path, docker_memory=memory, docker_output_quota_bytes=256 * 1024**2)
+    with pytest.raises(ValueError, match="docker_memory"):
+        Settings(state_dir=tmp_path, docker_memory=memory, docker_output_quota_bytes=2 * 1024**3)
+
+
+@pytest.mark.parametrize("memory", ["lots", "1x", "", "1.5.2g", "-1g"])
+def test_unparsable_docker_memory_is_refused(tmp_path: Path, memory: str) -> None:
+    with pytest.raises(ValueError, match="docker_memory"):
+        Settings(state_dir=tmp_path, docker_memory=memory)
 
 
 @docker
@@ -555,3 +575,218 @@ def test_outputs_are_removed_when_artifact_registration_fails(tmp_path: Path) ->
         runtime.execution.execute_python(session, code, timeout_seconds=30)
     assert _containers(session) == []
     assert list((workspace / "outputs").iterdir()) == []
+
+
+# --- review round 3 ---------------------------------------------------------------------------
+
+
+@docker
+def test_zombie_leader_survivor_is_killed_before_judgement_and_cannot_inject(
+    tmp_path: Path,
+) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    # A thread-group leader that calls SYS_exit shows state Z in /proc while its other threads
+    # keep running. A scan that treats Z as dead misses it, and the thread writes into outputs/
+    # after the verdict.
+    code = """
+import ctypes, os, sys, threading, time
+open('outputs/ok.txt', 'w').write('ok')
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        def late():
+            time.sleep(0.15)
+            open('outputs/injected.txt', 'w').write('written after the verdict')
+            time.sleep(60)
+        threading.Thread(target=late).start()
+        ctypes.CDLL(None).syscall(60, 0)  # SYS_exit on x86-64: only the leader thread exits
+        time.sleep(60)
+    os._exit(0)
+os.wait()
+sys.exit(0)
+"""
+    started = time.monotonic()
+    record = _run(runtime, session, code, timeout=20)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 20, f"run wedged for {elapsed:.1f}s"
+    assert record.status is ExecutionStatus.SUCCEEDED, record.stderr_preview
+    assert sorted(path.name for path in (workspace / "outputs").iterdir()) == ["ok.txt"]
+
+
+@docker
+def test_fifo_at_the_verdict_staging_path_does_not_hold_the_run(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    code = """
+import os
+os.mkfifo('/tmp/.agentic-analytics-verdict.json.1')
+open('outputs/ok.txt', 'w').write('ok')
+"""
+    started = time.monotonic()
+    record = _run(runtime, session, code, timeout=6)
+    assert time.monotonic() - started < 15
+    assert record.status is ExecutionStatus.SUCCEEDED, record.stderr_preview
+    assert (workspace / "outputs" / "ok.txt").read_text(encoding="utf-8") == "ok"
+
+
+@docker
+def test_unusable_verdict_staging_path_fails_the_run_at_once(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    code = """
+import os
+os.makedirs('/tmp/.agentic-analytics-verdict.json.1/occupied')
+open('outputs/ok.txt', 'w').write('ok')
+"""
+    started = time.monotonic()
+    record = _run(runtime, session, code, timeout=6)
+    assert time.monotonic() - started < 15
+    assert record.status is ExecutionStatus.FAILED
+    assert "supervisor verdict" in (record.stderr_preview or "")
+    assert list((workspace / "outputs").iterdir()) == []
+
+
+@docker
+def test_script_keeps_its_original_descriptor_limit(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    code = """
+import resource
+open('outputs/soft.txt', 'w').write(str(resource.getrlimit(resource.RLIMIT_NOFILE)[0]))
+"""
+    record = _run(runtime, session, code)
+    assert record.status is ExecutionStatus.SUCCEEDED, record.stderr_preview
+    default = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "agentic-analytics-exec:test",
+            "python",
+            "-c",
+            "import resource; print(resource.getrlimit(resource.RLIMIT_NOFILE)[0])",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert (workspace / "outputs" / "soft.txt").read_text(encoding="utf-8") == default
+
+
+@docker
+def test_replaced_output_is_restored_when_artifact_registration_fails(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    (workspace / "outputs").mkdir()
+    (workspace / "outputs" / "f0.txt").write_text("EARLIER RUN", encoding="utf-8")
+    code = "for i in range(200):\n    open(f'outputs/f{i}.txt', 'w').write('x')"
+    with pytest.raises(Exception):  # noqa: B017 - the service's artifact limit, any type
+        runtime.execution.execute_python(session, code, timeout_seconds=30)
+    assert _containers(session) == []
+    assert [path.name for path in (workspace / "outputs").iterdir()] == ["f0.txt"]
+    assert (workspace / "outputs" / "f0.txt").read_text(encoding="utf-8") == "EARLIER RUN"
+
+
+def _earlier(tmp_path: Path) -> Path:
+    destination = tmp_path / "outputs"
+    destination.mkdir()
+    (destination / "report.csv").write_bytes(b"EARLIER RUN, GOOD")
+    return destination
+
+
+def test_failed_move_restores_an_output_that_was_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = _earlier(tmp_path)
+    archive = _tar(
+        _file("report.csv"),
+        _file("b.txt"),
+        _file("sub/c.txt"),
+        data={"report.csv": b"FROM THE FAILED RUN", "b.txt": b"1", "sub/c.txt": b"2"},
+    )
+    real_replace = os.replace
+    calls = 0
+
+    def flaky(*args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # report.csv has been replaced; moving b.txt into place fails
+            raise OSError(28, "No space left on device")
+        real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(output_quota.os, "replace", flaky)
+    with pytest.raises(OutputArchiveError, match="could not extract"):
+        extract_outputs(archive, destination, QUOTA)
+    assert calls >= 3  # the move that failed, then the restore
+    assert [path.name for path in destination.iterdir()] == ["report.csv"]
+    assert (destination / "report.csv").read_bytes() == b"EARLIER RUN, GOOD"
+
+
+def test_failed_staging_leaves_earlier_outputs_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = _earlier(tmp_path)
+    archive = _tar(
+        _file("report.csv"),
+        _file("b.txt"),
+        data={"report.csv": b"FROM THE FAILED RUN", "b.txt": b"1"},
+    )
+    real_copy = output_quota.shutil.copyfileobj
+    calls = 0
+
+    def flaky(*args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(28, "No space left on device")
+        real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(output_quota.shutil, "copyfileobj", flaky)
+    monkeypatch.setattr(
+        output_quota.os, "replace", lambda *a, **k: pytest.fail("nothing may be moved in")
+    )
+    with pytest.raises(OutputArchiveError, match="could not extract"):
+        extract_outputs(archive, destination, QUOTA)
+    assert [path.name for path in destination.iterdir()] == ["report.csv"]
+    assert (destination / "report.csv").read_bytes() == b"EARLIER RUN, GOOD"
+
+
+def test_names_that_collide_on_case_insensitive_hosts_are_refused_everywhere(
+    tmp_path: Path,
+) -> None:
+    destination = _earlier(tmp_path)
+    cases = [
+        ("report.csv", "a", "A/b"),  # the reviewer's write-phase trigger on Windows
+        ("report.csv", "Result.csv", "result.csv"),
+        ("report.csv", "Dir/x", "dir/y"),
+        ("report.csv", "caf\u00e9.txt", "cafe\u0301.txt"),  # NFC and NFD spellings
+    ]
+    for names in cases:
+        archive = _tar(*[_file(name) for name in names], data=dict.fromkeys(names, b"new"))
+        with pytest.raises(OutputArchiveError, match="differ only by case"):
+            extract_outputs(archive, destination, QUOTA)
+        assert [path.name for path in destination.iterdir()] == ["report.csv"]
+        assert (destination / "report.csv").read_bytes() == b"EARLIER RUN, GOOD"
+
+
+def test_staging_name_is_reserved_and_no_staging_directory_is_left(tmp_path: Path) -> None:
+    destination = _earlier(tmp_path)
+    name = output_quota.STAGING_PREFIX + "x/f.txt"
+    with pytest.raises(OutputArchiveError, match="reserved name"):
+        extract_outputs(_tar(_file(name), data={name: b"x"}), destination, QUOTA)
+    extract_outputs(_tar(_file("new.txt"), data={"new.txt": b"n"}), destination, QUOTA)
+    assert sorted(path.name for path in destination.iterdir()) == ["new.txt", "report.csv"]
+
+
+def test_remove_outputs_restores_what_a_successful_copy_out_replaced(tmp_path: Path) -> None:
+    destination = _earlier(tmp_path)
+    restore_dir = tmp_path / "state" / "outputs-restore"
+    archive = _tar(
+        _file("report.csv"),
+        _file("sub/new.txt"),
+        data={"report.csv": b"NEW", "sub/new.txt": b"n"},
+    )
+    created = extract_outputs(archive, destination, QUOTA, restore_dir=restore_dir)
+    assert (destination / "report.csv").read_bytes() == b"NEW"
+    assert created == [destination.resolve() / "sub", destination.resolve() / "sub" / "new.txt"]
+
+    output_quota.remove_outputs([str(path) for path in created], restore_dir)
+    assert [path.name for path in destination.iterdir()] == ["report.csv"]
+    assert (destination / "report.csv").read_bytes() == b"EARLIER RUN, GOOD"

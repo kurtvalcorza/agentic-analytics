@@ -23,6 +23,7 @@ from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard, drain_bounde
 from .output_quota import (
     CONTAINER_OUTPUT_DIR,
     OUTPUT_DIR_NAME,
+    RESTORE_DIR_NAME,
     SUPERVISOR_PATH,
     SUPERVISOR_SOURCE,
     TAR_OVERHEAD_BYTES,
@@ -165,8 +166,7 @@ class DockerBackend:
                 # cover, so a workspace containing one is never mounted.
                 if stat.S_ISSOCK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
                     raise DockerExecutionError(
-                        "workspace contains a socket or device node; refusing to mount it: "
-                        f"{path}"
+                        f"workspace contains a socket or device node; refusing to mount it: {path}"
                     )
                 # Symlinks resolve through their target mount; bind mounting their link name
                 # could instead make Docker follow a target outside the container workspace.
@@ -312,6 +312,10 @@ class DockerBackend:
             *self._user_args(),
             "--tmpfs",
             "/tmp:rw,nosuid,nodev,size=128m",
+            # Explicit, so the memory budget in Settings counts the real /dev/shm size
+            # whatever the daemon's default-shm-size is.
+            "--shm-size",
+            "64m",
             "--memory",
             self.memory,
             "--cpus",
@@ -440,6 +444,7 @@ class DockerBackend:
                 timeout_seconds,
                 timed_out,
                 runtime,
+                script_path.parent / RESTORE_DIR_NAME,
             )
         finally:
             # Closing stdin lets the supervisor exit; --rm then removes the container and its
@@ -478,6 +483,7 @@ class DockerBackend:
         timeout_seconds: int,
         timed_out: bool,
         runtime: dict[str, Any],
+        restore_dir: Path,
     ) -> dict[str, Any]:
         """Decide the run's outcome while its container (and tmpfs) is still alive."""
 
@@ -508,9 +514,10 @@ class DockerBackend:
             }
         runtime["output_min_free_bytes"] = verdict.min_free_bytes
         if verdict.timed_out:
-            return {"status": ExecutionStatus.TIMED_OUT, "stderr_default": (
-                f"execution exceeded {timeout_seconds} seconds"
-            )}
+            return {
+                "status": ExecutionStatus.TIMED_OUT,
+                "stderr_default": (f"execution exceeded {timeout_seconds} seconds"),
+            }
         if verdict.others_remaining:
             return {
                 "status": ExecutionStatus.FAILED,
@@ -528,7 +535,7 @@ class DockerBackend:
                 "runtime": {**runtime, "resource_limit": "disk", "retained_output_bytes": 0},
                 "resource_limit": "disk",
             }
-        failure, created = self._copy_out(container, workspace, readonly_paths)
+        failure, created = self._copy_out(container, workspace, readonly_paths, restore_dir)
         if failure is not None:
             return {
                 "status": ExecutionStatus.FAILED,
@@ -547,9 +554,17 @@ class DockerBackend:
         }
 
     def _copy_out(
-        self, container: str, workspace: Path, readonly_paths: tuple[Path, ...]
+        self,
+        container: str,
+        workspace: Path,
+        readonly_paths: tuple[Path, ...],
+        restore_dir: Path,
     ) -> tuple[str | None, list[Path]]:
-        """Stream outputs/ out of the live container; return (failure, created paths)."""
+        """Stream outputs/ out of the live container; return (failure, created paths).
+
+        Earlier versions of outputs the run replaced are kept in ``restore_dir`` (server
+        state, next to the request script) until the caller has registered the artifacts.
+        """
 
         cap = self.output_quota_bytes * TAR_OVERHEAD_FACTOR + TAR_OVERHEAD_BYTES
         protected = {self._identity(path) for path in readonly_paths if path.exists()}
@@ -579,6 +594,7 @@ class DockerBackend:
                     self.output_quota_bytes,
                     protected,
                     max_members=self.disk_limits.max_output_files,
+                    restore_dir=restore_dir,
                 )
             except OutputArchiveError as exc:
                 return str(exc), []

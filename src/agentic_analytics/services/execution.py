@@ -8,7 +8,10 @@ from typing import Any
 
 from agentic_analytics.execution_backends import ExecutionBackend
 from agentic_analytics.execution_backends.base import BackendResult
-from agentic_analytics.execution_backends.output_quota import remove_outputs
+from agentic_analytics.execution_backends.output_quota import (
+    RESTORE_DIR_NAME,
+    remove_outputs,
+)
 from agentic_analytics.ids import EntityType, new_id
 from agentic_analytics.models import (
     AnalysisSession,
@@ -126,9 +129,10 @@ class ExecutionService:
                             session.id, execution_id, workspace_root, before, after
                         )
                 except Exception as exc:
-                    if result is not None and result.output_paths:
-                        # Copied-out outputs that cannot be registered are not kept.
-                        remove_outputs(result.output_paths)
+                    if result is not None:
+                        # Copied-out outputs that cannot be registered are not kept, and the
+                        # earlier outputs they replaced are put back.
+                        remove_outputs(result.output_paths, script_path.parent / RESTORE_DIR_NAME)
                     # Registration failures happen after code has already changed files.
                     # Preserve their audit record and any artifacts published before failure.
                     self._persist_backend_failure(

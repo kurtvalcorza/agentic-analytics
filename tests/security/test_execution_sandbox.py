@@ -223,10 +223,9 @@ for name in ['shared', 'shared/source-parent', 'aliases/deep']:
             # The workspace is read-only (EROFS, 30); bind-mount boundaries can also reject
             # rename with EBUSY (16) or EXDEV (18). Any of them proves it was refused.
             assert any(
-                f"{name}={error_number}" in record.stdout_preview
-                for error_number in (16, 18, 30)
+                f"{name}={error_number}" in record.stdout_preview for error_number in (16, 18, 30)
             )
-        for name in ('shared', 'shared/source-parent', 'aliases/deep'):
+        for name in ("shared", "shared/source-parent", "aliases/deep"):
             assert f"{name}/write=blocked" in record.stdout_preview
         assert sentinel.read_bytes() == b"SERVER_PRIVATE"
         assert source_path.read_bytes() == source_bytes

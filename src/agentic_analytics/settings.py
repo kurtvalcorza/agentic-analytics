@@ -27,16 +27,22 @@ def parse_size(value: str) -> int | None:
     return int(float(match.group(1)) * _UNITS[unit])
 
 
-_DOCKER_UNITS = {"": 1, "b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
+_DOCKER_UNITS = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4, "p": 1024**5}
+# Container tmpfs mounts other than outputs/: /tmp (128 MiB) and /dev/shm (64 MiB).
+_DOCKER_SCRATCH_TMPFS_BYTES = (128 + 64) * 1024**2
 
 
 def _docker_bytes(value: str) -> int | None:
-    """Parse a Docker memory size such as ``1g`` or ``512m``; None when unrecognised."""
+    """Parse a Docker memory size (``1g``, ``512m``, ``1.5GiB``); None when unrecognised.
 
-    match = re.fullmatch(r"\s*([0-9]+)\s*([bkmg]?)b?\s*", value.lower())
+    Follows Docker's own rule: a decimal number, an optional binary unit from k to p, and an
+    optional ``i`` and ``b``.
+    """
+
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?) ?([kmgtp]?)i?b?\s*", value.lower())
     if match is None:
         return None
-    return int(match.group(1)) * _DOCKER_UNITS[match.group(2)]
+    return int(float(match.group(1)) * _DOCKER_UNITS[match.group(2)])
 
 
 class Settings(BaseSettings):
@@ -102,12 +108,18 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_output_quota(self) -> Self:
         # tmpfs pages are charged to the container's memory cgroup, together with /tmp
-        # (128 MiB). A quota near the memory limit would end in an OOM kill instead of ENOSPC.
+        # (128 MiB) and /dev/shm (64 MiB). A quota near the memory limit would end in an OOM
+        # kill instead of ENOSPC. A size that cannot be read cannot be checked, so it is refused.
         memory = _docker_bytes(self.docker_memory)
-        if memory is not None and self.docker_output_quota_bytes + 128 * 1024**2 > 0.8 * memory:
+        if memory is None:
             raise ValueError(
-                "docker_output_quota_bytes plus 128 MiB for /tmp must stay below 80% of "
-                "docker_memory, because tmpfs outputs are charged to container memory"
+                f"docker_memory {self.docker_memory!r} is not a size such as '1g', '512m' or "
+                "'1.5g', so the output quota cannot be checked against it"
+            )
+        if self.docker_output_quota_bytes + _DOCKER_SCRATCH_TMPFS_BYTES > 0.8 * memory:
+            raise ValueError(
+                "docker_output_quota_bytes plus 192 MiB for /tmp and /dev/shm must stay below "
+                "80% of docker_memory, because tmpfs pages are charged to container memory"
             )
         return self
 
