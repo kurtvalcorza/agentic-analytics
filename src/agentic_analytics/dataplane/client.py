@@ -5,9 +5,11 @@ already-authorized absolute paths and validated, rewritten SQL, and only reads b
 JSON response. A worker that crashes, exhausts its memory, hangs, or floods its output is killed
 and reported as a failed operation; the MCP server process is never affected.
 
-This is a failure-containment and resource boundary, not a privilege boundary: the worker runs
-as the server's OS user, so a remote-code-execution flaw in DuckDB would run with the server's
-filesystem permissions (but with a scrubbed environment and DuckDB's own file restrictions).
+The worker runs as the server's OS user, but on Linux it confines itself with Landlock before
+DuckDB is loaded: it can read only the runtime, the operation's authorized source files, and
+write only its private scratch directory and the operation's own output directory. Code running
+inside a compromised worker therefore cannot reach the workspace, server state, or other
+sessions' archives. The worker also exits when the server does. See ``sandbox.py``.
 """
 
 from __future__ import annotations
@@ -28,6 +30,8 @@ from typing import IO, Any
 
 from agentic_analytics.settings import Settings
 
+from .sandbox import SandboxPolicy
+
 # Seconds allowed beyond an operation's own deadline before the worker is killed. Covers
 # interpreter start-up and the worker's graceful in-process interrupt.
 _KILL_GRACE_SECONDS = 10.0
@@ -40,7 +44,8 @@ class DataPlaneError(RuntimeError):
     """A data-plane operation failed. ``category`` is stable; ``error_type`` is diagnostic.
 
     Categories: ``timeout``, ``out_of_memory``, ``disk_limit``, ``spill_limit``,
-    ``source_read``, ``sql``, ``crashed``, ``response_too_large``, ``internal``.
+    ``source_read``, ``sql``, ``crashed``, ``response_too_large``, ``sandbox_unavailable``,
+    ``internal``.
     """
 
     def __init__(self, category: str, error_type: str, message: str) -> None:
@@ -71,6 +76,9 @@ def _write_request(stream: IO[bytes], request: bytes) -> None:
 class DataPlaneClient:
     # Seconds allowed beyond an operation's own deadline before the worker is killed.
     kill_grace_seconds = _KILL_GRACE_SECONDS
+    # Ask the kernel to kill the worker when the server exits (Linux PR_SET_PDEATHSIG). The
+    # portable watchdog runs regardless; tests turn this off to exercise the watchdog alone.
+    parent_death_signal = True
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -98,6 +106,25 @@ class DataPlaneClient:
             "max_file_bytes": self.settings.data_plane_max_file_bytes,
             "max_open_files": 256,
         }
+
+    def sandbox_policy(self, payload: dict[str, Any], workdir: Path) -> SandboxPolicy:
+        """Least-privilege filesystem policy for one operation.
+
+        Read: the operation's authorized source files only. Write: the private scratch
+        directory, and for queries the per-execution archive directory that receives the spill.
+        """
+
+        read_files = [str(item["path"]) for item in payload.get("sources", ())]
+        if "path" in payload:
+            read_files.append(str(payload["path"]))
+        write_dirs = [str(workdir)]
+        if payload.get("spill_path"):
+            write_dirs.append(str(Path(payload["spill_path"]).parent))
+        return SandboxPolicy(
+            mode=self.settings.data_plane_sandbox,
+            read_files=tuple(read_files),
+            write_dirs=tuple(write_dirs),
+        )
 
     @staticmethod
     def worker_command() -> list[str]:
@@ -231,7 +258,13 @@ class DataPlaneClient:
             payload = dict(payload)
             payload["limits"] = {**payload["limits"], "temp_directory": str(workdir / "duckdb")}
             request = json.dumps(
-                {"op": op, "payload": payload, "os_limits": self._os_limits(deadline_seconds)}
+                {
+                    "op": op,
+                    "payload": payload,
+                    "os_limits": self._os_limits(deadline_seconds),
+                    "sandbox": self.sandbox_policy(payload, workdir).to_json(),
+                    "parent": {"pid": os.getpid(), "pdeathsig": self.parent_death_signal},
+                }
             ).encode("utf-8")
             returncode, out, out_overflow, timed_out = self._run_worker(
                 workdir, request, deadline_seconds

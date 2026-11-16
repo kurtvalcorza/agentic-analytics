@@ -17,6 +17,9 @@ Limits applied on POSIX before any data is read:
 
 On hosts without the ``resource`` module (Windows) the worker still provides crash, hang, and
 memory-fault containment through process separation, but not OS resource limits.
+
+After the limits, and still before DuckDB is imported, the worker binds its lifetime to the
+server and confines itself (Landlock on Linux); see :mod:`agentic_analytics.dataplane.sandbox`.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ import json
 import signal
 import sys
 from typing import Any
+
+from . import sandbox
 
 _MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _MAX_MESSAGE_CHARS = 2000
@@ -128,6 +133,27 @@ def main() -> int:
     request = json.loads(raw)
     # Limits first, before DuckDB is imported or any source byte is read.
     _apply_limits(request.get("os_limits", {}))
+    parent = request.get("parent", {})
+    parent_pid = parent.get("pid")
+    death_signal_armed = sandbox.bind_to_parent(
+        parent_pid, pdeathsig=bool(parent.get("pdeathsig", True))
+    )
+    try:
+        # Privilege isolation next, still single-threaded and before DuckDB is imported.
+        sandbox.enter(sandbox.SandboxPolicy.from_json(request.get("sandbox", {})))
+    except (sandbox.SandboxUnavailable, OSError) as exc:
+        _respond(
+            {
+                "error": {
+                    "category": "sandbox_unavailable",
+                    "type": type(exc).__name__,
+                    "message": str(exc)[:_MAX_MESSAGE_CHARS],
+                }
+            }
+        )
+        return 1
+    if not death_signal_armed:
+        sandbox.start_parent_watchdog(parent_pid)
     try:
         from .engine import OPERATIONS
 
