@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,9 @@ import pytest
 
 from agentic_analytics.execution_backends.output_quota import (
     OutputArchiveError,
+    _members,
     extract_outputs,
+    member_parts,
     parse_verdict,
 )
 from agentic_analytics.models import AnalysisSession, ExecutionStatus, SessionMode
@@ -288,7 +291,7 @@ def test_existing_symlink_and_protected_source_are_never_written_through(tmp_pat
     outside = tmp_path / "outside"
     outside.mkdir()
     (destination / "dir-link").symlink_to(outside, target_is_directory=True)
-    with pytest.raises(OutputArchiveError, match="symlink"):
+    with pytest.raises(OutputArchiveError, match=r"link|escapes"):
         extract_outputs(
             _tar(_file("dir-link/x.txt"), data={"dir-link/x.txt": b"x"}), destination, QUOTA
         )
@@ -317,13 +320,238 @@ def test_safe_archive_is_extracted_byte_for_byte(tmp_path: Path) -> None:
         destination,
         QUOTA,
     )
-    assert written == [destination.resolve() / "d" / "f.bin"]
+    assert written == [destination.resolve() / "d", destination.resolve() / "d" / "f.bin"]
     assert (destination / "d" / "f.bin").read_bytes() == b"\x00\x01payload"
 
 
 def test_verdict_must_carry_the_run_key() -> None:
-    body = json.dumps({"exit_code": 0, "quota_exhausted": False, "min_free_bytes": 5})
+    body = json.dumps(
+        {
+            "exit_code": 0,
+            "timed_out": False,
+            "quota_exhausted": False,
+            "min_free_bytes": 5,
+            "others_remaining": False,
+        }
+    )
     good = json.dumps({"body": body, "mac": hmac.new(b"k", body.encode(), "sha256").hexdigest()})
     assert parse_verdict(good, "k") is not None
     assert parse_verdict(good, "other-key") is None
     assert parse_verdict("not json", "k") is None
+
+
+# --- review round 2 ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "..\\..\\x.txt",
+        "./..\\..\\ESCAPED.txt",
+        "./..\\.agentic-analytics\\state\\planted.json",
+        "a\\b.txt",
+        "C:x.txt",
+        "c:/x.txt",
+        "//server/share/x.txt",
+        "\\\\?\\C:\\x.txt",
+        "a:b.txt",
+        "CON",
+        "nul.txt",
+        "com1",
+        "dir/LPT9.log",
+        "conin$",
+        "trailing.",
+        "trailing ",
+        "ctrl\x01.txt",
+        "../x.txt",
+        "/abs.txt",
+    ],
+)
+def test_member_names_are_validated_under_windows_and_posix_rules(name: str) -> None:
+    # Runs on every OS: the validator, not the host, decides what a Windows host would do.
+    with pytest.raises(OutputArchiveError):
+        member_parts(name)
+
+
+def test_plain_names_are_accepted() -> None:
+    assert member_parts("./a/b.c/report.final.csv") == ("a", "b.c", "report.final.csv")
+    assert member_parts("console.txt") == ("console.txt",)
+
+
+def test_windows_traversal_member_writes_nothing_outside_outputs(tmp_path: Path) -> None:
+    destination = tmp_path / "workspace" / "outputs"
+    destination.mkdir(parents=True)
+    name = "./..\\..\\ESCAPED.txt"
+    with pytest.raises(OutputArchiveError):
+        extract_outputs(_tar(_file(name), data={name: b"x"}), destination, QUOTA)
+    assert not list(tmp_path.rglob("*ESCAPED*"))
+
+
+def test_member_count_is_capped_and_nothing_is_written(tmp_path: Path) -> None:
+    destination = tmp_path / "outputs"
+    destination.mkdir()
+    names = [f"f{index}.txt" for index in range(5)]
+    archive = _tar(*[_file(name) for name in names], data={name: b"x" for name in names})
+    with pytest.raises(OutputArchiveError, match="more than 3 entries"):
+        extract_outputs(archive, destination, QUOTA, max_members=3)
+    assert list(destination.iterdir()) == []
+
+
+def test_negative_header_size_is_refused() -> None:
+    info = _file("bad.bin")
+    info.size = -1
+    with pytest.raises(OutputArchiveError, match="invalid size"):
+        _members([info], QUOTA, 10)  # type: ignore[arg-type]
+
+
+def test_file_directory_conflicts_are_refused_before_writing(tmp_path: Path) -> None:
+    destination = tmp_path / "outputs"
+    destination.mkdir()
+    archive = _tar(_file("a"), _file("a/b"), data={"a": b"1", "a/b": b"2"})
+    with pytest.raises(OutputArchiveError):
+        extract_outputs(archive, destination, QUOTA)
+    assert list(destination.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="hardlinks to arbitrary files need POSIX")
+def test_existing_hardlink_in_outputs_is_never_written_through(tmp_path: Path) -> None:
+    destination = tmp_path / "outputs"
+    destination.mkdir()
+    state_file = tmp_path / "state.json"
+    state_file.write_text("SERVER", encoding="utf-8")
+    (destination / "linked.txt").hardlink_to(state_file)
+    archive = _tar(_file("linked.txt"), data={"linked.txt": b"tampered"})
+    with pytest.raises(OutputArchiveError, match="linked or protected"):
+        extract_outputs(archive, destination, QUOTA)
+    assert state_file.read_text(encoding="utf-8") == "SERVER"
+
+
+def test_quota_must_leave_room_in_container_memory(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="docker_memory"):
+        Settings(state_dir=tmp_path, docker_memory="512m", docker_output_quota_bytes=512 * 1024**2)
+    Settings(state_dir=tmp_path, docker_memory="1g", docker_output_quota_bytes=256 * 1024**2)
+
+
+@docker
+def test_setsid_survivor_is_killed_before_judgement_and_cannot_inject(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    # The reviewer's case: a double-forked setsid process outlives the script, waits for the
+    # verdict, then tries to add a file and to write into the exec'd tar's stdout.
+    code = """
+import os, time
+open('outputs/real.txt', 'w').write('real')
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if os.path.exists('/tmp/.agentic-analytics-verdict.json'):
+                break
+            time.sleep(0.005)
+        open('outputs/injected.txt', 'w').write('injected')
+        for pid in os.listdir('/proc'):
+            try:
+                if b'tar' in open('/proc/' + pid + '/cmdline', 'rb').read():
+                    os.write(os.open('/proc/' + pid + '/fd/1', os.O_WRONLY), b'x' * 4096)
+            except OSError:
+                pass
+        time.sleep(30)
+    os._exit(0)
+"""
+    started = time.monotonic()
+    record = _run(runtime, session, code, timeout=20)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 20, f"run wedged for {elapsed:.1f}s"
+    assert record.status is ExecutionStatus.SUCCEEDED, record.stderr_preview
+    assert (workspace / "outputs" / "real.txt").read_text(encoding="utf-8") == "real"
+    assert not (workspace / "outputs" / "injected.txt").exists()
+
+
+@docker
+def test_managed_code_cannot_read_the_verdict_key(tmp_path: Path) -> None:
+    runtime, session, _ = _runtime(tmp_path)
+    code = """
+import os
+for label, action in [
+    ('environ', lambda: open('/proc/1/environ', 'rb').read()),
+    ('mem', lambda: open('/proc/1/mem', 'rb').read(1)),
+    ('fd0', lambda: open('/proc/1/fd/0', 'rb').read(1)),
+    ('fdlist', lambda: os.listdir('/proc/1/fd')),
+]:
+    try:
+        action()
+        print(label + '=readable')
+    except OSError:
+        print(label + '=denied')
+print('stdin=' + str(os.read(0, 100)))
+"""
+    record = _run(runtime, session, code)
+    assert record.status is ExecutionStatus.SUCCEEDED, record.stderr_preview
+    for label in ("environ", "mem", "fd0", "fdlist"):
+        assert f"{label}=denied" in record.stdout_preview
+    assert "stdin=b''" in record.stdout_preview  # the script's stdin is /dev/null
+
+
+@docker
+def test_fill_catch_unlink_and_exit_zero_still_fails_closed(tmp_path: Path) -> None:
+    # The reviewer's case: deleting the partial file must not hide that the quota was hit.
+    runtime, session, workspace = _runtime(tmp_path, docker_output_quota_bytes=16 * 1024**2)
+    code = """
+import os
+try:
+    with open('outputs/fill.bin', 'wb') as stream:
+        while True:
+            stream.write(b'x' * 65536)
+except OSError:
+    pass
+os.unlink('outputs/fill.bin')
+open('outputs/result.txt', 'w').write('small')
+"""
+    for _ in range(3):
+        record = _run(runtime, session, code)
+        assert record.status is ExecutionStatus.FAILED
+        assert record.error is not None and record.error["resource"] == "disk"
+        assert not (workspace / "outputs" / "result.txt").exists()
+
+
+@docker
+@pytest.mark.xfail(
+    reason="known gap, documented: truncating the file frees tmpfs pages even while the "
+    "supervisor holds a descriptor, so fill + catch ENOSPC + truncate + exit 0 between two "
+    "samples is not reliably detected (the kernel quota still protects the host)",
+    strict=False,
+)
+def test_fill_catch_truncate_and_exit_zero_is_a_documented_gap(tmp_path: Path) -> None:
+    runtime, session, _ = _runtime(tmp_path, docker_output_quota_bytes=16 * 1024**2)
+    code = """
+try:
+    with open('outputs/fill.bin', 'wb') as stream:
+        while True:
+            stream.write(b'x' * 65536)
+except OSError:
+    pass
+open('outputs/fill.bin', 'w').close()
+"""
+    record = _run(runtime, session, code)
+    assert record.status is ExecutionStatus.FAILED
+
+
+@docker
+def test_member_cap_fails_closed_and_keeps_nothing(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path, max_execution_output_files=50)
+    code = "for i in range(60):\n    open(f'outputs/f{i}.txt', 'w').write('x')"
+    record = _run(runtime, session, code)
+    assert record.status is ExecutionStatus.FAILED
+    assert record.error is not None and record.error["resource"] == "output_archive"
+    assert list((workspace / "outputs").iterdir()) == []
+
+
+@docker
+def test_outputs_are_removed_when_artifact_registration_fails(tmp_path: Path) -> None:
+    runtime, session, workspace = _runtime(tmp_path)
+    code = "for i in range(200):\n    open(f'outputs/f{i}.txt', 'w').write('x')"
+    with pytest.raises(Exception):  # noqa: B017 - the service's artifact limit, any type
+        runtime.execution.execute_python(session, code, timeout_seconds=30)
+    assert _containers(session) == []
+    assert list((workspace / "outputs").iterdir()) == []

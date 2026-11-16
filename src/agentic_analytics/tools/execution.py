@@ -10,7 +10,15 @@ from .errors import paginate, tool_errors
 
 
 def register_execution_tools(server: MCPServer[Any], runtime: Runtime) -> None:
-    @server.tool(description="Execute Python in the configured managed analytical sandbox.")
+    @server.tool(
+        description=(
+            "Execute Python in the configured managed analytical sandbox. The working "
+            "directory is the session workspace, mounted read-only: write every output file "
+            "under outputs/ (for example outputs/chart.png). outputs/ starts empty on each "
+            "run and is limited by a size quota; reaching it fails the run. Files from "
+            "earlier runs are registered artifacts, not visible in outputs/."
+        )
+    )
     @tool_errors
     def execute_python(
         session_id: str,

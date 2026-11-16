@@ -27,6 +27,7 @@ from .output_quota import (
     SUPERVISOR_SOURCE,
     TAR_OVERHEAD_BYTES,
     TAR_OVERHEAD_FACTOR,
+    VERDICT_MAX_BYTES,
     VERDICT_PATH,
     OutputArchiveError,
     extract_outputs,
@@ -39,6 +40,10 @@ from .output_quota import (
 # supply a non-root numeric identity (non-POSIX Docker Desktop hosts).
 DEFAULT_CONTAINER_USER = "10001:10001"
 _VERDICT_POLL_SECONDS = 0.2
+# The supervisor enforces the script's own timeout from the moment the script starts. The
+# server's backstop adds this much for container start-up and judgement, so slow start-up
+# is not misreported as a script timeout while a wedged run is still killed.
+_SERVER_GRACE_SECONDS = 30.0
 _USER_PATTERN = re.compile(r"^[0-9]+:[0-9]+$")
 
 
@@ -278,6 +283,7 @@ class DockerBackend:
         script_path: Path,
         *,
         readonly_paths: tuple[Path, ...] = (),
+        timeout_seconds: int = 3600,
     ) -> list[str]:
         workspace = Path(session.workspace_root).resolve(strict=True)
         script = script_path.resolve(strict=True)
@@ -329,6 +335,7 @@ class DockerBackend:
             "python",
             SUPERVISOR_PATH,
             str(quota_threshold(self.output_quota_bytes)),
+            str(timeout_seconds),
         ]
 
     def _drain(
@@ -356,7 +363,13 @@ class DockerBackend:
             )
         container = self._container_name(session.id)
         runtime: dict[str, Any] = {"backend": self.name, "image": self.image, "network": "none"}
-        run_args = self._run_args(session, container, script_path, readonly_paths=readonly_paths)
+        run_args = self._run_args(
+            session,
+            container,
+            script_path,
+            readonly_paths=readonly_paths,
+            timeout_seconds=timeout_seconds,
+        )
 
         def kill_container(_: str = "") -> None:
             # Killing the ephemeral container tears down the whole process tree; --rm removes it.
@@ -406,12 +419,12 @@ class DockerBackend:
                 proc.stdin.flush()
             verdict_ready = False
             with guard:
-                deadline = time.monotonic() + timeout_seconds
+                deadline = time.monotonic() + timeout_seconds + _SERVER_GRACE_SECONDS
                 while time.monotonic() < deadline:
                     if proc.poll() is not None:
                         break  # the container died before reporting
-                    probe = self._run(["exec", container, "test", "-f", VERDICT_PATH], timeout=30)
-                    if probe.returncode == 0:
+                    probe = self._exec(container, ["test", "-f", VERDICT_PATH])
+                    if probe == 0:
                         verdict_ready = True
                         break
                     time.sleep(_VERDICT_POLL_SECONDS)
@@ -452,6 +465,7 @@ class DockerBackend:
             stdout_truncated=stdout_truncated.is_set(),
             stderr_truncated=stderr_truncated.is_set(),
             resource_limit=outcome.get("resource_limit"),
+            output_paths=outcome.get("output_paths", ()),
         )
 
     def _judge(
@@ -484,8 +498,8 @@ class DockerBackend:
                 "status": ExecutionStatus.TIMED_OUT,
                 "stderr_default": f"execution exceeded {timeout_seconds} seconds",
             }
-        read = self._run(["exec", container, "cat", VERDICT_PATH], timeout=30)
-        verdict = parse_verdict(read.stdout, key) if read.returncode == 0 else None
+        raw = self._exec_output(container, ["head", "-c", str(VERDICT_MAX_BYTES), VERDICT_PATH])
+        verdict = parse_verdict(raw, key) if raw is not None else None
         if verdict is None:
             # The container died early, or the verdict is missing or forged: fail closed.
             return {
@@ -493,6 +507,16 @@ class DockerBackend:
                 "stderr": "managed execution ended without a valid supervisor verdict",
             }
         runtime["output_min_free_bytes"] = verdict.min_free_bytes
+        if verdict.timed_out:
+            return {"status": ExecutionStatus.TIMED_OUT, "stderr_default": (
+                f"execution exceeded {timeout_seconds} seconds"
+            )}
+        if verdict.others_remaining:
+            return {
+                "status": ExecutionStatus.FAILED,
+                "stderr": "execution terminated: processes outlived the script and could "
+                "not be stopped; outputs were discarded",
+            }
         if verdict.quota_exhausted:
             return {
                 "status": ExecutionStatus.FAILED,
@@ -504,7 +528,7 @@ class DockerBackend:
                 "runtime": {**runtime, "resource_limit": "disk", "retained_output_bytes": 0},
                 "resource_limit": "disk",
             }
-        failure = self._copy_out(container, workspace, readonly_paths)
+        failure, created = self._copy_out(container, workspace, readonly_paths)
         if failure is not None:
             return {
                 "status": ExecutionStatus.FAILED,
@@ -516,12 +540,16 @@ class DockerBackend:
         # A failed script's outputs are still copied out, as before SEC-01, so a caller can
         # inspect partial work; they are never reported as a success.
         status = ExecutionStatus.SUCCEEDED if verdict.exit_code == 0 else ExecutionStatus.FAILED
-        return {"status": status, "exit_code": verdict.exit_code}
+        return {
+            "status": status,
+            "exit_code": verdict.exit_code,
+            "output_paths": tuple(str(path) for path in created),
+        }
 
     def _copy_out(
         self, container: str, workspace: Path, readonly_paths: tuple[Path, ...]
-    ) -> str | None:
-        """Stream outputs/ out of the live container; return a failure reason or None."""
+    ) -> tuple[str | None, list[Path]]:
+        """Stream outputs/ out of the live container; return (failure, created paths)."""
 
         cap = self.output_quota_bytes * TAR_OVERHEAD_FACTOR + TAR_OVERHEAD_BYTES
         protected = {self._identity(path) for path in readonly_paths if path.exists()}
@@ -537,19 +565,39 @@ class DockerBackend:
             finally:
                 if tar.poll() is None:
                     tar.kill()
-                tar.wait(timeout=30)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    tar.wait(timeout=30)
             if not within:
-                return "outputs archive exceeded its size cap"
+                return "outputs archive exceeded its size cap", []
             if tar.returncode != 0:
-                return f"could not read outputs/ (tar exit {tar.returncode})"
+                return f"could not read outputs/ (tar exit {tar.returncode})", []
             spool.seek(0)
             try:
-                extract_outputs(
-                    spool, workspace / OUTPUT_DIR_NAME, self.output_quota_bytes, protected
+                created = extract_outputs(
+                    spool,
+                    workspace / OUTPUT_DIR_NAME,
+                    self.output_quota_bytes,
+                    protected,
+                    max_members=self.disk_limits.max_output_files,
                 )
             except OutputArchiveError as exc:
-                return str(exc)
-        return None
+                return str(exc), []
+        return None, created
+
+    def _exec(self, container: str, command: list[str]) -> int:
+        """Run ``docker exec``; a hung exec counts as a failure, never an exception."""
+
+        try:
+            return self._run(["exec", container, *command], timeout=30).returncode
+        except subprocess.TimeoutExpired:
+            return -1
+
+    def _exec_output(self, container: str, command: list[str]) -> str | None:
+        try:
+            done = self._run(["exec", container, *command], timeout=30)
+        except subprocess.TimeoutExpired:
+            return None
+        return done.stdout if done.returncode == 0 else None
 
     def close_session(self, session_id: str) -> None:
         # Remove any container still labelled for this session (defensive; ephemeral runs

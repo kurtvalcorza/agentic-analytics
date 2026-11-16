@@ -48,7 +48,7 @@ def test_masks_actual_nested_state_and_mounts_external_script(
         "readonly",
     ] in _mounts(args)
     # The supervisor runs the request script and judges the outputs quota (SEC-01).
-    assert args[-2] == "/run/agentic-analytics/supervisor.py"
+    assert args[-3] == "/run/agentic-analytics/supervisor.py"
     assert ["type=bind", f"src={workspace}", "dst=/workspace", "readonly"] in _mounts(args)
     assert [
         "type=tmpfs",

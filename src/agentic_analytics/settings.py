@@ -27,6 +27,18 @@ def parse_size(value: str) -> int | None:
     return int(float(match.group(1)) * _UNITS[unit])
 
 
+_DOCKER_UNITS = {"": 1, "b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
+
+
+def _docker_bytes(value: str) -> int | None:
+    """Parse a Docker memory size such as ``1g`` or ``512m``; None when unrecognised."""
+
+    match = re.fullmatch(r"\s*([0-9]+)\s*([bkmg]?)b?\s*", value.lower())
+    if match is None:
+        return None
+    return int(match.group(1)) * _DOCKER_UNITS[match.group(2)]
+
+
 class Settings(BaseSettings):
     """Process configuration. Filesystem authority is always resolved server-side."""
 
@@ -86,6 +98,18 @@ class Settings(BaseSettings):
     max_result_preview_bytes: int = Field(default=256 * 1024, ge=1024)
     max_result_cell_chars: int = Field(default=8192, ge=64)
     log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def validate_output_quota(self) -> Self:
+        # tmpfs pages are charged to the container's memory cgroup, together with /tmp
+        # (128 MiB). A quota near the memory limit would end in an OOM kill instead of ENOSPC.
+        memory = _docker_bytes(self.docker_memory)
+        if memory is not None and self.docker_output_quota_bytes + 128 * 1024**2 > 0.8 * memory:
+            raise ValueError(
+                "docker_output_quota_bytes plus 128 MiB for /tmp must stay below 80% of "
+                "docker_memory, because tmpfs outputs are charged to container memory"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_data_plane_capacity(self) -> Self:

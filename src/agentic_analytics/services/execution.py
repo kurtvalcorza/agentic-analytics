@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from agentic_analytics.execution_backends import ExecutionBackend
+from agentic_analytics.execution_backends.base import BackendResult
+from agentic_analytics.execution_backends.output_quota import remove_outputs
 from agentic_analytics.ids import EntityType, new_id
 from agentic_analytics.models import (
     AnalysisSession,
@@ -109,6 +111,7 @@ class ExecutionService:
             with tempfile.TemporaryDirectory(prefix=f"{execution_id}-", dir=temp_dir) as request:
                 script_path = Path(request) / "request.py"
                 script_path.write_text(code, encoding="utf-8")
+                result: BackendResult | None = None
                 try:
                     result = self.backend.execute(
                         session, script_path, timeout, readonly_paths=readonly_paths
@@ -123,6 +126,9 @@ class ExecutionService:
                             session.id, execution_id, workspace_root, before, after
                         )
                 except Exception as exc:
+                    if result is not None and result.output_paths:
+                        # Copied-out outputs that cannot be registered are not kept.
+                        remove_outputs(result.output_paths)
                     # Registration failures happen after code has already changed files.
                     # Preserve their audit record and any artifacts published before failure.
                     self._persist_backend_failure(
@@ -137,6 +143,7 @@ class ExecutionService:
                     )
                     raise
 
+        assert result is not None  # every path without a result raised above
         stdout, stdout_truncated = _bounded_text(result.stdout, self.settings.max_output_chars)
         stderr, stderr_truncated = _bounded_text(result.stderr, self.settings.max_output_chars)
         error = None
