@@ -19,6 +19,9 @@ class BackendResult:
     # Set when the backend terminated the workload for exceeding a host resource budget
     # (for example ``"disk"``); the execution service then discards its partial outputs.
     resource_limit: str | None = None
+    # Files and directories the backend copied into the workspace for this run (Docker
+    # outputs/). Removed again if artifact registration fails.
+    output_paths: tuple[str, ...] = ()
 
 
 class ExecutionBackend(Protocol):

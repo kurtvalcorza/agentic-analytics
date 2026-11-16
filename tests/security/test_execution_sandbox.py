@@ -75,7 +75,7 @@ def test_docker_hides_configured_state_and_preserves_existing_archives(
     sentinel.write_text("SERVER_PRIVATE", encoding="utf-8")
     try:
         first = runtime.execution.execute_python(
-            session, "from pathlib import Path\nPath('result.txt').write_text('original')"
+            session, "from pathlib import Path\nPath('outputs/result.txt').write_text('original')"
         )
         assert first.status.value == "succeeded", first.stderr_preview
         artifact = runtime.artifacts.get(session.id, first.artifact_ids[0])
@@ -92,7 +92,12 @@ for label, path in [('state', root / 'sentinel.txt'), ('archive', Path({archive_
         print(label + '=writable')
     except OSError:
         print(label + '=blocked')
-Path('allowed-output.txt').write_text('allowed')
+Path('outputs/allowed-output.txt').write_text('allowed')
+try:
+    Path('outside-outputs.txt').write_text('x')
+    print('workspace=writable')
+except OSError:
+    print('workspace=blocked')
 """
         result = runtime.execution.execute_python(session, code)
         assert result.status.value == "succeeded", result.stderr_preview
@@ -100,13 +105,15 @@ Path('allowed-output.txt').write_text('allowed')
         assert "state=blocked" in result.stdout_preview
         assert "archive=blocked" in result.stdout_preview
         assert "script=blocked" in result.stdout_preview
+        assert "workspace=blocked" in result.stdout_preview
+        assert not (workspace / "outside-outputs.txt").exists()
         assert sentinel.read_text(encoding="utf-8") == "SERVER_PRIVATE"
         assert archive.read_text(encoding="utf-8") == "original"
         assert hashlib.sha256(archive.read_bytes()).hexdigest() == artifact.sha256
         assert len(result.artifact_ids) == 1
         assert (
             runtime.artifacts.get(session.id, result.artifact_ids[0]).relative_path
-            == "allowed-output.txt"
+            == "outputs/allowed-output.txt"
         )
     finally:
         runtime.execution_backend.close_session(session.id)
@@ -151,7 +158,7 @@ try:
     print('new_alias=created')
 except OSError:
     print('new_alias=blocked')
-Path('result.txt').write_text('allowed')
+Path('outputs/result.txt').write_text('allowed')
 """
     try:
         # Omitting source_ids must not remove read-only protection from registered inputs.
@@ -200,27 +207,33 @@ for index, name in enumerate({ancestors!r}):
         print(name + '=movable')
     except OSError as exc:
         print(name + '=' + str(exc.errno))
-Path('shared/allowed-output.txt').write_text('allowed')
-Path('shared/source-parent/allowed-output.txt').write_text('allowed')
-Path('aliases/deep/allowed-output.txt').write_text('allowed')
+for name in ['shared', 'shared/source-parent', 'aliases/deep']:
+    try:
+        Path(name, 'outside-outputs.txt').write_text('x')
+        print(name + '/write=allowed')
+    except OSError:
+        print(name + '/write=blocked')
+    Path('outputs', name).mkdir(parents=True, exist_ok=True)
+    Path('outputs', name, 'allowed-output.txt').write_text('allowed')
 """
     try:
         record = runtime.execution.execute_python(session, code)
         assert record.status.value == "succeeded", record.stderr_preview
         for name in ancestors:
-            # Bind-mount boundaries can reject rename with EBUSY (16) or EXDEV (18),
-            # depending on the mount topology. Either result proves the rename was refused.
+            # The workspace is read-only (EROFS, 30); bind-mount boundaries can also reject
+            # rename with EBUSY (16) or EXDEV (18). Any of them proves it was refused.
             assert any(
-                f"{name}={error_number}" in record.stdout_preview
-                for error_number in (16, 18)
+                f"{name}={error_number}" in record.stdout_preview for error_number in (16, 18, 30)
             )
+        for name in ("shared", "shared/source-parent", "aliases/deep"):
+            assert f"{name}/write=blocked" in record.stdout_preview
         assert sentinel.read_bytes() == b"SERVER_PRIVATE"
         assert source_path.read_bytes() == source_bytes
         assert alias.read_bytes() == source_bytes
         assert {item.relative_path for item in runtime.artifacts.list(session.id)} == {
-            "shared/allowed-output.txt",
-            "shared/source-parent/allowed-output.txt",
-            "aliases/deep/allowed-output.txt",
+            "outputs/shared/allowed-output.txt",
+            "outputs/shared/source-parent/allowed-output.txt",
+            "outputs/aliases/deep/allowed-output.txt",
         }
     finally:
         runtime.execution_backend.close_session(session.id)
