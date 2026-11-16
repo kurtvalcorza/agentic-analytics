@@ -9,10 +9,13 @@ the attacker opens its own unrestricted connection and plain Python file handles
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
+import resource
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import textwrap
@@ -39,8 +42,9 @@ requires_confinement = pytest.mark.skipif(
 # Runs as the worker program: installs the attacker operation, then hands control to the real
 # worker entry point, which applies limits and isolation before dispatching to the operation.
 _COMPROMISED_WORKER = """
-import ctypes, json, os, runpy, socket, sys
+import ctypes, errno, fcntl, json, os, resource, runpy, signal, socket, sys
 import agentic_analytics.dataplane.engine as engine
+import agentic_analytics.dataplane.sandbox as sandbox
 
 def attack(request):
     import duckdb
@@ -136,6 +140,64 @@ def attack(request):
     attempt("fork", fork)
     attempt("clear_death_signal", clear_death_signal)
 
+    # --- calls Landlock does not mediate (#26): record the errno of each ------------------
+    numbers = sandbox._SECCOMP_ARCHES[os.uname().machine][1]
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+
+    def raw(name, *args):
+        values = [ctypes.c_long(arg) if isinstance(arg, int) else arg for arg in args]
+        if libc.syscall(ctypes.c_long(numbers[name]), *values) < 0:
+            raise OSError(ctypes.get_errno(), name)
+
+    def call(name, action):
+        try:
+            action()
+            outcome[name] = "allowed"
+        except OSError as exc:
+            outcome[name] = errno.errorcode.get(exc.errno, str(exc.errno))
+
+    victim = int(targets["victim_pid"])
+    metadata = targets["metadata_file"]
+    null_fd = os.open("/dev/null", os.O_RDONLY)
+    scratch_fd = os.open("scratch-ok.txt", os.O_RDONLY)
+    absent_key = 0x26AA0026  # no IPC object has this key; without IPC_CREAT none is made
+    call("sys_prlimit64", lambda: resource.prlimit(victim, resource.RLIMIT_NOFILE, (7, 7)))
+    call("sys_sched_setaffinity", lambda: os.sched_setaffinity(victim, {0}))
+    call(
+        "sys_sched_setscheduler",
+        lambda: os.sched_setscheduler(victim, os.SCHED_BATCH, os.sched_param(0)),
+    )
+    call("sys_sched_setparam", lambda: os.sched_setparam(victim, os.sched_param(0)))
+    call("sys_sched_setattr", lambda: raw("sched_setattr", victim, 0, 0))
+    call("sys_setpriority", lambda: os.setpriority(os.PRIO_PROCESS, victim, 5))
+    call("sys_ioprio_set", lambda: raw("ioprio_set", 1, victim, 0))
+    call("sys_fcntl_setown", lambda: fcntl.fcntl(null_fd, fcntl.F_SETOWN, victim))
+    call("sys_fcntl_setsig", lambda: fcntl.fcntl(null_fd, fcntl.F_SETSIG, signal.SIGUSR1))
+    call("sys_fcntl_setown_ex", lambda: raw("fcntl", null_fd, 15, 0))
+    call("sys_chmod", lambda: os.chmod(metadata, 0o666))
+    call("sys_fchmod", lambda: os.fchmod(scratch_fd, 0o600))
+    call("sys_chown", lambda: os.chown(metadata, os.getuid(), os.getgid()))
+    call("sys_utime", lambda: os.utime(metadata, (1, 1)))
+    call("sys_setxattr", lambda: os.setxattr(metadata, "user.probe", b"1"))
+    call("sys_removexattr", lambda: os.removexattr(metadata, "user.probe"))
+    call("sys_add_key", lambda: raw("add_key", 0, 0, 0, 0, 0))
+    call("sys_request_key", lambda: raw("request_key", 0, 0, 0, 0))
+    call("sys_keyctl", lambda: raw("keyctl", 0, -3, 0))  # KEYCTL_GET_KEYRING_ID, session
+    call("sys_shmget", lambda: raw("shmget", absent_key, 0, 0))
+    call("sys_shmat", lambda: raw("shmat", -1, 0, 0))
+    call("sys_msgget", lambda: raw("msgget", absent_key, 0))
+    call("sys_semget", lambda: raw("semget", absent_key, 0, 0))
+    call("sys_mq_open", lambda: raw("mq_open", b"absent-queue", 0))
+    # The same calls aimed at the worker itself stay available.
+    call("self_sched_setaffinity", lambda: os.sched_setaffinity(0, os.sched_getaffinity(0)))
+    call(
+        "self_setpriority",
+        lambda: os.setpriority(os.PRIO_PROCESS, 0, os.getpriority(os.PRIO_PROCESS, 0)),
+    )
+    call("self_prlimit64", lambda: resource.prlimit(os.getpid(), resource.RLIMIT_CORE))
+    call("self_fcntl_getfl", lambda: fcntl.fcntl(null_fd, fcntl.F_GETFL))
+
     # Last: a successful exec replaces this process, so the replacement reports for both.
     report = json.dumps({"result": {**outcome, "execve": "allowed"}})
     attempt(
@@ -165,7 +227,14 @@ def _attack(tmp_path: Path, **settings: Any) -> tuple[dict[str, str], dict[str, 
     secret.write_text("token\nhunter2\n", encoding="utf-8")
     outside = tmp_path / "outside"
     outside.mkdir()
+    metadata_file = outside / "metadata.txt"
+    metadata_file.write_text("unchanged", encoding="utf-8")
+    metadata_file.chmod(0o600)
     with contextlib.ExitStack() as stack:
+        # A sacrificial process of the same uid, for the calls that take a pid.
+        victim = stack.enter_context(subprocess.Popen(["sleep", "120"]))
+        stack.callback(victim.kill)
+        victim_limit = resource.prlimit(victim.pid, resource.RLIMIT_NOFILE)
         # Test-owned listeners: a pathname Unix socket standing in for /var/run/docker.sock,
         # and loopback UDP and TCP endpoints. Each records whether anything reached it.
         unix_path = outside / "ctl.sock"
@@ -189,6 +258,8 @@ def _attack(tmp_path: Path, **settings: Any) -> tuple[dict[str, str], dict[str, 
             "udp_port": udp.getsockname()[1],
             "tcp_port": tcp.getsockname()[1],
             "server_pid": os.getpid(),
+            "victim_pid": victim.pid,
+            "metadata_file": metadata_file,
         }
         client = _CompromisedWorker(Settings(state_dir=tmp_path / "state", **settings))
         payload = {
@@ -209,6 +280,10 @@ def _attack(tmp_path: Path, **settings: Any) -> tuple[dict[str, str], dict[str, 
             tcp.accept()[0].close()
             received["tcp"] = True
         targets["received"] = received
+        targets["victim_limit"] = (
+            victim_limit,
+            resource.prlimit(victim.pid, resource.RLIMIT_NOFILE),
+        )
     return outcome, targets
 
 
@@ -255,6 +330,39 @@ def test_compromised_worker_cannot_reach_sockets_processes_or_exec(tmp_path: Pat
     assert outcome["hardlink_secret"].startswith("denied:")
 
 
+_FILTERED_CALLS = (
+    "prlimit64", "sched_setaffinity", "sched_setscheduler", "sched_setparam", "sched_setattr",
+    "setpriority", "ioprio_set", "fcntl_setown", "fcntl_setsig", "fcntl_setown_ex",
+    "chmod", "fchmod", "chown", "utime", "setxattr", "removexattr",
+    "add_key", "request_key", "keyctl", "shmget", "shmat", "msgget", "semget", "mq_open",
+)  # fmt: skip
+
+
+@requires_confinement
+def test_compromised_worker_cannot_act_on_other_processes_metadata_keys_or_ipc(
+    tmp_path: Path,
+) -> None:
+    """Calls Landlock does not mediate are refused by the seccomp filter (#26)."""
+
+    outcome, targets = _attack(tmp_path)
+
+    results = {name: outcome[f"sys_{name}"] for name in _FILTERED_CALLS}
+    assert results == dict.fromkeys(_FILTERED_CALLS, "EPERM")
+    # Nothing reached the sacrificial process or file.
+    before, after = targets["victim_limit"]
+    assert after == before
+    status = targets["metadata_file"].stat()
+    assert status.st_mode & 0o777 == 0o600
+    assert status.st_mtime > 1
+    # The worker can still make the same calls on itself.
+    assert {name: value for name, value in outcome.items() if name.startswith("self_")} == {
+        "self_sched_setaffinity": "allowed",
+        "self_setpriority": "allowed",
+        "self_prlimit64": "allowed",
+        "self_fcntl_getfl": "allowed",
+    }
+
+
 @linux_only
 def test_sandbox_off_is_an_explicit_opt_out(tmp_path: Path) -> None:
     outcome, targets = _attack(tmp_path, data_plane_sandbox="off")
@@ -262,6 +370,11 @@ def test_sandbox_off_is_an_explicit_opt_out(tmp_path: Path) -> None:
     assert outcome["python_write_outside"] == "allowed"
     assert targets["outside_file"].exists()
     assert outcome["unix_connect"] == "allowed"
+    # Control for the #26 test: without the filter these calls succeed.
+    assert outcome["sys_prlimit64"] == "allowed"
+    assert outcome["sys_chmod"] == "allowed"
+    assert targets["victim_limit"][1] == (7, 7)
+    assert targets["metadata_file"].stat().st_mode & 0o777 == 0o666
 
 
 @requires_confinement
@@ -460,6 +573,58 @@ def test_symlink_swapped_in_for_an_authorized_source_fails_closed(tmp_path: Path
     assert "hunter2" not in str(caught.value)
 
 
+@requires_confinement
+def test_source_under_a_symlinked_parent_directory_fails_closed(tmp_path: Path) -> None:
+    """No component of an authorized source path may be a symlink (#26)."""
+
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "data.csv").write_text("value\n1\n", encoding="utf-8")
+    (tmp_path / "link").symlink_to(real, target_is_directory=True)
+    client = DataPlaneClient(Settings(state_dir=tmp_path / "state"))
+    direct = {
+        "limits": client.limits(10),
+        "path": str(real / "data.csv"),
+        "kind": "csv",
+        "sample_limit": 5,
+        "max_profile_columns": 10,
+    }
+    assert client.call("profile", direct, deadline_seconds=10)["profile"]
+    through_link = {**direct, "path": str(tmp_path / "link" / "data.csv")}
+    with pytest.raises(DataPlaneError) as caught:
+        client.call("profile", through_link, deadline_seconds=10)
+    assert caught.value.category == "sandbox_unavailable"
+
+
+@linux_only
+@pytest.mark.parametrize("openat2", [True, False])
+def test_source_file_open_refuses_a_symlink_in_any_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, openat2: bool
+) -> None:
+    """Both the openat2 path and the per-component fallback fail closed."""
+
+    from agentic_analytics.dataplane import sandbox as sandbox_module
+
+    def unsupported(root_fd: int, relative: str) -> int:
+        raise OSError(errno.ENOSYS, "openat2")
+
+    if not openat2:
+        monkeypatch.setattr(sandbox_module, "_open_beneath_root", unsupported)
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "data.csv").write_text("value\n1\n", encoding="utf-8")
+    (tmp_path / "link").symlink_to(real, target_is_directory=True)
+    (real / "final-link.csv").symlink_to(real / "data.csv")
+
+    fd = sandbox_module._open_source_file(str(real / "data.csv"))
+    assert fd is not None
+    os.close(fd)
+    assert sandbox_module._open_source_file(str(real / "missing.csv")) is None
+    for swapped in (tmp_path / "link" / "data.csv", real / "final-link.csv"):
+        with pytest.raises(sandbox_module.SandboxUnavailable):
+            sandbox_module._open_source_file(str(swapped))
+
+
 @pytest.mark.parametrize("machine", ["x86_64", "aarch64"])
 def test_seccomp_program_is_well_formed_for_each_supported_architecture(machine: str) -> None:
     """Structural check; aarch64 is not executed in CI, so its table is checked here."""
@@ -480,7 +645,70 @@ def test_seccomp_program_is_well_formed_for_each_supported_architecture(machine:
     assert program[-1] == (ret, 0, 0, 0x7FFF0000)
     numbers = sandbox_module._SECCOMP_ARCHES[machine][1]
     for name in sandbox_module._SECCOMP_DENY:
-        assert name in numbers or name in {"fork", "vfork"}
+        assert name in numbers or name in sandbox_module._SECCOMP_X86_64_ONLY
     assert len(set(numbers.values())) == len(numbers)  # no copy-paste duplicates
     with pytest.raises(sandbox_module.SandboxUnavailable):
         sandbox_module.seccomp_program("riscv64", 4242)
+
+
+def _run_filter(
+    program: list[tuple[int, int, int, int]], arch: int, number: int, *args: int
+) -> int:
+    """Evaluate the classic-BPF subset the filter uses against one ``seccomp_data``."""
+
+    padded = [arg & 0xFFFFFFFFFFFFFFFF for arg in (*args, 0, 0, 0, 0, 0, 0)[:6]]
+    data = struct.pack("<iIQ6Q", number, arch, 0, *padded)
+    accumulator = index = 0
+    while True:
+        code, jt, jf, k = program[index]
+        index += 1
+        if code == 0x06:  # BPF_RET
+            return k
+        if code == 0x20:  # BPF_LD | BPF_W | BPF_ABS
+            accumulator = int.from_bytes(data[k : k + 4], "little")
+            continue
+        taken = {0x15: accumulator == k, 0x35: accumulator >= k, 0x45: bool(accumulator & k)}
+        index += jt if taken[code] else jf
+
+
+@pytest.mark.parametrize("machine", ["x86_64", "aarch64"])
+def test_seccomp_program_decisions_for_each_supported_architecture(machine: str) -> None:
+    """What the filter returns per call and argument, on both tables (#26)."""
+
+    from agentic_analytics.dataplane import sandbox as sandbox_module
+
+    pid = 4242
+    program = sandbox_module.seccomp_program(machine, pid)
+    arch, numbers = sandbox_module._SECCOMP_ARCHES[machine]
+    allow, eperm = 0x7FFF0000, 0x00050000 | errno.EPERM
+
+    def decide(name: str, *args: int) -> int:
+        return _run_filter(program, arch, numbers[name], *args)
+
+    for name in sandbox_module._SECCOMP_DENY:
+        if name in numbers:
+            assert decide(name) == eperm, name
+    for name in (*sandbox_module._SECCOMP_SELF_ONLY, *sandbox_module._SECCOMP_SELF_OR_ZERO):
+        assert decide(name, pid) == allow, name
+        assert decide(name, 1) == eperm, name
+        assert decide(name, -1) == eperm, name
+    for name in sandbox_module._SECCOMP_SELF_ONLY:
+        assert decide(name, 0) == eperm, name  # pid 0 is the whole process group
+    for name in sandbox_module._SECCOMP_SELF_OR_ZERO:
+        assert decide(name, 0) == allow, name  # pid 0 is the caller
+    for name, which in sandbox_module._SECCOMP_WHICH_WHO:
+        assert decide(name, which, 0) == allow, name
+        assert decide(name, which, pid) == allow, name
+        assert decide(name, which, 1) == eperm, name
+        assert decide(name, which + 1, 0) == eperm, name  # a process group or a uid
+    for command in (8, 10, 15):  # F_SETOWN, F_SETSIG, F_SETOWN_EX
+        assert decide("fcntl", 3, command) == eperm, command
+    for command in (1, 3, 4, 6, 9, 1030):  # GETFD, GETFL, SETFL, SETLK, GETOWN, DUPFD_CLOEXEC
+        assert decide("fcntl", 3, command) == allow, command
+    assert decide("clone", 0x00010000) == allow
+    assert decide("clone", 0x11) == eperm
+    assert decide("prctl", 1) == eperm
+    assert decide("prctl", 38) == allow
+    assert decide("clone3") == 0x00050000 | errno.ENOSYS
+    assert _run_filter(program, arch, 9999) == allow  # the default
+    assert _run_filter(program, 0x40000003, numbers["fcntl"]) == 0x80000000  # i386: killed
