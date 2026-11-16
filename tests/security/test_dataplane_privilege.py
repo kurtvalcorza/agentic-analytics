@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import textwrap
@@ -22,17 +23,23 @@ from typing import Any
 import pytest
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
+from agentic_analytics.dataplane.sandbox import landlock_abi
 from agentic_analytics.settings import Settings
 
 linux_only = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="Landlock confinement is Linux-only"
 )
 posix_only = pytest.mark.skipif(os.name != "posix", reason="kills a POSIX parent process")
+# Confinement assertions need the kernel feature; tests/conftest.py explains the skip once.
+requires_confinement = pytest.mark.skipif(
+    not sys.platform.startswith("linux") or landlock_abi() <= 0,
+    reason="needs Linux Landlock; see the session notice from tests/conftest.py",
+)
 
 # Runs as the worker program: installs the attacker operation, then hands control to the real
 # worker entry point, which applies limits and isolation before dispatching to the operation.
 _COMPROMISED_WORKER = """
-import runpy
+import ctypes, json, os, runpy, socket, sys
 import agentic_analytics.dataplane.engine as engine
 
 def attack(request):
@@ -77,6 +84,66 @@ def attack(request):
     )
     attempt("python_read_source", lambda: open(targets["source"]).read())
     attempt("scratch_write", scratch_write)
+
+    # --- escapes that do not go through the filesystem namespace Landlock covers ---------
+    def unix_connect():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2)
+            sock.connect(targets["unix_socket"])  # stand-in for /var/run/docker.sock
+            sock.sendall(b"GET /_ping HTTP/1.0\\r\\n\\r\\n")
+
+    def udp_send():
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(b"exfiltrated", ("127.0.0.1", int(targets["udp_port"])))
+
+    def tcp_connect():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2)
+            sock.connect(("127.0.0.1", int(targets["tcp_port"])))
+
+    def socketpair():
+        left, right = socket.socketpair()
+        left.close()
+        right.close()
+
+    def fork():
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        os.waitpid(pid, 0)
+
+    def clear_death_signal():
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+        if libc.prctl(1, 0, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            raise OSError(ctypes.get_errno(), "prctl")
+
+    def symlink_plant():
+        os.symlink(targets["secret"], "planted-link")
+        open("planted-link").read()
+
+    attempt("unix_connect", unix_connect)
+    attempt("udp_send", udp_send)
+    attempt("tcp_connect", tcp_connect)
+    attempt("socketpair", socketpair)
+    attempt("signal_server", lambda: os.kill(int(targets["server_pid"]), 0))
+    attempt(
+        "read_server_proc",
+        lambda: open("/proc/" + targets["server_pid"] + "/environ", "rb").read(),
+    )
+    attempt("symlink_plant", symlink_plant)
+    attempt("hardlink_secret", lambda: os.link(targets["secret"], "hardlinked"))
+    attempt("fork", fork)
+    attempt("clear_death_signal", clear_death_signal)
+
+    # Last: a successful exec replaces this process, so the replacement reports for both.
+    report = json.dumps({"result": {**outcome, "execve": "allowed"}})
+    attempt(
+        "execve",
+        lambda: os.execv(
+            sys.executable, [sys.executable, "-I", "-c", "print(" + repr(report) + ")"]
+        ),
+    )
     return outcome
 
 engine.OPERATIONS["profile"] = attack
@@ -98,23 +165,54 @@ def _attack(tmp_path: Path, **settings: Any) -> tuple[dict[str, str], dict[str, 
     secret.write_text("token\nhunter2\n", encoding="utf-8")
     outside = tmp_path / "outside"
     outside.mkdir()
-    targets = {
-        "source": source,
-        "secret": secret,
-        "outside_file": outside / "escape.txt",
-        "copy_target": outside / "copy.csv",
-    }
-    client = _CompromisedWorker(Settings(state_dir=tmp_path / "state", **settings))
-    payload = {
-        "limits": client.limits(30),
-        "path": str(source),
-        "kind": "csv",
-        "attack": {key: str(value) for key, value in targets.items()},
-    }
-    return client.call("profile", payload, deadline_seconds=30), targets
+    with contextlib.ExitStack() as stack:
+        # Test-owned listeners: a pathname Unix socket standing in for /var/run/docker.sock,
+        # and loopback UDP and TCP endpoints. Each records whether anything reached it.
+        unix_path = outside / "ctl.sock"
+        unix_listener = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+        unix_listener.bind(str(unix_path))
+        unix_listener.listen(1)
+        unix_listener.setblocking(False)
+        udp = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+        udp.bind(("127.0.0.1", 0))
+        udp.setblocking(False)
+        tcp = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+        tcp.bind(("127.0.0.1", 0))
+        tcp.listen(1)
+        tcp.setblocking(False)
+        targets: dict[str, Any] = {
+            "source": source,
+            "secret": secret,
+            "outside_file": outside / "escape.txt",
+            "copy_target": outside / "copy.csv",
+            "unix_socket": unix_path,
+            "udp_port": udp.getsockname()[1],
+            "tcp_port": tcp.getsockname()[1],
+            "server_pid": os.getpid(),
+        }
+        client = _CompromisedWorker(Settings(state_dir=tmp_path / "state", **settings))
+        payload = {
+            "limits": client.limits(30),
+            "path": str(source),
+            "kind": "csv",
+            "attack": {key: str(value) for key, value in targets.items()},
+        }
+        outcome = client.call("profile", payload, deadline_seconds=30)
+        received = {"unix": False, "udp": False, "tcp": False}
+        with contextlib.suppress(BlockingIOError):
+            unix_listener.accept()[0].close()
+            received["unix"] = True
+        with contextlib.suppress(BlockingIOError):
+            udp.recvfrom(64)
+            received["udp"] = True
+        with contextlib.suppress(BlockingIOError):
+            tcp.accept()[0].close()
+            received["tcp"] = True
+        targets["received"] = received
+    return outcome, targets
 
 
-@linux_only
+@requires_confinement
 def test_compromised_worker_cannot_write_or_read_outside_its_allowed_paths(
     tmp_path: Path,
 ) -> None:
@@ -133,12 +231,67 @@ def test_compromised_worker_cannot_write_or_read_outside_its_allowed_paths(
     assert targets["source"].read_text(encoding="utf-8") == "value\n1\n"
 
 
+@requires_confinement
+def test_compromised_worker_cannot_reach_sockets_processes_or_exec(tmp_path: Path) -> None:
+    """Escapes outside Landlock's filesystem rules (review of PR #25, P1 and P2)."""
+
+    outcome, targets = _attack(tmp_path)
+
+    # seccomp: no socket of any address family can be created, so a pathname Unix socket
+    # (docker.sock), UDP, and TCP are unreachable whatever the Landlock ABI.
+    for name in ("unix_connect", "udp_send", "tcp_connect", "socketpair"):
+        assert outcome[name].startswith("denied:PermissionError"), (name, outcome[name])
+    assert targets["received"] == {"unix": False, "udp": False, "tcp": False}
+    # seccomp: no new program, no child process, and the death signal stays armed.
+    assert outcome["execve"].startswith("denied:PermissionError")
+    assert outcome["fork"].startswith("denied:PermissionError")
+    assert outcome["clear_death_signal"].startswith("denied:")
+    # seccomp (any ABI) and Landlock scoping (ABI 6+): no signal to the server.
+    assert outcome["signal_server"].startswith("denied:PermissionError")
+    # Landlock: the server's /proc entry is outside the read allowlist.
+    assert outcome["read_server_proc"].startswith("denied:PermissionError")
+    # Landlock: scratch grants no symlink creation, and a hardlink cannot cross the boundary.
+    assert outcome["symlink_plant"].startswith("denied:PermissionError")
+    assert outcome["hardlink_secret"].startswith("denied:")
+
+
 @linux_only
 def test_sandbox_off_is_an_explicit_opt_out(tmp_path: Path) -> None:
     outcome, targets = _attack(tmp_path, data_plane_sandbox="off")
 
     assert outcome["python_write_outside"] == "allowed"
     assert targets["outside_file"].exists()
+    assert outcome["unix_connect"] == "allowed"
+
+
+@requires_confinement
+def test_read_root_covering_a_protected_root_fails_closed(tmp_path: Path) -> None:
+    """A workspace or state directory under a runtime read root would be readable (P2)."""
+
+    # The interpreter prefix is a runtime read root; authorizing a workspace there would let
+    # the read allowlist cover it, so the worker must refuse to start rather than expose it.
+    client = DataPlaneClient(
+        Settings(state_dir=tmp_path / "state", allowed_workspace_roots=[Path(sys.prefix)])
+    )
+    policy = client.sandbox_policy({}, tmp_path)
+    assert os.path.realpath(sys.prefix) in policy.protected_roots
+    with pytest.raises(DataPlaneError) as caught:
+        client.call("profile", {"limits": client.limits(10)}, deadline_seconds=10)
+    assert caught.value.category == "sandbox_unavailable"
+    message = str(caught.value)
+    assert sys.prefix not in message and str(tmp_path) not in message
+
+
+def test_protected_root_check_rejects_ancestors_and_equal_paths() -> None:
+    from agentic_analytics.dataplane import sandbox as sandbox_module
+
+    check = sandbox_module.check_protected_roots
+    check(["/usr", "/srv/venv"], ["/srv/app/workspace", "/var/state"])  # disjoint: fine
+    check(["/srv/app/workspace/.venv"], ["/srv/app/workspace"])  # a descendant only
+    check(["/usr"], ["/usrdata"])  # a shared prefix is not an ancestor
+    for read_root, protected in (("/usr", "/usr/src/app"), ("/srv/s", "/srv/s"), ("/", "/a")):
+        with pytest.raises(sandbox_module.SandboxUnavailable):
+            check([read_root], [protected])
 
 
 def test_required_sandbox_fails_closed_without_landlock(
@@ -289,3 +442,45 @@ def test_policy_grants_only_the_operation_paths(tmp_path: Path) -> None:
     assert policy.write_dirs == (str(tmp_path / "scratch"), str(spill.parent))
     assert json.loads(json.dumps(policy.to_json())) == policy.to_json()
     assert sandbox_module.SandboxPolicy.from_json(policy.to_json()) == policy
+
+
+@requires_confinement
+def test_symlink_swapped_in_for_an_authorized_source_fails_closed(tmp_path: Path) -> None:
+    """The worker grants the source without following a final symlink (P3)."""
+
+    secret = tmp_path / "secret.csv"
+    secret.write_text("token\nhunter2\n", encoding="utf-8")
+    swapped = tmp_path / "data.csv"
+    swapped.symlink_to(secret)
+    client = DataPlaneClient(Settings(state_dir=tmp_path / "state"))
+    payload = {"limits": client.limits(10), "path": str(swapped), "kind": "csv"}
+    with pytest.raises(DataPlaneError) as caught:
+        client.call("profile", payload, deadline_seconds=10)
+    assert caught.value.category == "sandbox_unavailable"
+    assert "hunter2" not in str(caught.value)
+
+
+@pytest.mark.parametrize("machine", ["x86_64", "aarch64"])
+def test_seccomp_program_is_well_formed_for_each_supported_architecture(machine: str) -> None:
+    """Structural check; aarch64 is not executed in CI, so its table is checked here."""
+
+    from agentic_analytics.dataplane import sandbox as sandbox_module
+
+    program = sandbox_module.seccomp_program(machine, 4242)
+    assert 0 < len(program) < 4096
+    ret, jumps = 0x06, {0x15, 0x35, 0x45}
+    for index, (code, jt, jf, _k) in enumerate(program):
+        if code in jumps:  # every branch lands inside the program
+            assert index + 1 + max(jt, jf) < len(program)
+    # The architecture is checked first and a mismatch kills; the default is allow.
+    audit_arch = sandbox_module._SECCOMP_ARCHES[machine][0]
+    assert program[0] == (0x20, 0, 0, 4)
+    assert program[1] == (0x15, 1, 0, audit_arch)
+    assert program[2] == (ret, 0, 0, 0x80000000)
+    assert program[-1] == (ret, 0, 0, 0x7FFF0000)
+    numbers = sandbox_module._SECCOMP_ARCHES[machine][1]
+    for name in sandbox_module._SECCOMP_DENY:
+        assert name in numbers or name in {"fork", "vfork"}
+    assert len(set(numbers.values())) == len(numbers)  # no copy-paste duplicates
+    with pytest.raises(sandbox_module.SandboxUnavailable):
+        sandbox_module.seccomp_program("riscv64", 4242)

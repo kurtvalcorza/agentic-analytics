@@ -5,11 +5,13 @@ already-authorized absolute paths and validated, rewritten SQL, and only reads b
 JSON response. A worker that crashes, exhausts its memory, hangs, or floods its output is killed
 and reported as a failed operation; the MCP server process is never affected.
 
-The worker runs as the server's OS user, but on Linux it confines itself with Landlock before
-DuckDB is loaded: it can read only the runtime, the operation's authorized source files, and
-write only its private scratch directory and the operation's own output directory. Code running
-inside a compromised worker therefore cannot reach the workspace, server state, or other
-sessions' archives. The worker also exits when the server does. See ``sandbox.py``.
+The worker runs as the server's OS user, but on Linux it confines itself with Landlock and a
+seccomp filter before DuckDB is loaded: it can read only the runtime and the operation's
+authorized source files, write only its private scratch directory and the operation's own
+output directory, and open no socket, run no program, and start no child process. Code running
+inside a compromised worker therefore cannot reach the workspace, server state, other sessions'
+archives, the Docker socket, or the network. The worker also exits when the server does. See
+``sandbox.py``.
 """
 
 from __future__ import annotations
@@ -77,7 +79,9 @@ class DataPlaneClient:
     # Seconds allowed beyond an operation's own deadline before the worker is killed.
     kill_grace_seconds = _KILL_GRACE_SECONDS
     # Ask the kernel to kill the worker when the server exits (Linux PR_SET_PDEATHSIG). The
-    # portable watchdog runs regardless; tests turn this off to exercise the watchdog alone.
+    # worker starts its portable parent-polling watchdog only when the death signal could not
+    # be armed (macOS, Windows, a failed prctl, or this flag off); tests turn the flag off to
+    # exercise the watchdog alone.
     parent_death_signal = True
 
     def __init__(self, settings: Settings) -> None:
@@ -124,7 +128,23 @@ class DataPlaneClient:
             mode=self.settings.data_plane_sandbox,
             read_files=tuple(read_files),
             write_dirs=tuple(write_dirs),
+            protected_roots=self.protected_roots(),
         )
+
+    def protected_roots(self) -> tuple[str, ...]:
+        """Directories no sandbox grant may cover: workspaces, server state, and archives.
+
+        The archive root and the data-plane scratch root live inside ``state_dir``.
+        """
+
+        settings = self.settings
+        roots = [
+            *settings.allowed_workspace_roots,
+            settings.workspace_base_dir,
+            settings.state_dir,
+            settings.state_dir / "artifacts",
+        ]
+        return tuple(dict.fromkeys(os.path.realpath(root) for root in roots))
 
     @staticmethod
     def worker_command() -> list[str]:
@@ -173,6 +193,9 @@ class DataPlaneClient:
         while a descendant still holds the pipes), so a recycled group id is never targeted.
         """
 
+        # PR_SET_PDEATHSIG fires when the *thread* that forked the worker exits, not the whole
+        # server process. This thread therefore must outlive the worker: it blocks in
+        # proc.wait() below until the worker is reaped, and must keep doing so.
         proc = subprocess.Popen(
             self.worker_command(),
             stdin=subprocess.PIPE,

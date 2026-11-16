@@ -117,6 +117,12 @@ _FIXED_MESSAGES = {
         "temporary spill, data_plane_max_file_bytes per file, or a full disk); the operation "
         "needed more temporary or output space than allowed"
     ),
+    "sandbox_unavailable": (
+        "data-plane worker could not confine itself (it needs Linux Landlock and seccomp, a "
+        "supported CPU architecture, authorized sources that are still regular files, and no "
+        "runtime read location that covers a workspace or the server state directory). Set "
+        "AGENTIC_ANALYTICS_DATA_PLANE_SANDBOX=off to run without confinement"
+    ),
 }
 
 
@@ -142,12 +148,16 @@ def main() -> int:
         # Privilege isolation next, still single-threaded and before DuckDB is imported.
         sandbox.enter(sandbox.SandboxPolicy.from_json(request.get("sandbox", {})))
     except (sandbox.SandboxUnavailable, OSError) as exc:
+        # The detail can name server paths, so the response carries fixed text; the detail goes
+        # to stderr (drained, not returned) for anyone running the worker by hand.
+        sys.stderr.write(f"sandbox_unavailable: {exc}\n"[:_MAX_MESSAGE_CHARS])
+        sys.stderr.flush()
         _respond(
             {
                 "error": {
                     "category": "sandbox_unavailable",
                     "type": type(exc).__name__,
-                    "message": str(exc)[:_MAX_MESSAGE_CHARS],
+                    "message": _FIXED_MESSAGES["sandbox_unavailable"],
                 }
             }
         )
