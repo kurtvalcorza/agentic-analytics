@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeGuard
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
+from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.models import (
     READABLE_SOURCE_KINDS,
     AnalysisSession,
@@ -14,7 +15,6 @@ from agentic_analytics.models import (
     ValidationFinding,
     ValidationSeverity,
 )
-from agentic_analytics.services.inspector import fingerprint_file
 from agentic_analytics.services.workspace import WorkspaceAuthorizationError, WorkspaceService
 
 _SUPPORTED_TABULAR = READABLE_SOURCE_KINDS

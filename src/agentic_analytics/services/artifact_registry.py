@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agentic_analytics.integrity import sha256_file
 from agentic_analytics.layout import ARCHIVE_DIR_NAME, INTERNAL_DIR_NAME
 from agentic_analytics.models import Artifact, ArtifactKind
 from agentic_analytics.repositories import ArtifactRepository
@@ -59,18 +60,6 @@ class FileMeta:
     @classmethod
     def of(cls, info: os.stat_result) -> FileMeta:
         return cls(info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev)
-
-
-def _sha256(path: Path) -> tuple[str, int]:
-    """Return the digest and byte count of exactly the bytes read in one pass."""
-
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(_CHUNK), b""):
-            digest.update(chunk)
-            size += len(chunk)
-    return digest.hexdigest(), size
 
 
 def _private_mkdir(path: Path) -> None:
@@ -210,7 +199,7 @@ class ArtifactRegistry:
             )
         # Hash outside the lock (it can be expensive) then reserve budget and persist atomically.
         # Size and digest describe the same single read of the archived bytes.
-        sha256, size_bytes = _sha256(resolved)
+        sha256, size_bytes, _ = sha256_file(resolved)
         if size_bytes > self.max_artifact_bytes:
             raise ArtifactLimitError(
                 f"artifact {resolved.name} is {size_bytes} bytes; per-file limit is "

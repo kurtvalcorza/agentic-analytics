@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
 from agentic_analytics.ids import EntityType, new_id
+from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.models import (
     AnalysisSession,
     ExecutionRecord,
@@ -22,7 +23,6 @@ from agentic_analytics.repositories import ExecutionRepository, SourceRepository
 from agentic_analytics.settings import Settings
 
 from .artifact_registry import ArtifactLimitError, ArtifactRegistry
-from .inspector import fingerprint_file
 from .sql_tokens import SqlToken, tokenize_sql
 from .workspace import WorkspaceService
 

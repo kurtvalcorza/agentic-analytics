@@ -13,6 +13,7 @@ from agentic_analytics.execution_backends.output_quota import (
     remove_outputs,
 )
 from agentic_analytics.ids import EntityType, new_id
+from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.layout import scratch_dir
 from agentic_analytics.models import (
     AnalysisSession,
@@ -27,7 +28,6 @@ from agentic_analytics.repositories import ExecutionRepository, SourceRepository
 from agentic_analytics.settings import Settings
 
 from .artifact_registry import ArtifactRegistry, snapshot_workspace
-from .inspector import fingerprint_file
 from .workspace import WorkspaceService
 
 
