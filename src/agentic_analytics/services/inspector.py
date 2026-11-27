@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
-from agentic_analytics.models import AnalysisSession, DataSource, SourceKind
+from agentic_analytics.models import (
+    READABLE_SOURCE_SUFFIXES,
+    AnalysisSession,
+    DataSource,
+    SourceKind,
+)
 from agentic_analytics.repositories import SourceRepository
 from agentic_analytics.settings import Settings
 
@@ -44,10 +49,9 @@ class InspectorService:
         path = self.workspace.resolve_file(session.workspace_root, source_path)
         if path.stat().st_size == 0:
             raise SourceInspectionError("source is empty")
-        suffix = path.suffix.lower()
-        if suffix not in {".csv", ".parquet"}:
+        kind = READABLE_SOURCE_SUFFIXES.get(path.suffix.lower())
+        if kind is None:
             raise SourceInspectionError("only CSV and Parquet sources are supported")
-        kind = SourceKind.CSV if suffix == ".csv" else SourceKind.PARQUET
         relative_path = self.workspace.relative_to_workspace(session.workspace_root, path)
         fingerprint = fingerprint_file(path)
         try:

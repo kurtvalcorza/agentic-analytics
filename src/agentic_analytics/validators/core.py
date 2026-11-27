@@ -7,17 +7,17 @@ from typing import Any, Protocol, TypeGuard
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
 from agentic_analytics.models import (
+    READABLE_SOURCE_KINDS,
     AnalysisSession,
     DataSource,
     EvidenceItem,
-    SourceKind,
     ValidationFinding,
     ValidationSeverity,
 )
 from agentic_analytics.services.inspector import fingerprint_file
 from agentic_analytics.services.workspace import WorkspaceAuthorizationError, WorkspaceService
 
-_SUPPORTED_TABULAR = {SourceKind.CSV, SourceKind.PARQUET}
+_SUPPORTED_TABULAR = READABLE_SOURCE_KINDS
 # Source-format, filesystem, resource, timeout, and worker-crash failures make a data check
 # incomplete (inconclusive). SQL programming errors are raised as caller errors instead.
 
