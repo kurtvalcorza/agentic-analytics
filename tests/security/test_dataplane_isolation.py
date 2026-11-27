@@ -455,6 +455,38 @@ def test_stale_scratch_directories_are_swept(tmp_path: Path) -> None:
     assert fresh.exists()
 
 
+def test_worker_error_text_is_redacted_before_it_leaves_the_client(tmp_path: Path) -> None:
+    # The fake worker echoes the request's own paths in its error, as DuckDB does when it
+    # quotes the rewritten SQL. None of them may reach the public message.
+    script = """
+    import json, sys
+    request = json.loads(sys.stdin.buffer.read())
+    payload = request["payload"]
+    message = (
+        "IO Error: could not read " + payload["path"]
+        + " (temp " + payload["limits"]["temp_directory"] + ")"
+    )
+    print(json.dumps({"error": {"category": "source_read", "type": "IOException",
+                                "message": message}}))
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "sales.csv"
+    client = _fake(tmp_path, script, allowed_workspace_roots=[workspace])
+
+    with pytest.raises(DataPlaneError) as caught:
+        client.call(
+            "profile", {"limits": client.limits(5), "path": str(source)}, deadline_seconds=5
+        )
+
+    public = str(caught.value)
+    assert caught.value.category == "source_read"
+    assert str(tmp_path) not in public
+    assert "could not read sales.csv" in public
+    assert "<path>/duckdb" in public
+    assert caught.value.detail is not None and str(source) in caught.value.detail
+
+
 # --- review follow-ups (PR 20) -------------------------------------------------------------
 
 
