@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import os
 import shutil
@@ -35,6 +36,8 @@ from agentic_analytics.settings import Settings
 
 from .sandbox import SandboxPolicy
 
+_log = logging.getLogger(__name__)
+
 # Seconds allowed beyond an operation's own deadline before the worker is killed. Covers
 # interpreter start-up and the worker's graceful in-process interrupt.
 _KILL_GRACE_SECONDS = 10.0
@@ -46,15 +49,57 @@ _STALE_SCRATCH_SECONDS = 24 * 3600
 class DataPlaneError(RuntimeError):
     """A data-plane operation failed. ``category`` is stable; ``error_type`` is diagnostic.
 
+    ``str(error)`` is the public message: safe to return to MCP clients and to store in
+    execution records, because server paths are already redacted from it. ``detail`` holds the
+    worker's raw text for server-side logs only; never return it to a client.
+
     Categories: ``timeout``, ``out_of_memory``, ``disk_limit``, ``spill_limit``,
     ``source_read``, ``sql``, ``crashed``, ``response_too_large``, ``sandbox_unavailable``,
     ``internal``.
     """
 
-    def __init__(self, category: str, error_type: str, message: str) -> None:
+    def __init__(
+        self, category: str, error_type: str, message: str, *, detail: str | None = None
+    ) -> None:
         super().__init__(message or f"data-plane worker failed ({category})")
         self.category = category
         self.error_type = error_type
+        self.detail = detail
+
+
+_REDACTED_ROOT = "<path>"
+
+
+def _absolute_strings(value: Any) -> list[str]:
+    """Every absolute-path string anywhere in a request payload."""
+
+    if isinstance(value, str):
+        return [value] if os.path.isabs(value) else []
+    if isinstance(value, dict):
+        return [found for item in value.values() for found in _absolute_strings(item)]
+    if isinstance(value, (list, tuple)):
+        return [found for item in value for found in _absolute_strings(item)]
+    return []
+
+
+def redact_paths(message: str, files: list[str], roots: list[str]) -> str:
+    """Replace server paths in ``message``: a file by its name, a root by ``<path>``.
+
+    DuckDB quotes SQL literals with doubled single quotes, so each path is also matched in that
+    form. Longer paths are replaced first, so a file is named before its directory is redacted.
+    """
+
+    replacements: dict[str, str] = {}
+    for root in roots:
+        replacements[root] = _REDACTED_ROOT
+    for path in files:
+        replacements[path] = Path(path).name or _REDACTED_ROOT
+    for original, public in list(replacements.items()):
+        replacements.setdefault(original.replace("'", "''"), public)
+    for original in sorted(replacements, key=len, reverse=True):
+        if original and original not in {"/", os.sep}:
+            message = message.replace(original, replacements[original])
+    return message
 
 
 def _read_bounded(
@@ -146,6 +191,20 @@ class DataPlaneClient:
             archive_dir(settings.state_dir),
         ]
         return tuple(dict.fromkeys(os.path.realpath(root) for root in roots))
+
+    def _redaction_roots(self, workdir: Path) -> list[str]:
+        """Server directories never named in a public message, as given and as resolved."""
+
+        settings = self.settings
+        given = [
+            *settings.allowed_workspace_roots,
+            settings.workspace_base_dir,
+            settings.state_dir,
+            self.work_root,
+            workdir,
+        ]
+        roots = [str(Path(root).expanduser().absolute()) for root in given]
+        return list(dict.fromkeys([*roots, *self.protected_roots(), str(workdir.resolve())]))
 
     @staticmethod
     def worker_command() -> list[str]:
@@ -278,6 +337,8 @@ class DataPlaneClient:
             self._sweep_stale()
             self._swept = True
         workdir = Path(tempfile.mkdtemp(prefix=f"{op}-", dir=self.work_root))
+        # Collected before the scratch temp_directory is added: it sits under workdir, a root.
+        request_files = _absolute_strings(payload)
         try:
             payload = dict(payload)
             payload["limits"] = {**payload["limits"], "temp_directory": str(workdir / "duckdb")}
@@ -320,11 +381,13 @@ class DataPlaneClient:
                 )
             if "error" in response:
                 error = response["error"]
-                raise DataPlaneError(
-                    str(error.get("category", "internal")),
-                    str(error.get("type", "Error")),
-                    str(error.get("message", "")),
-                )
+                category = str(error.get("category", "internal"))
+                error_type = str(error.get("type", "Error"))
+                raw = str(error.get("message", ""))
+                # DuckDB errors can quote the rewritten SQL and so the absolute source path.
+                public = redact_paths(raw, request_files, self._redaction_roots(workdir))
+                _log.debug("data-plane %s failed (%s, %s): %s", op, category, error_type, raw)
+                raise DataPlaneError(category, error_type, public, detail=raw)
             result = response.get("result")
             if not isinstance(result, dict):
                 raise DataPlaneError("internal", "MalformedResponse", "malformed worker response")
