@@ -1,4 +1,7 @@
-"""Shared SQL-side cell limits for model-facing query and inspection previews."""
+"""SQL-side cell limits for model-facing query and inspection previews.
+
+Runs inside the confined data-plane worker; imports nothing from the server's service layer.
+"""
 
 from __future__ import annotations
 
@@ -16,9 +19,13 @@ _TEXT = {"VARCHAR", "CHAR", "BPCHAR", "TEXT", "STRING"}
 _BLOB = {"BLOB", "BYTEA", "VARBINARY"}
 
 
+def sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
 def cell_bound_expr(name: str, sql_type: str, cell_cap: int) -> str:
     """Bound strings, blobs, and nested values before crossing the Python boundary."""
-    ident = '"' + name.replace('"', '""') + '"'
+    ident = sql_identifier(name)
     upper = sql_type.upper()
     if _SMALL_SCALAR.fullmatch(upper):
         return ident
