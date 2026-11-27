@@ -7,7 +7,7 @@ Run the reference MCP server locally, connect any MCP-capable coding agent, and 
 ## 1. Install development environment
 
 ```bash
-uv sync --all-extras
+uv sync --frozen --extra dev
 ```
 
 Build the strict-mode execution image:
@@ -18,30 +18,39 @@ docker build -t agentic-analytics-exec:dev -f docker/Dockerfile.exec .
 
 ## 2. Start the MCP server
 
-```bash
-uv run agentic-analytics serve --transport stdio
-```
-
-For clients that require streamable HTTP:
+The server speaks MCP over stdio; the command takes no arguments. By default the current directory is the authorized workspace, so start it from the folder that holds your CSV/Parquet data:
 
 ```bash
-uv run agentic-analytics serve --transport streamable-http --host 127.0.0.1 --port 8765
+cd /path/to/your/data
+uv run --project /path/to/agentic-analytics agentic-analytics
 ```
+
+Streamable HTTP transport is not implemented yet.
 
 ## 3. Configure an MCP client
 
-Point the host at either:
+Point the host at the stdio command `agentic-analytics`, and authorize the data directories through the environment (see README, Quickstart):
 
-- the local stdio command `uv run agentic-analytics serve --transport stdio`; or
-- the configured local streamable HTTP endpoint.
+```json
+{
+  "mcpServers": {
+    "agentic-analytics": {
+      "command": "agentic-analytics",
+      "env": {
+        "AGENTIC_ANALYTICS_ALLOWED_WORKSPACE_ROOTS": "[\"/path/to/your/data\"]"
+      }
+    }
+  }
+}
+```
 
 No host-specific adapter is required for correctness.
 
 ## 4. Reference workflow
 
-Ask the coding agent:
+Ask the coding agent, with a survey CSV in the authorized workspace:
 
-> Inspect `tests/fixtures/survey.csv`. Report the share of respondents with positive adoption intent, break it down by organization type, create one chart, register the key findings as evidence, and validate the final claims. Do not use causal language.
+> Inspect `survey.csv`. Report the share of respondents with positive adoption intent, break it down by organization type, create one chart, register the key findings as evidence, and validate the final claims. Do not use causal language.
 
 A correct host-independent tool sequence will usually include:
 
@@ -54,24 +63,15 @@ A correct host-independent tool sequence will usually include:
 
 The exact planning order may differ by host. Correctness is judged from resulting execution, evidence, artifact, and validation records—not from matching a prescribed hidden sequence.
 
-## 5. Run protocol conformance
+## 5. Protocol conformance
+
+A standalone conformance script is planned but not implemented. Until then, `tests/protocol` covers host-neutral tool schemas, source discovery and bounded queries, result completeness, evidence lineage, validation blockers and session/workspace isolation; managed execution and artifact registration are covered in `tests/scenarios` and `tests/security`:
 
 ```bash
-uv run python scripts/conformance.py
+uv run pytest tests/protocol tests/scenarios
 ```
 
-Expected result:
-
-```text
-PASS tool discovery
-PASS source inspection
-PASS bounded query
-PASS managed execution
-PASS artifact registration
-PASS evidence lineage
-PASS validation blocker fixture
-PASS cross-session authorization
-```
+The data-plane tests need Linux with Landlock, and the managed-execution tests need Docker and an `agentic-analytics-exec:test` image (see README, Development).
 
 ## 6. Strict versus permissive mode
 
@@ -93,18 +93,6 @@ Host-native execution may be registered through `register_external_execution`, b
 
 ## 7. Expected session outputs
 
-```text
-.agentic-analytics/
-└── sessions/
-    └── ses_.../
-        ├── manifest.json
-        ├── sources.jsonl
-        ├── executions.jsonl
-        ├── evidence.jsonl
-        ├── findings.jsonl
-        ├── artifacts.jsonl
-        ├── generated/
-        └── reports/
-```
+Server state lives under `.agentic-analytics/state/` (setting `AGENTIC_ANALYTICS_STATE_DIR`): one directory per session (`ses_.../`), holding a subdirectory of JSON records per record type, plus a `locks/` directory. Managed outputs are written to the workspace's `outputs/`.
 
 The exact internal persistence layout is not part of the public MCP contract and may change behind repository interfaces.
