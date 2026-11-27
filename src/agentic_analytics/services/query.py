@@ -255,9 +255,7 @@ class QueryService:
                 "partial result because require_complete was set. Aggregate or filter the "
                 "query, or raise AGENTIC_ANALYTICS_MAX_SPILL_ROWS."
             )
-            self._persist_failure(
-                session, normalized, limit, source_ids, fingerprints, incomplete
-            )
+            self._persist_failure(session, normalized, limit, source_ids, fingerprints, incomplete)
             raise incomplete
         artifact_rows = min(materialized, spill_cap)
 

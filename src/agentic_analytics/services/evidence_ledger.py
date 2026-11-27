@@ -103,12 +103,10 @@ class EvidenceLedger:
             for execution_id in item.execution_ids
         ]
         artifacts = [
-            self.artifacts.get(item.session_id, artifact_id)
-            for artifact_id in item.artifact_ids
+            self.artifacts.get(item.session_id, artifact_id) for artifact_id in item.artifact_ids
         ]
         upstream_evidence = [
-            self.evidence.get(item.session_id, evidence_id)
-            for evidence_id in item.evidence_ids
+            self.evidence.get(item.session_id, evidence_id) for evidence_id in item.evidence_ids
         ]
 
         if item.classification is EvidenceClassification.DERIVED_FACT:
@@ -182,8 +180,5 @@ class EvidenceLedger:
             and (material is None or item.material is material)
             and (source_id is None or source_id in item.source_ids)
             and (execution_id is None or execution_id in item.execution_ids)
-            and (
-                upstream_evidence_id is None
-                or upstream_evidence_id in item.evidence_ids
-            )
+            and (upstream_evidence_id is None or upstream_evidence_id in item.evidence_ids)
         ]

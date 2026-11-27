@@ -4,10 +4,22 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # One PR for all action bumps: they only swap pinned SHAs in quality.yml.
+      github-actions:
+        patterns: ["*"]
   - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly
+    # Update uv.lock only; never raise the floors in pyproject.toml. A release outside a
+    # declared range (e.g. a new major past an upper cap) gets no PR and is upgraded by hand.
+    versioning-strategy: lockfile-only
+    groups:
+      # Every uv PR rewrites uv.lock, so separate PRs conflict with each other once one lands.
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
   - package-ecosystem: docker
     directory: /docker
     schedule:

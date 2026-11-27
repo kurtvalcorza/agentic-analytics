@@ -82,7 +82,8 @@ async def test_query_reports_full_result_completeness(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("rows", "complete", "artifact_rows"), [(6, True, None), (20, False, 10)],
+    ("rows", "complete", "artifact_rows"),
+    [(6, True, None), (20, False, 10)],
     ids=["fits-preview", "overflows-both"],
 )
 async def test_spill_cap_below_preview_limit_stays_consistent(

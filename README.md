@@ -66,7 +66,7 @@ The runtime exposes a versioned MCP tool surface over a host-neutral core:
 - **Validation** — `validate_analysis` runs deterministic checks (evidence coverage, stale sources, duplicates, missingness, denominator consistency, unsupported causal language) and returns bounded, provenance-linked findings. Only a run covering the full default baseline with no findings or inconclusive checks reports `validated`; a clean subset reports `partial`, and every response carries `coverage_complete` and an `assurance` statement.
 - **Large results** — query results that exceed the row or response-size budget spill to a Parquet artifact, with a bounded in-context preview derived from the same evaluation.
 
-Persistence is append-only and session-scoped, with atomic record publication, canonical typed IDs, and UTC-normalized timestamps. Quality gates (ruff, mypy, pytest, and the sandbox image build) run in CI.
+Persistence is append-only and session-scoped, with atomic record publication, canonical typed IDs, and UTC-normalized timestamps. Quality gates (ruff lint and format, mypy, pytest with an 85% coverage floor, and the sandbox image build and scan) run in CI.
 
 See `specs/001-agent-agnostic-analytical-runtime/` for the specification, plan, contracts, data model, and implementation task graph. The runtime is delivered as a stack of layered pull requests: runtime foundation → data plane → managed execution → evidence ledger → validation → large-data spill.
 
@@ -116,13 +116,14 @@ The remaining hardening work is tracked in the security-hardening RFC (issue #10
 
 Requires Python 3.12+.
 
-CI installs exactly the reviewed `uv.lock` (`uv sync --frozen`), pins GitHub Actions and the sandbox base image by digest, and runs a dependency vulnerability scan plus SBOM generation. To reproduce locally:
+CI installs exactly the reviewed `uv.lock` (`uv sync --frozen`), pins GitHub Actions and the sandbox base image by digest, and runs a dependency vulnerability scan plus SBOM generation. It enforces `ruff format` and a test coverage floor of 85%. Dependabot updates only `uv.lock` (grouped weekly); raising a version range in `pyproject.toml` is a deliberate change. To reproduce locally:
 
 ```bash
 uv sync --frozen --extra dev
 uv run ruff check .
+uv run ruff format --check .
 uv run mypy src
-uv run pytest
+uv run pytest --cov=agentic_analytics --cov-fail-under=85
 ```
 
 Without uv, `python -m pip install -e '.[dev]'` installs from the version ranges in `pyproject.toml` instead of the lockfile.

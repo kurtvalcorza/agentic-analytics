@@ -27,9 +27,7 @@ from agentic_analytics.services.evidence_ledger import (
 )
 
 
-def _ledger(tmp_path: Path) -> tuple[
-    EvidenceLedger, SourceRepository, ExecutionRepository
-]:
+def _ledger(tmp_path: Path) -> tuple[EvidenceLedger, SourceRepository, ExecutionRepository]:
     sources = SourceRepository(tmp_path)
     executions = ExecutionRepository(tmp_path)
     ledger = EvidenceLedger(
@@ -84,9 +82,7 @@ def test_interpretation_requires_same_session_upstream_evidence(tmp_path: Path) 
     session_a = AnalysisSession(workspace_root=str(tmp_path))
     session_b = AnalysisSession(workspace_root=str(tmp_path))
     source = sources.add(_source(session_a.id))
-    execution = executions.add(
-        _execution(session_a.id, source.id, ExecutionStatus.SUCCEEDED)
-    )
+    execution = executions.add(_execution(session_a.id, source.id, ExecutionStatus.SUCCEEDED))
     fact = ledger.register(
         session_a.id,
         EvidenceClassification.DERIVED_FACT,
@@ -168,15 +164,24 @@ def test_derived_fact_rejects_artifact_from_unrelated_execution(
     cited = executions.add(_execution(session.id, source.id, ExecutionStatus.SUCCEEDED))
     artifact = ledger.artifacts.add(
         Artifact(
-            session_id=session.id, execution_id=origin.id, kind=ArtifactKind.TABLE,
-            display_name="result", relative_path="result.csv", media_type="text/csv",
-            size_bytes=10, sha256="a" * 64,
+            session_id=session.id,
+            execution_id=origin.id,
+            kind=ArtifactKind.TABLE,
+            display_name="result",
+            relative_path="result.csv",
+            media_type="text/csv",
+            size_bytes=10,
+            sha256="a" * 64,
         )
     )
     with pytest.raises(EvidenceRegistrationError, match="unlinked artifacts"):
         ledger.register(
-            session.id, EvidenceClassification.DERIVED_FACT, "The result is supported.",
-            source_ids=[source.id], execution_ids=[cited.id], artifact_ids=[artifact.id],
+            session.id,
+            EvidenceClassification.DERIVED_FACT,
+            "The result is supported.",
+            source_ids=[source.id],
+            execution_ids=[cited.id],
+            artifact_ids=[artifact.id],
         )
     assert ledger.list(session.id) == []
 
@@ -188,22 +193,35 @@ def test_derived_fact_requires_bidirectional_artifact_link(tmp_path: Path) -> No
     execution = _execution(session.id, source.id, ExecutionStatus.SUCCEEDED)
     artifact = ledger.artifacts.add(
         Artifact(
-            session_id=session.id, execution_id=execution.id, kind=ArtifactKind.TABLE,
-            display_name="result", relative_path="result.csv", media_type="text/csv",
-            size_bytes=10, sha256="a" * 64,
+            session_id=session.id,
+            execution_id=execution.id,
+            kind=ArtifactKind.TABLE,
+            display_name="result",
+            relative_path="result.csv",
+            media_type="text/csv",
+            size_bytes=10,
+            sha256="a" * 64,
         )
     )
     executions.add(execution)
     with pytest.raises(EvidenceRegistrationError, match="unlinked artifacts"):
         ledger.register(
-            session.id, EvidenceClassification.DERIVED_FACT, "The result is supported.",
-            source_ids=[source.id], execution_ids=[execution.id], artifact_ids=[artifact.id],
+            session.id,
+            EvidenceClassification.DERIVED_FACT,
+            "The result is supported.",
+            source_ids=[source.id],
+            execution_ids=[execution.id],
+            artifact_ids=[artifact.id],
         )
     # A genuine runtime artifact appears in both canonical records.
     execution.artifact_ids = [artifact.id]
     executions.update(execution)
     accepted = ledger.register(
-        session.id, EvidenceClassification.DERIVED_FACT, "The result is supported.",
-        source_ids=[source.id], execution_ids=[execution.id], artifact_ids=[artifact.id],
+        session.id,
+        EvidenceClassification.DERIVED_FACT,
+        "The result is supported.",
+        source_ids=[source.id],
+        execution_ids=[execution.id],
+        artifact_ids=[artifact.id],
     )
     assert accepted.artifact_ids == [artifact.id]

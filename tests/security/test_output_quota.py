@@ -535,26 +535,10 @@ open('outputs/result.txt', 'w').write('small')
         assert not (workspace / "outputs" / "result.txt").exists()
 
 
-@docker
-@pytest.mark.xfail(
-    reason="known gap, documented: truncating the file frees tmpfs pages even while the "
-    "supervisor holds a descriptor, so fill + catch ENOSPC + truncate + exit 0 between two "
-    "samples is not reliably detected (the kernel quota still protects the host)",
-    strict=False,
-)
-def test_fill_catch_truncate_and_exit_zero_is_a_documented_gap(tmp_path: Path) -> None:
-    runtime, session, _ = _runtime(tmp_path, docker_output_quota_bytes=16 * 1024**2)
-    code = """
-try:
-    with open('outputs/fill.bin', 'wb') as stream:
-        while True:
-            stream.write(b'x' * 65536)
-except OSError:
-    pass
-open('outputs/fill.bin', 'w').close()
-"""
-    record = _run(runtime, session, code)
-    assert record.status is ExecutionStatus.FAILED
+# Not tested: fill + catch ENOSPC + truncate + exit 0 between two samples. Truncation frees
+# tmpfs pages even while the supervisor holds a descriptor, so detection is timing-dependent;
+# the gap is documented in README ("Detecting that the quota was hit is not sound in every
+# case") and the kernel quota still protects the host.
 
 
 @docker

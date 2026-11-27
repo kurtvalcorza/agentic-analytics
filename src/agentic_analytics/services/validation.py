@@ -67,7 +67,8 @@ class ValidationService:
             if previous is None or source.registered_at > previous.registered_at:
                 latest[location] = source
         return [
-            source for source in sources
+            source
+            for source in sources
             if source.id in referenced
             or source.registered_at == latest[(source.relative_path, source.uri)].registered_at
         ]
@@ -87,9 +88,7 @@ class ValidationService:
             if unknown:
                 # Reject unknown check selectors so a typo cannot silently skip every check
                 # and report success.
-                raise ValidationRequestError(
-                    f"unknown validation checks: {', '.join(unknown)}"
-                )
+                raise ValidationRequestError(f"unknown validation checks: {', '.join(unknown)}")
             selected = set(checks)
         else:
             selected = known
