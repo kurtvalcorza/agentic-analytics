@@ -24,7 +24,10 @@ def _runtime(tmp_path: Path, workspace: Path, *, timeout: int = 5) -> Runtime:
 def test_managed_execution_generates_hashed_artifacts(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    runtime = _runtime(tmp_path, workspace)
+    # Cold pandas + matplotlib imports in a fresh exec container take about 5 s on the
+    # Python 3.15 image, so this test needs headroom beyond the helper's 5 s cap (which
+    # also clamps the per-call timeout_seconds).
+    runtime = _runtime(tmp_path, workspace, timeout=30)
     session = AnalysisSession(workspace_root=str(workspace), mode=SessionMode.STRICT)
     runtime.sessions.add(session)
     code = """
@@ -38,7 +41,7 @@ plt.savefig('outputs/chart.png')
 print('done')
 """
     try:
-        record = runtime.execution.execute_python(session, code, timeout_seconds=10)
+        record = runtime.execution.execute_python(session, code, timeout_seconds=30)
         assert record.status.value == "succeeded", record.stderr_preview
         assert record.stdout_preview.strip() == "done"
         assert len(record.artifact_ids) == 2
