@@ -6,6 +6,8 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .layout import INTERNAL_DIR_NAME, archive_dir, dataplane_scratch_dir, scratch_dir
+
 _SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]i?b?|b|bytes)?\s*$", re.IGNORECASE)
 _UNITS = {"": 1, "b": 1, "bytes": 1}
 for _index, _prefix in enumerate("kmgt", start=1):
@@ -50,8 +52,8 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="AGENTIC_ANALYTICS_", extra="ignore")
 
-    state_dir: Path = Field(default=Path(".agentic-analytics/state"))
-    workspace_base_dir: Path = Field(default=Path(".agentic-analytics/workspaces"))
+    state_dir: Path = Field(default=Path(INTERNAL_DIR_NAME) / "state")
+    workspace_base_dir: Path = Field(default=Path(INTERNAL_DIR_NAME) / "workspaces")
     allowed_workspace_roots: list[Path] = Field(default_factory=lambda: [Path.cwd()])
     max_sample_rows: int = Field(default=100, ge=1, le=1000)
     max_query_rows: int = Field(default=200, ge=1, le=10_000)
@@ -143,6 +145,18 @@ class Settings(BaseSettings):
         if self.max_artifact_bytes > self.data_plane_max_file_bytes:
             raise ValueError("max_artifact_bytes must not exceed data_plane_max_file_bytes")
         return self
+
+    @property
+    def archive_dir(self) -> Path:
+        return archive_dir(self.state_dir)
+
+    @property
+    def scratch_dir(self) -> Path:
+        return scratch_dir(self.state_dir)
+
+    @property
+    def dataplane_scratch_dir(self) -> Path:
+        return dataplane_scratch_dir(self.state_dir)
 
     def normalized_allowed_roots(self) -> list[Path]:
         return [root.expanduser().resolve(strict=False) for root in self.allowed_workspace_roots]

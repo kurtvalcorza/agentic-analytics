@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import IO, Any
 from uuid import uuid4
 
+from agentic_analytics.layout import INTERNAL_DIR_NAME
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
 
 from .base import BackendResult
@@ -181,7 +182,7 @@ class DockerBackend:
     def _mount_args(
         self, workspace: Path, script: Path, readonly_paths: tuple[Path, ...]
     ) -> list[str]:
-        state = (self.protected_state_root or workspace / ".agentic-analytics" / "state").resolve()
+        state = (self.protected_state_root or workspace / INTERNAL_DIR_NAME / "state").resolve()
         if workspace.is_relative_to(state):
             raise DockerExecutionError("workspace must not be inside the protected state directory")
         outputs = self._outputs_dir(workspace)
@@ -195,7 +196,7 @@ class DockerBackend:
                 raise DockerExecutionError("read-only sources must be regular workspace files")
             if (
                 source.is_relative_to(state)
-                or source.relative_to(workspace).parts[0] == ".agentic-analytics"
+                or source.relative_to(workspace).parts[0] == INTERNAL_DIR_NAME
             ):
                 raise DockerExecutionError("read-only source overlaps protected runtime files")
             identity = self._identity(source)

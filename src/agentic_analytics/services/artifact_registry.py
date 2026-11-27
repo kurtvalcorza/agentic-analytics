@@ -8,10 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agentic_analytics.layout import ARCHIVE_DIR_NAME, INTERNAL_DIR_NAME
 from agentic_analytics.models import Artifact, ArtifactKind
 from agentic_analytics.repositories import ArtifactRepository
-
-_INTERNAL_DIR = ".agentic-analytics"
 
 _MEDIA_TYPES: dict[str, str] = {
     ".csv": "text/csv",
@@ -102,7 +101,7 @@ def snapshot_workspace(
         ):
             continue
         relative = path.relative_to(root)
-        if relative.parts and relative.parts[0] == _INTERNAL_DIR:
+        if relative.parts and relative.parts[0] == INTERNAL_DIR_NAME:
             continue
         snapshot[relative.as_posix()] = FileMeta.of(path.stat())
     return snapshot
@@ -327,7 +326,7 @@ class ArtifactRegistry:
                 lineage={
                     "original_relative_path": relative,
                     "change": "created" if relative not in before else "modified",
-                    "archive_root": _INTERNAL_DIR + "/artifacts",
+                    "archive_root": f"{INTERNAL_DIR_NAME}/{ARCHIVE_DIR_NAME}",
                 },
             )
             self.repository.add(artifact)

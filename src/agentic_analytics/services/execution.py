@@ -13,6 +13,7 @@ from agentic_analytics.execution_backends.output_quota import (
     remove_outputs,
 )
 from agentic_analytics.ids import EntityType, new_id
+from agentic_analytics.layout import scratch_dir
 from agentic_analytics.models import (
     AnalysisSession,
     ExecutionRecord,
@@ -109,7 +110,7 @@ class ExecutionService:
             before = snapshot_workspace(workspace_root, excluded_roots=(state_root,))
             # Never write executable code through a caller-controlled workspace path.
             # The Docker backend mounts this exact server-owned file read-only.
-            temp_dir = state_root / "tmp"
+            temp_dir = scratch_dir(state_root)
             temp_dir.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix=f"{execution_id}-", dir=temp_dir) as request:
                 script_path = Path(request) / "request.py"

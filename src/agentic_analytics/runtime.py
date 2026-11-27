@@ -62,7 +62,7 @@ class Runtime:
         inspector = InspectorService(sources, workspace, resolved, data_plane)
         registry = ArtifactRegistry(
             artifact_repository,
-            resolved.state_dir / "artifacts",
+            resolved.archive_dir,
             max_artifacts=resolved.max_artifacts_per_execution,
             max_artifact_bytes=resolved.max_artifact_bytes,
             max_total_bytes=resolved.max_total_artifact_bytes,
