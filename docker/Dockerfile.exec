@@ -1,5 +1,5 @@
 # Pinned by digest for reproducible, reviewable base-image updates (bump deliberately).
-FROM python:3.12-slim@sha256:4840d514c583a4d3d8cad3940e68dee6f0f6f3635c12fcd0a3d74c21a5b93a54
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -8,14 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MPLCONFIGDIR=/tmp/matplotlib
 
 RUN python -m pip install --no-cache-dir \
-    duckdb==1.5.5 \
-    matplotlib==3.11.1 \
+    duckdb==2.0.0 \
+    matplotlib==3.11.2 \
     numpy==2.5.2 \
-    pandas==3.0.5 \
-    pyarrow==23.0.1 \
-    scikit-learn==1.9.0 \
-    scipy==1.18.0 \
-    statsmodels==0.14.6
+    pandas==3.0.6 \
+    pyarrow==26.0.0 \
+    scikit-learn==1.9.1 \
+    scipy==1.18.1 \
+    statsmodels==0.15.0
 
 # Fixed unprivileged identity. The backend always passes an explicit non-root --user (the
 # server's own uid:gid on POSIX hosts, this identity elsewhere) and refuses uid 0.
