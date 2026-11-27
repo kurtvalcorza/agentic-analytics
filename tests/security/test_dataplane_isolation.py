@@ -507,9 +507,7 @@ def test_spill_write_failure_is_not_reported_as_source_read(tmp_path: Path) -> N
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     data = workspace / "data.parquet"
-    pq.write_table(
-        pa.table({"s": [os.urandom(64).hex() for _ in range(200_000)]}), data
-    )
+    pq.write_table(pa.table({"s": [os.urandom(64).hex() for _ in range(200_000)]}), data)
     archive = tmp_path / "archive"
     archive.mkdir()
     client = DataPlaneClient(

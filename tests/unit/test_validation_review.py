@@ -24,10 +24,13 @@ def _setup(tmp_path: Path) -> tuple[Runtime, AnalysisSession, Path]:
     workspace.mkdir()
     data = workspace / "data.csv"
     data.write_text("id,value\n1,2\n", encoding="utf-8")
-    runtime = Runtime.create(Settings(
-        state_dir=tmp_path / "state", allowed_workspace_roots=[workspace],
-        execution_backend="subprocess_dev",
-    ))
+    runtime = Runtime.create(
+        Settings(
+            state_dir=tmp_path / "state",
+            allowed_workspace_roots=[workspace],
+            execution_backend="subprocess_dev",
+        )
+    )
     session = runtime.sessions.add(AnalysisSession(workspace_root=str(workspace)))
     return runtime, session, data
 
@@ -38,17 +41,29 @@ def _revisions(
     now = datetime.now(UTC)
     # Force IDs to sort opposite registration time. Repository listing order must not
     # determine which version is current.
-    old = runtime.sources.add(DataSource(
-        id="src_" + "f" * 32, session_id=session.id, kind=SourceKind.CSV,
-        display_name=data.name, relative_path=data.name, fingerprint=fingerprint_file(data),
-        registered_at=now - timedelta(days=1),
-    ))
+    old = runtime.sources.add(
+        DataSource(
+            id="src_" + "f" * 32,
+            session_id=session.id,
+            kind=SourceKind.CSV,
+            display_name=data.name,
+            relative_path=data.name,
+            fingerprint=fingerprint_file(data),
+            registered_at=now - timedelta(days=1),
+        )
+    )
     data.write_text("id,value\n1,3\n", encoding="utf-8")
-    current = runtime.sources.add(DataSource(
-        id="src_" + "0" * 32, session_id=session.id, kind=SourceKind.CSV,
-        display_name=data.name, relative_path=data.name, fingerprint=fingerprint_file(data),
-        registered_at=now,
-    ))
+    current = runtime.sources.add(
+        DataSource(
+            id="src_" + "0" * 32,
+            session_id=session.id,
+            kind=SourceKind.CSV,
+            display_name=data.name,
+            relative_path=data.name,
+            fingerprint=fingerprint_file(data),
+            registered_at=now,
+        )
+    )
     return old, current
 
 
@@ -73,23 +88,36 @@ def test_cited_historical_source_remains_stale(tmp_path: Path, link: str) -> Non
     runtime, session, data = _setup(tmp_path)
     old, current = _revisions(runtime, session, data)
     if link == "execution":
-        execution = runtime.executions.add(ExecutionRecord(
-            session_id=session.id, execution_type=ExecutionType.MANAGED_SQL,
-            status=ExecutionStatus.SUCCEEDED, request={"sql": "SELECT 1"},
-            source_ids=[old.id, current.id], completed_at=datetime.now(UTC),
-        ))
+        execution = runtime.executions.add(
+            ExecutionRecord(
+                session_id=session.id,
+                execution_type=ExecutionType.MANAGED_SQL,
+                status=ExecutionStatus.SUCCEEDED,
+                request={"sql": "SELECT 1"},
+                source_ids=[old.id, current.id],
+                completed_at=datetime.now(UTC),
+            )
+        )
         runtime.evidence_ledger.register(
-            session.id, EvidenceClassification.DERIVED_FACT, "A result from both sources.",
-            source_ids=[current.id], execution_ids=[execution.id],
+            session.id,
+            EvidenceClassification.DERIVED_FACT,
+            "A result from both sources.",
+            source_ids=[current.id],
+            execution_ids=[execution.id],
         )
     else:
         upstream = runtime.evidence_ledger.register(
-            session.id, EvidenceClassification.SOURCE_FACT, "The old input value was 2.",
-            source_ids=[old.id], material=link == "direct",
+            session.id,
+            EvidenceClassification.SOURCE_FACT,
+            "The old input value was 2.",
+            source_ids=[old.id],
+            material=link == "direct",
         )
         if link == "upstream":
             runtime.evidence_ledger.register(
-                session.id, EvidenceClassification.INTERPRETATION, "This supports the claim.",
+                session.id,
+                EvidenceClassification.INTERPRETATION,
+                "This supports the claim.",
                 evidence_ids=[upstream.id],
             )
     run, findings = runtime.validation.validate(session, checks=["stale_sources"])
@@ -111,8 +139,9 @@ def test_malformed_source_preserves_findings_and_incomplete_coverage(tmp_path: P
     assert runtime.validation_runs.get(session.id, run.id) == run
 
 
-@pytest.mark.parametrize("check,code", [("duplicates", "DUPLICATE_ROWS"),
-                                       ("missingness", "HIGH_MISSINGNESS")])
+@pytest.mark.parametrize(
+    "check,code", [("duplicates", "DUPLICATE_ROWS"), ("missingness", "HIGH_MISSINGNESS")]
+)
 def test_source_failure_preserves_other_sources_in_same_check(
     tmp_path: Path, check: str, code: str
 ) -> None:
@@ -121,10 +150,16 @@ def test_source_failure_preserves_other_sources_in_same_check(
     for name, character in [("first.csv", "0"), ("bad.csv", "8"), ("last.csv", "f")]:
         path = data.parent / name
         path.write_bytes(b"id,value\n1,\xff\n" if name == "bad.csv" else b"id,value\n1,\n1,\n")
-        source = runtime.sources.add(DataSource(
-            id="src_" + character * 32, session_id=session.id, kind=SourceKind.CSV,
-            display_name=name, relative_path=name, fingerprint=fingerprint_file(path),
-        ))
+        source = runtime.sources.add(
+            DataSource(
+                id="src_" + character * 32,
+                session_id=session.id,
+                kind=SourceKind.CSV,
+                display_name=name,
+                relative_path=name,
+                fingerprint=fingerprint_file(path),
+            )
+        )
         if name != "bad.csv":
             good_ids.add(source.id)
     run, findings = runtime.validation.validate(session, checks=[check])

@@ -84,9 +84,7 @@ async def test_empty_check_set_is_rejected(tmp_path: Path) -> None:
 
     # An explicit empty check set runs no validator; it must not report a clean pass.
     with pytest.raises(Exception, match=r"at least one check|zero coverage"):
-        await server.call_tool(
-            "validate_analysis", {"session_id": session_id, "checks": []}
-        )
+        await server.call_tool("validate_analysis", {"session_id": session_id, "checks": []})
 
 
 @pytest.mark.anyio
@@ -123,6 +121,4 @@ async def test_scope_field_is_accepted_and_echoed(tmp_path: Path) -> None:
 
     # An unknown scope is rejected before the run executes.
     with pytest.raises(Exception, match="scope must be one of"):
-        await server.call_tool(
-            "validate_analysis", {"session_id": session_id, "scope": "bogus"}
-        )
+        await server.call_tool("validate_analysis", {"session_id": session_id, "scope": "bogus"})

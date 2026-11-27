@@ -279,9 +279,7 @@ class ArtifactRegistry:
                     f"execution would bring session artifacts to {existing_bytes + total_bytes} "
                     f"bytes; limit is {self.max_total_bytes}"
                 )
-            return self._copy_and_register(
-                session_id, execution_id, root, changed, before, after
-            )
+            return self._copy_and_register(session_id, execution_id, root, changed, before, after)
 
     def _copy_and_register(
         self,

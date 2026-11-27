@@ -215,11 +215,13 @@ def test_directory_entries_and_allocations_are_counted(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     by_entries = WorkspaceDiskGuard(
-        workspace, DiskLimits(max_output_bytes=10**12, max_output_files=5, min_free_bytes=0),
+        workspace,
+        DiskLimits(max_output_bytes=10**12, max_output_files=5, min_free_bytes=0),
         lambda _: None,
     )
     by_bytes = WorkspaceDiskGuard(
-        workspace, DiskLimits(max_output_bytes=1, max_output_files=10**6, min_free_bytes=0),
+        workspace,
+        DiskLimits(max_output_bytes=1, max_output_files=10**6, min_free_bytes=0),
         lambda _: None,
     )
     for index in range(6):

@@ -18,8 +18,11 @@ async def test_capability_reflects_conformant_backend(tmp_path: Path) -> None:
     assert created.structured_content["capabilities"]["managed_python"] is True
 
     dev_server = build_server(
-        Settings(state_dir=tmp_path / "state2", allowed_workspace_roots=[workspace],
-                 execution_backend="subprocess_dev")
+        Settings(
+            state_dir=tmp_path / "state2",
+            allowed_workspace_roots=[workspace],
+            execution_backend="subprocess_dev",
+        )
     )
     created_dev = await dev_server.call_tool("create_session", {"workspace_root": "."})
     assert created_dev.structured_content is not None

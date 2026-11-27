@@ -210,9 +210,7 @@ class StaleSourceValidator:
                         ValidationSeverity.BLOCKING,
                         f"Registered source is no longer present: {source.relative_path}",
                         entity_refs=[{"type": "source", "id": source.id}],
-                        remediation=(
-                            "Restore and re-inspect the source before final validation."
-                        ),
+                        remediation=("Restore and re-inspect the source before final validation."),
                     )
                 )
                 continue
@@ -228,18 +226,13 @@ class StaleSourceValidator:
                         self.name,
                         "STALE_SOURCE",
                         ValidationSeverity.BLOCKING,
-                        (
-                            "Source fingerprint changed after registration: "
-                            f"{source.display_name}"
-                        ),
+                        (f"Source fingerprint changed after registration: {source.display_name}"),
                         entity_refs=[{"type": "source", "id": source.id}],
                         details={
                             "registered": source.fingerprint,
                             "current": current,
                         },
-                        remediation=(
-                            "Re-inspect the changed source and rerun dependent analyses."
-                        ),
+                        remediation=("Re-inspect the changed source and rerun dependent analyses."),
                     )
                 )
         if checked == 0:
@@ -402,8 +395,7 @@ class DenominatorConsistencyValidator:
                         "Registered denominator must be a positive number.",
                         entity_refs=[{"type": "evidence", "id": item.id}],
                         remediation=(
-                            "Register the denominator used for the reported statistic "
-                            "explicitly."
+                            "Register the denominator used for the reported statistic explicitly."
                         ),
                     )
                 )
@@ -422,8 +414,7 @@ class DenominatorConsistencyValidator:
                             "denominator": denominator,
                         },
                         remediation=(
-                            "Correct the numerator/denominator metadata and recompute "
-                            "the claim."
+                            "Correct the numerator/denominator metadata and recompute the claim."
                         ),
                     )
                 )
@@ -434,10 +425,7 @@ class DenominatorConsistencyValidator:
                         self.name,
                         "DENOMINATOR_MISMATCH",
                         ValidationSeverity.ERROR,
-                        (
-                            "Reported denominator differs from the registered expected "
-                            "denominator."
-                        ),
+                        ("Reported denominator differs from the registered expected denominator."),
                         entity_refs=[{"type": "evidence", "id": item.id}],
                         details={
                             "denominator": denominator,
@@ -480,9 +468,7 @@ class UnsupportedCausalLanguageValidator:
                 (claim, None) for claim in context.claim_texts
             ]
         else:
-            candidates = [
-                (item.claim, item.id) for item in context.evidence if item.material
-            ]
+            candidates = [(item.claim, item.id) for item in context.evidence if item.material]
         for claim, evidence_id in candidates:
             if not _CAUSAL.search(claim):
                 continue
@@ -521,10 +507,7 @@ class UnsupportedCausalLanguageValidator:
                     self.name,
                     "UNSUPPORTED_CAUSAL_CLAIM",
                     ValidationSeverity.BLOCKING,
-                    (
-                        "Causal language is unsupported by the registered design: "
-                        f"{claim}"
-                    ),
+                    (f"Causal language is unsupported by the registered design: {claim}"),
                     entity_refs=entity_refs,
                     details={"analysis_design": design or None, "claim": claim},
                     remediation=(

@@ -27,9 +27,7 @@ def _service(tmp_path: Path) -> tuple[ExecutionService, AnalysisSession]:
         SubprocessDevBackend(),
         ExecutionRepository(settings.state_dir),
         SourceRepository(settings.state_dir),
-        ArtifactRegistry(
-            ArtifactRepository(settings.state_dir), settings.state_dir / "artifacts"
-        ),
+        ArtifactRegistry(ArtifactRepository(settings.state_dir), settings.state_dir / "artifacts"),
         WorkspaceService([workspace]),
         settings,
     )
@@ -71,9 +69,7 @@ def test_backend_failure_persists_failed_record(tmp_path: Path) -> None:
         _FailingBackend(),
         executions,
         SourceRepository(settings.state_dir),
-        ArtifactRegistry(
-            ArtifactRepository(settings.state_dir), settings.state_dir / "artifacts"
-        ),
+        ArtifactRegistry(ArtifactRepository(settings.state_dir), settings.state_dir / "artifacts"),
         WorkspaceService([workspace]),
         settings,
     )
