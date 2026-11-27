@@ -315,6 +315,46 @@ def test_engine_connections_cannot_read_unlisted_files(tmp_path: Path) -> None:
         connection.close()
 
 
+@pytest.mark.skipif(not Path("/proc/self/task").is_dir(), reason="needs Linux /proc thread list")
+def test_engine_connections_size_thread_pools_at_creation() -> None:
+    # DuckDB starts its pools when the database opens; DuckDB 2.0's async I/O pool defaults to
+    # 4 x the CPU count, which crashed the worker under its address-space limit. The connection
+    # must come up with every pool already bounded. A fresh interpreter keeps the count clean.
+    script = textwrap.dedent(
+        """
+        import json, os
+        import duckdb
+        from agentic_analytics.dataplane import engine
+
+        limits = engine.EngineLimits(
+            timeout_seconds=30, memory_limit="256MB", preview_bytes=4096, cell_chars=64,
+            threads=2,
+        )
+        before = len(os.listdir("/proc/self/task"))
+        connection = engine.open_connection(limits)
+        after = len(os.listdir("/proc/self/task"))
+        settings = dict(connection.execute(
+            "SELECT name, value FROM duckdb_settings()"
+            " WHERE name IN ('threads', 'async_threads')"
+        ).fetchall())
+        connection.close()
+        print(json.dumps({"added": after - before, "settings": settings,
+                          "major": int(duckdb.__version__.split(".")[0])}))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=60
+    )
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["settings"]["threads"] == "2"
+    if report["major"] >= 2:
+        assert report["settings"]["async_threads"] == "2"
+    # Two worker threads plus two async threads, with slack for DuckDB's own housekeeping;
+    # default-sized pools add dozens.
+    assert report["added"] <= 8, report
+
+
 def test_validation_survives_worker_failure(tmp_path: Path) -> None:
     runtime, session, _ = _runtime(tmp_path)
     runtime.inspector.inspect(session, "data.csv")

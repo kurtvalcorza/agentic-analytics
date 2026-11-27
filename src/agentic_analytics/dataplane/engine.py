@@ -89,6 +89,29 @@ def reader_sql(kind: str, path: str) -> str:
     raise ValueError(f"unsupported source kind: {kind}")
 
 
+# DuckDB 2.0 added an async I/O thread pool ("async_threads", default 4 x the visible CPU count);
+# 1.x rejects the option as unrecognized.
+_HAS_ASYNC_THREADS = int(duckdb.__version__.split(".", 1)[0]) >= 2
+
+
+def open_connection(limits: EngineLimits) -> duckdb.DuckDBPyConnection:
+    """Open the operation's in-memory database with its thread pools sized at creation.
+
+    DuckDB starts its worker and async I/O pools when the database is created, so a later
+    ``SET threads`` comes too late: under the worker's address-space limit the default-sized
+    pools (about 100 threads on a 24-CPU host with DuckDB 2.0) fail thread creation and crash
+    the process before any data is read. The async pool gets the same bound as the worker pool,
+    which keeps the per-thread overhead in Settings' address-space budget.
+    """
+
+    config: dict[str, str | bool | int | float | list[str]] = {}
+    if limits.threads is not None:
+        config["threads"] = int(limits.threads)
+        if _HAS_ASYNC_THREADS:
+            config["async_threads"] = int(limits.threads)
+    return duckdb.connect(database=":memory:", config=config)
+
+
 def secure_connection(
     connection: duckdb.DuckDBPyConnection, allowed_paths: list[str], limits: EngineLimits
 ) -> None:
@@ -305,7 +328,7 @@ def run_query(request: dict[str, Any]) -> dict[str, Any]:
     result_table = request["result_table"]
     limit = int(request["limit"])
     spill_cap = int(request["spill_cap"])
-    connection = duckdb.connect(database=":memory:")
+    connection = open_connection(limits)
     try:
         secure_connection(
             connection, [item["path"] for item in sources] + [str(spill_path)], limits
@@ -435,7 +458,7 @@ def profile_source(request: dict[str, Any]) -> dict[str, Any]:
     relation = reader_sql(request["kind"], path)
     sample_limit = int(request["sample_limit"])
     max_profile_columns = int(request["max_profile_columns"])
-    connection = duckdb.connect(database=":memory:")
+    connection = open_connection(limits)
     try:
         secure_connection(connection, [path], limits)
         with deadline(connection, limits.timeout_seconds):
@@ -498,7 +521,7 @@ def table_stats(request: dict[str, Any]) -> dict[str, Any]:
     limits = EngineLimits.from_json(request["limits"])
     path = request["path"]
     relation = reader_sql(request["kind"], path)
-    connection = duckdb.connect(database=":memory:")
+    connection = open_connection(limits)
     try:
         secure_connection(connection, [path], limits)
         with deadline(connection, limits.timeout_seconds):
