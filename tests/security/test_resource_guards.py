@@ -7,6 +7,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
+import _processes
 import pytest
 
 from agentic_analytics.execution_backends import guards
@@ -152,23 +153,33 @@ def test_drain_bounded_keeps_draining_past_cap() -> None:
 @pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX specific")
 def test_dev_backend_timeout_kills_descendants(tmp_path: Path) -> None:
     runtime, session, workspace = _runtime(tmp_path)
-    marker = workspace / "child-alive.txt"
+    started = workspace / "grandchild.pid"
+    # The grandchild publishes its pid atomically, and the script waits for it before
+    # sleeping, so the timeout always lands while the grandchild is alive.
     code = f"""
-import subprocess, sys
-subprocess.Popen([sys.executable, '-c', '''
-import time
+import subprocess, sys, time
 from pathlib import Path
-time.sleep(3)
-Path({str(marker)!r}).write_text("alive")
+started = Path({str(started)!r})
+subprocess.Popen([sys.executable, '-c', '''
+import os, time
+from pathlib import Path
+started = Path({str(started)!r})
+staging = started.with_name("grandchild.tmp")
+staging.write_text(str(os.getpid()))
+os.replace(staging, started)
+time.sleep(60)
 '''])
-import time
+while not started.exists():
+    time.sleep(0.01)
 time.sleep(60)
 """
-    record = runtime.execution.execute_python(session, code, timeout_seconds=1)
+    record = runtime.execution.execute_python(session, code, timeout_seconds=10)
 
     assert record.status is ExecutionStatus.TIMED_OUT
-    time.sleep(4)
-    assert not marker.exists()
+    assert started.exists(), "the grandchild never started, so its cleanup was not exercised"
+    grandchild = int(started.read_text())
+    ended = _processes.wait_for(lambda: not _processes.alive(grandchild), 10)
+    assert ended, f"grandchild outlived the timeout: {_processes.describe(grandchild)}"
 
 
 # --- Review follow-ups on PR 11 ---------------------------------------------------------

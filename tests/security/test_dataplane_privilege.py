@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import _processes
 import pytest
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
@@ -477,16 +478,11 @@ client.call("query", payload, deadline_seconds=600)
 """
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    stat = Path(f"/proc/{pid}/stat")
-    with contextlib.suppress(OSError):
-        if stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":  # zombie awaiting its reaper
-            return False
-    return True
+def _worker_running(pid: int) -> bool:
+    # The worker stays single-threaded until bind_to_parent and sandbox.enter have returned
+    # (worker.main); its first extra thread is the parent watchdog or DuckDB's own. A second
+    # thread therefore proves the binding is in place and the operation is under way.
+    return _processes.thread_count(pid) >= 2
 
 
 def _assert_worker_dies_with_parent(tmp_path: Path, *, pdeathsig: bool) -> None:
@@ -512,15 +508,19 @@ def _assert_worker_dies_with_parent(tmp_path: Path, *, pdeathsig: bool) -> None:
             else:
                 time.sleep(0.05)
         assert worker_pid is not None, "worker never started"
-        time.sleep(2.0)  # let the worker finish start-up and start the query
-        assert _alive(worker_pid), "worker ended before the parent was killed"
+        if _processes.HAS_PROC:
+            started = _processes.wait_for(lambda: _worker_running(worker_pid), 60)
+            assert started, f"worker never reached its operation: {_processes.describe(worker_pid)}"
+        else:  # pragma: no cover - POSIX without /proc (macOS)
+            time.sleep(2.0)
+        assert _processes.alive(worker_pid), "worker ended before the parent was killed"
 
         parent.send_signal(signal.SIGKILL)
         parent.wait(timeout=10)
-        ended_by = time.monotonic() + 5.0  # bounded: well under the 600 s operation deadline
-        while _alive(worker_pid) and time.monotonic() < ended_by:
-            time.sleep(0.05)
-        assert not _alive(worker_pid), "worker outlived its killed parent"
+        # Bounded, and still far under the 600 s operation deadline: the death signal is
+        # immediate and the watchdog polls every 0.25 s, so this allows for a loaded host.
+        ended = _processes.wait_for(lambda: not _processes.alive(worker_pid), 15)
+        assert ended, f"worker outlived its killed parent: {_processes.describe(worker_pid)}"
     finally:
         with contextlib.suppress(ProcessLookupError):
             parent.kill()
