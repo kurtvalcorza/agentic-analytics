@@ -28,11 +28,12 @@ class ValidationContext:
     evidence: list[EvidenceItem]
     sources: list[DataSource]
     workspace_root: Path
+    # The one path-authorization implementation (allowlist, containment, protected roots).
+    workspace: WorkspaceService
     claim_texts: list[str] = field(default_factory=list)
     # Per-source duplicate keys supplied through the public validate_analysis call, keyed by
     # source relative_path or source id. Makes the key-based duplicate check reachable via MCP.
     duplicate_keys: dict[str, list[str]] = field(default_factory=dict)
-    workspace: WorkspaceService | None = None
     # Isolated DuckDB worker (SEC-02); required by the checks that read source data.
     data_plane: DataPlaneClient | None = None
 
@@ -61,12 +62,13 @@ class ValidationContext:
             raise
 
     def resolve_source_file(self, source: DataSource) -> Path | None:
-        if self.workspace is not None and source.relative_path is not None:
-            try:
-                return self.workspace.resolve_file(self.workspace_root, source.relative_path)
-            except WorkspaceAuthorizationError:
-                return None
-        return _resolve_source_file(self.workspace_root, source)
+        # None (never an exception) so one unreadable source does not abort the whole run.
+        if source.relative_path is None:
+            return None
+        try:
+            return self.workspace.resolve_file(self.workspace_root, source.relative_path)
+        except WorkspaceAuthorizationError:
+            return None
 
     def source_duplicate_keys(self, source: DataSource) -> list[str]:
         if source.relative_path and source.relative_path in self.duplicate_keys:
@@ -122,29 +124,6 @@ def _normalize_claim(value: str) -> str:
 def _is_number(value: object) -> TypeGuard[int | float]:
     # bool is a subclass of int; a boolean is never a meaningful analytical quantity.
     return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _resolve_source_file(workspace_root: Path, source: DataSource) -> Path | None:
-    """Resolve a source to a real file strictly contained in the workspace, else None.
-
-    Mirrors the workspace containment check so validators never follow a symlink out of the
-    authorized workspace, and never abort the whole run when a registered file is missing.
-    """
-
-    if source.relative_path is None:
-        return None
-    requested = Path(source.relative_path)
-    if requested.is_absolute() or ".." in requested.parts:
-        return None
-    try:
-        resolved = (workspace_root / requested).resolve(strict=True)
-    except (OSError, RuntimeError):
-        return None
-    if resolved != workspace_root and workspace_root not in resolved.parents:
-        return None
-    if not resolved.is_file():
-        return None
-    return resolved
 
 
 def _inconclusive(check: str, reason: str) -> CheckResult:
