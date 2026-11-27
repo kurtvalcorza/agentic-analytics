@@ -22,9 +22,15 @@ def _confinement_unavailable() -> bool:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip with one explanation instead of failing every data-plane test (SEC-02)."""
+    """Skip with one explanation instead of failing every data-plane test (SEC-02).
+
+    CI sets AGENTIC_ANALYTICS_TEST_REQUIRE_SANDBOX=1 so a runner without Landlock fails the
+    run instead of passing it with every test skipped.
+    """
 
     if _confinement_unavailable():
+        if os.environ.get("AGENTIC_ANALYTICS_TEST_REQUIRE_SANDBOX") == "1":
+            raise pytest.UsageError(f"AGENTIC_ANALYTICS_TEST_REQUIRE_SANDBOX=1 but {_NO_LANDLOCK}")
         marker = pytest.mark.skip(reason=_NO_LANDLOCK)
         for item in items:
             item.add_marker(marker)

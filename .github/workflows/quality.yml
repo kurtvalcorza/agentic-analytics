@@ -26,6 +26,8 @@ jobs:
         run: uv sync --frozen --extra dev --python 3.12
       - name: Ruff
         run: uv run --frozen ruff check .
+      - name: Ruff format
+        run: uv run --frozen ruff format --check .
       - name: Mypy
         run: uv run --frozen mypy src
       - name: Build execution image
@@ -47,7 +49,12 @@ jobs:
           scan --severity HIGH,CRITICAL --exit-code 0 --format table
           scan --severity CRITICAL --exit-code 1 --skip-db-update --format table
       - name: Tests
-        run: uv run --frozen pytest --cov=agentic_analytics --cov-report=term-missing
+        env:
+          # Fail instead of skipping every test if this runner has no Landlock.
+          AGENTIC_ANALYTICS_TEST_REQUIRE_SANDBOX: "1"
+        run: >-
+          uv run --frozen pytest --cov=agentic_analytics --cov-report=term-missing
+          --cov-fail-under=85
 
   supply-chain:
     runs-on: ubuntu-latest
