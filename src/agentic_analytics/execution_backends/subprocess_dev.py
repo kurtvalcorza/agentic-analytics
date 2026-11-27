@@ -8,6 +8,7 @@ import sys
 import threading
 from pathlib import Path
 
+from agentic_analytics import limits
 from agentic_analytics.layout import INTERNAL_DIR_NAME
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
 
@@ -29,7 +30,7 @@ class SubprocessDevBackend:
     def __init__(
         self,
         *,
-        max_output_chars: int = 65536,
+        max_output_chars: int = limits.MAX_OUTPUT_CHARS,
         disk_limits: DiskLimits | None = None,
         protected_state_root: Path | None = None,
     ) -> None:

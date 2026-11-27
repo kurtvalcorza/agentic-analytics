@@ -6,6 +6,7 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from . import limits
 from .layout import INTERNAL_DIR_NAME, archive_dir, dataplane_scratch_dir, scratch_dir
 
 _SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]i?b?|b|bytes)?\s*$", re.IGNORECASE)
@@ -78,27 +79,29 @@ class Settings(BaseSettings):
     data_plane_sandbox: Literal["auto", "required", "off"] = "auto"
     execution_backend: Literal["docker", "subprocess_dev"] = "docker"
     docker_image: str = "agentic-analytics-exec:dev"
-    docker_memory: str = "1g"
-    docker_cpus: float = Field(default=1.0, gt=0, le=8)
-    docker_pids_limit: int = Field(default=128, ge=16, le=4096)
+    docker_memory: str = limits.DOCKER_MEMORY
+    docker_cpus: float = Field(default=limits.DOCKER_CPUS, gt=0, le=8)
+    docker_pids_limit: int = Field(default=limits.DOCKER_PIDS_LIMIT, ge=16, le=4096)
     # Explicit non-root container identity ("uid:gid"). Defaults to the server's own identity on
     # POSIX hosts and to the image's unprivileged user elsewhere; uid 0 is always refused.
     docker_user: str | None = Field(default=None, pattern=r"^[0-9]+:[0-9]+$")
     # SEC-01 (#22): size of each run's tmpfs at /workspace/outputs, the only writable output
     # location. 256 MiB is inferred from test and quickstart outputs (CSV + PNG, a few MB),
     # not measured on real workloads; raise it for larger datasets or figures.
-    docker_output_quota_bytes: int = Field(default=256 * 1024**2, ge=1024**2, le=64 * 1024**3)
+    docker_output_quota_bytes: int = Field(
+        default=limits.DOCKER_OUTPUT_QUOTA_BYTES, ge=1024**2, le=64 * 1024**3
+    )
     execution_timeout_seconds: int = Field(default=120, ge=1, le=3600)
     max_execution_timeout_seconds: int = Field(default=300, ge=1, le=3600)
-    max_output_chars: int = Field(default=65536, ge=1024, le=1_000_000)
+    max_output_chars: int = Field(default=limits.MAX_OUTPUT_CHARS, ge=1024, le=1_000_000)
     max_artifacts_per_execution: int = Field(default=64, ge=1, le=10_000)
     max_artifact_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
     max_total_artifact_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
     # Budget for bytes/files one execution may add to its writable workspace, enforced while it
     # runs (not only at artifact registration), plus a host free-space reserve.
-    max_execution_output_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
-    max_execution_output_files: int = Field(default=10_000, ge=1)
-    min_free_disk_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+    max_execution_output_bytes: int = Field(default=limits.MAX_EXECUTION_OUTPUT_BYTES, ge=1024)
+    max_execution_output_files: int = Field(default=limits.MAX_EXECUTION_OUTPUT_FILES, ge=1)
+    min_free_disk_bytes: int = Field(default=limits.MIN_FREE_DISK_BYTES, ge=0)
     max_list_page_size: int = Field(default=200, ge=1, le=10_000)
     max_discovery_scan_entries: int = Field(default=100_000, ge=1)
     max_validation_findings: int = Field(default=200, ge=1, le=10_000)
