@@ -6,6 +6,9 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from . import limits
+from .layout import INTERNAL_DIR_NAME, archive_dir, dataplane_scratch_dir, scratch_dir
+
 _SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]i?b?|b|bytes)?\s*$", re.IGNORECASE)
 _UNITS = {"": 1, "b": 1, "bytes": 1}
 for _index, _prefix in enumerate("kmgt", start=1):
@@ -50,8 +53,8 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="AGENTIC_ANALYTICS_", extra="ignore")
 
-    state_dir: Path = Field(default=Path(".agentic-analytics/state"))
-    workspace_base_dir: Path = Field(default=Path(".agentic-analytics/workspaces"))
+    state_dir: Path = Field(default=Path(INTERNAL_DIR_NAME) / "state")
+    workspace_base_dir: Path = Field(default=Path(INTERNAL_DIR_NAME) / "workspaces")
     allowed_workspace_roots: list[Path] = Field(default_factory=lambda: [Path.cwd()])
     max_sample_rows: int = Field(default=100, ge=1, le=1000)
     max_query_rows: int = Field(default=200, ge=1, le=10_000)
@@ -76,27 +79,29 @@ class Settings(BaseSettings):
     data_plane_sandbox: Literal["auto", "required", "off"] = "auto"
     execution_backend: Literal["docker", "subprocess_dev"] = "docker"
     docker_image: str = "agentic-analytics-exec:dev"
-    docker_memory: str = "1g"
-    docker_cpus: float = Field(default=1.0, gt=0, le=8)
-    docker_pids_limit: int = Field(default=128, ge=16, le=4096)
+    docker_memory: str = limits.DOCKER_MEMORY
+    docker_cpus: float = Field(default=limits.DOCKER_CPUS, gt=0, le=8)
+    docker_pids_limit: int = Field(default=limits.DOCKER_PIDS_LIMIT, ge=16, le=4096)
     # Explicit non-root container identity ("uid:gid"). Defaults to the server's own identity on
     # POSIX hosts and to the image's unprivileged user elsewhere; uid 0 is always refused.
     docker_user: str | None = Field(default=None, pattern=r"^[0-9]+:[0-9]+$")
     # SEC-01 (#22): size of each run's tmpfs at /workspace/outputs, the only writable output
     # location. 256 MiB is inferred from test and quickstart outputs (CSV + PNG, a few MB),
     # not measured on real workloads; raise it for larger datasets or figures.
-    docker_output_quota_bytes: int = Field(default=256 * 1024**2, ge=1024**2, le=64 * 1024**3)
+    docker_output_quota_bytes: int = Field(
+        default=limits.DOCKER_OUTPUT_QUOTA_BYTES, ge=1024**2, le=64 * 1024**3
+    )
     execution_timeout_seconds: int = Field(default=120, ge=1, le=3600)
     max_execution_timeout_seconds: int = Field(default=300, ge=1, le=3600)
-    max_output_chars: int = Field(default=65536, ge=1024, le=1_000_000)
+    max_output_chars: int = Field(default=limits.MAX_OUTPUT_CHARS, ge=1024, le=1_000_000)
     max_artifacts_per_execution: int = Field(default=64, ge=1, le=10_000)
     max_artifact_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
     max_total_artifact_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
     # Budget for bytes/files one execution may add to its writable workspace, enforced while it
     # runs (not only at artifact registration), plus a host free-space reserve.
-    max_execution_output_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
-    max_execution_output_files: int = Field(default=10_000, ge=1)
-    min_free_disk_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+    max_execution_output_bytes: int = Field(default=limits.MAX_EXECUTION_OUTPUT_BYTES, ge=1024)
+    max_execution_output_files: int = Field(default=limits.MAX_EXECUTION_OUTPUT_FILES, ge=1)
+    min_free_disk_bytes: int = Field(default=limits.MIN_FREE_DISK_BYTES, ge=0)
     max_list_page_size: int = Field(default=200, ge=1, le=10_000)
     max_discovery_scan_entries: int = Field(default=100_000, ge=1)
     max_validation_findings: int = Field(default=200, ge=1, le=10_000)
@@ -143,6 +148,18 @@ class Settings(BaseSettings):
         if self.max_artifact_bytes > self.data_plane_max_file_bytes:
             raise ValueError("max_artifact_bytes must not exceed data_plane_max_file_bytes")
         return self
+
+    @property
+    def archive_dir(self) -> Path:
+        return archive_dir(self.state_dir)
+
+    @property
+    def scratch_dir(self) -> Path:
+        return scratch_dir(self.state_dir)
+
+    @property
+    def dataplane_scratch_dir(self) -> Path:
+        return dataplane_scratch_dir(self.state_dir)
 
     def normalized_allowed_roots(self) -> list[Path]:
         return [root.expanduser().resolve(strict=False) for root in self.allowed_workspace_roots]

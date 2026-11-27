@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.models import (
     AnalysisSession,
     DataSource,
@@ -13,7 +14,6 @@ from agentic_analytics.models import (
     SourceKind,
 )
 from agentic_analytics.runtime import Runtime
-from agentic_analytics.services.inspector import fingerprint_file
 from agentic_analytics.services.workspace import WorkspaceAuthorizationError
 from agentic_analytics.settings import Settings
 from agentic_analytics.validators.core import CheckResult, ValidationContext

@@ -18,7 +18,7 @@ from typing import Any
 
 import duckdb
 
-from agentic_analytics.services.preview import cell_bound_expr, json_value
+from .preview import cell_bound_expr, json_value, sql_identifier
 
 # The preview is streamed one row at a time so no more than a single (already cell-capped) row
 # is ever materialized in Python before the byte budget is re-checked.
@@ -74,10 +74,6 @@ class EngineLimits:
 
 def sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
-
-
-def sql_identifier(value: str) -> str:
-    return '"' + value.replace('"', '""') + '"'
 
 
 def reader_sql(kind: str, path: str) -> str:

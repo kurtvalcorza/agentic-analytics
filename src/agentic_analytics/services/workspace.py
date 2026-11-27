@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import ClassVar
 
+from agentic_analytics.models import READABLE_SOURCE_SUFFIXES
+
 
 class WorkspaceAuthorizationError(PermissionError):
     pass
@@ -11,7 +13,7 @@ class WorkspaceAuthorizationError(PermissionError):
 class WorkspaceService:
     """Canonical path authorization and supported-data discovery."""
 
-    SUPPORTED_SUFFIXES: ClassVar[frozenset[str]] = frozenset({".csv", ".parquet"})
+    SUPPORTED_SUFFIXES: ClassVar[frozenset[str]] = frozenset(READABLE_SOURCE_SUFFIXES)
 
     def __init__(
         self, allowed_roots: list[Path], *, protected_roots: list[Path] | None = None

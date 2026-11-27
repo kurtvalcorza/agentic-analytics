@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.models import (
     AnalysisSession,
     DataSource,
@@ -8,7 +9,6 @@ from agentic_analytics.models import (
     SourceKind,
 )
 from agentic_analytics.runtime import Runtime
-from agentic_analytics.services.inspector import fingerprint_file
 from agentic_analytics.settings import Settings
 
 

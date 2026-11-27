@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+from agentic_analytics import limits
+
 
 def drain_bounded(
     stream: IO[str],
@@ -65,9 +67,9 @@ def drain_bounded(
 class DiskLimits:
     """Budget for bytes/files managed code may add to its workspace during one execution."""
 
-    max_output_bytes: int = 512 * 1024 * 1024
-    max_output_files: int = 10_000
-    min_free_bytes: int = 256 * 1024 * 1024
+    max_output_bytes: int = limits.MAX_EXECUTION_OUTPUT_BYTES
+    max_output_files: int = limits.MAX_EXECUTION_OUTPUT_FILES
+    min_free_bytes: int = limits.MIN_FREE_DISK_BYTES
     poll_interval_seconds: float = 0.25
 
 

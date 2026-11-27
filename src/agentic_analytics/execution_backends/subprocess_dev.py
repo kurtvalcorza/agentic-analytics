@@ -8,6 +8,8 @@ import sys
 import threading
 from pathlib import Path
 
+from agentic_analytics import limits
+from agentic_analytics.layout import INTERNAL_DIR_NAME
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
 
 from .base import BackendResult
@@ -28,7 +30,7 @@ class SubprocessDevBackend:
     def __init__(
         self,
         *,
-        max_output_chars: int = 65536,
+        max_output_chars: int = limits.MAX_OUTPUT_CHARS,
         disk_limits: DiskLimits | None = None,
         protected_state_root: Path | None = None,
     ) -> None:
@@ -66,7 +68,7 @@ class SubprocessDevBackend:
         # Host-native development execution cannot enforce read-only mounts.
         del readonly_paths
         workspace = Path(session.workspace_root).resolve(strict=True)
-        internal_home = workspace / ".agentic-analytics" / "dev-home"
+        internal_home = workspace / INTERNAL_DIR_NAME / "dev-home"
         internal_home.mkdir(parents=True, exist_ok=True)
         env = {
             "HOME": str(internal_home),

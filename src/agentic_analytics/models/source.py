@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Final
 
 from pydantic import Field, model_validator
 
@@ -17,6 +17,15 @@ class SourceKind(StrEnum):
     EXCEL = "excel"
     DATABASE = "database"
     OTHER = "other"
+
+
+# The formats the data plane reads: workspace discovery, source inspection, the data-reading
+# validators and the engine's reader dispatch all derive from this one map.
+READABLE_SOURCE_SUFFIXES: Final[dict[str, SourceKind]] = {
+    ".csv": SourceKind.CSV,
+    ".parquet": SourceKind.PARQUET,
+}
+READABLE_SOURCE_KINDS: Final[frozenset[SourceKind]] = frozenset(READABLE_SOURCE_SUFFIXES.values())
 
 
 class DataSource(CanonicalModel):

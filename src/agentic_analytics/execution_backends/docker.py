@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import IO, Any
 from uuid import uuid4
 
+from agentic_analytics import limits
+from agentic_analytics.layout import INTERNAL_DIR_NAME
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
 
 from .base import BackendResult
@@ -60,14 +62,14 @@ class DockerBackend:
         self,
         image: str,
         *,
-        memory: str = "1g",
-        cpus: float = 1.0,
-        pids_limit: int = 128,
-        max_output_chars: int = 65536,
+        memory: str = limits.DOCKER_MEMORY,
+        cpus: float = limits.DOCKER_CPUS,
+        pids_limit: int = limits.DOCKER_PIDS_LIMIT,
+        max_output_chars: int = limits.MAX_OUTPUT_CHARS,
         protected_state_root: Path | None = None,
         disk_limits: DiskLimits | None = None,
         user: str | None = None,
-        output_quota_bytes: int = 256 * 1024 * 1024,
+        output_quota_bytes: int = limits.DOCKER_OUTPUT_QUOTA_BYTES,
     ) -> None:
         if user is not None and not _USER_PATTERN.fullmatch(user):
             raise ValueError("docker user must be a numeric 'uid:gid' pair")
@@ -181,7 +183,7 @@ class DockerBackend:
     def _mount_args(
         self, workspace: Path, script: Path, readonly_paths: tuple[Path, ...]
     ) -> list[str]:
-        state = (self.protected_state_root or workspace / ".agentic-analytics" / "state").resolve()
+        state = (self.protected_state_root or workspace / INTERNAL_DIR_NAME / "state").resolve()
         if workspace.is_relative_to(state):
             raise DockerExecutionError("workspace must not be inside the protected state directory")
         outputs = self._outputs_dir(workspace)
@@ -195,7 +197,7 @@ class DockerBackend:
                 raise DockerExecutionError("read-only sources must be regular workspace files")
             if (
                 source.is_relative_to(state)
-                or source.relative_to(workspace).parts[0] == ".agentic-analytics"
+                or source.relative_to(workspace).parts[0] == INTERNAL_DIR_NAME
             ):
                 raise DockerExecutionError("read-only source overlaps protected runtime files")
             identity = self._identity(source)

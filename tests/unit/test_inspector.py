@@ -1,8 +1,9 @@
 from pathlib import Path
 
+from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.models import AnalysisSession
 from agentic_analytics.repositories import SourceRepository
-from agentic_analytics.services.inspector import InspectorService, fingerprint_file
+from agentic_analytics.services.inspector import InspectorService
 from agentic_analytics.services.workspace import WorkspaceService
 from agentic_analytics.settings import Settings
 

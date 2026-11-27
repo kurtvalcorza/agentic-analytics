@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 from typing import IO, Any
 
+from agentic_analytics.layout import archive_dir, dataplane_scratch_dir
 from agentic_analytics.settings import Settings
 
 from .sandbox import SandboxPolicy
@@ -86,7 +87,7 @@ class DataPlaneClient:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.work_root = settings.state_dir.resolve(strict=False) / "tmp" / "dataplane"
+        self.work_root = dataplane_scratch_dir(settings.state_dir.resolve(strict=False))
         self._swept = False
 
     def limits(self, timeout_seconds: float) -> dict[str, Any]:
@@ -142,7 +143,7 @@ class DataPlaneClient:
             *settings.allowed_workspace_roots,
             settings.workspace_base_dir,
             settings.state_dir,
-            settings.state_dir / "artifacts",
+            archive_dir(settings.state_dir),
         ]
         return tuple(dict.fromkeys(os.path.realpath(root) for root in roots))
 

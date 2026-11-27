@@ -7,7 +7,7 @@ from .evidence import (
 )
 from .execution import ExecutionRecord, ExecutionStatus, ExecutionType, SourceAttestation
 from .session import AnalysisSession, SessionMode, SessionStatus
-from .source import DataSource, SourceKind
+from .source import READABLE_SOURCE_KINDS, READABLE_SOURCE_SUFFIXES, DataSource, SourceKind
 from .validation import (
     ValidationFinding,
     ValidationFindingStatus,
@@ -18,6 +18,8 @@ from .validation import (
 )
 
 __all__ = [
+    "READABLE_SOURCE_KINDS",
+    "READABLE_SOURCE_SUFFIXES",
     "AnalysisSession",
     "Artifact",
     "ArtifactKind",
