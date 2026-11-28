@@ -5,7 +5,7 @@ import importlib.metadata
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
@@ -62,6 +62,18 @@ def _source_references(tokens: list[SqlToken]) -> list[tuple[int, int, str]]:
         ):
             references.append((token.start, closing.end, argument.value))
     return references
+
+
+# Materialize, preview and spill each get their own deadline inside the worker, so the
+# worker as a whole is allowed this many query timeouts.
+_WORKER_PHASES = 3
+
+
+class _ResolvedSource(NamedTuple):
+    source_id: str
+    kind: SourceKind
+    path: str
+    fingerprint: dict[str, Any]
 
 
 class QueryRejected(ValueError):
@@ -174,118 +186,72 @@ class QueryService:
         source_ids = list(dict.fromkeys(source_id for _, _, source_id in references))
         if not source_ids:
             raise QueryRejected("query must reference at least one registered source('src_...')")
-
-        resolved_sources: list[tuple[str, SourceKind, str, dict[str, Any]]] = []
-        for source_id in source_ids:
-            source = self.sources.get(session.id, source_id)
-            if source.relative_path is None:
-                raise QueryRejected("URI/database sources are not supported by local query")
-            resolved_path = self.workspace.resolve_file(
-                session.workspace_root, source.relative_path
-            )
-            # Recompute the fingerprint at execution start so results are always attributable to
-            # the exact bytes queried; a source modified after inspection is rejected.
-            current = fingerprint_file(resolved_path)
-            if current.get("sha256") != source.fingerprint.get("sha256"):
-                raise QueryRejected(
-                    f"source {source_id} changed since inspection; re-inspect before querying"
-                )
-            resolved_sources.append((source_id, source.kind, str(resolved_path), current))
+        resolved = self._resolve_sources(session, source_ids)
+        fingerprints = {source.source_id: source.fingerprint for source in resolved}
 
         execution_id = new_id(EntityType.EXECUTION)
         # Spill to the out-of-workspace archive (server-controlled) so managed code cannot
         # corrupt the artifact and a workspace .agentic-analytics symlink cannot redirect the
         # write outside its boundary.
-        archive_base = self.artifacts.archive_base(session.id, execution_id)
-        spill_path = self._prepare_spill_path(archive_base)
-
-        fingerprints = {source_id: fingerprint for source_id, _, _, fingerprint in resolved_sources}
-        # Unguessable per-execution view/table names cannot be shadowed by a caller CTE.
-        token = uuid4().hex
-        view_names = {
-            source_id: f"_src_{token}_{index}"
-            for index, (source_id, _, _, _) in enumerate(resolved_sources)
-        }
-        rewritten = normalized
-        for start, end, source_id in reversed(references):
-            rewritten = rewritten[:start] + f'"{view_names[source_id]}"' + rewritten[end:]
+        spill_path = self._prepare_spill_path(self.artifacts.archive_base(session.id, execution_id))
         # The artifact row budget is never smaller than the preview row limit. Otherwise a
         # result could overflow the spill cap while still fitting the preview, leaving
         # result_complete=False with no artifact. With this floor, overflowing the cap always
         # also truncates the preview, so a capped result is always spilled.
         spill_cap = max(self.settings.max_spill_rows, limit)
-        timeout = self.settings.query_timeout_seconds
-        request = QueryRequest(
-            sources=tuple(
-                SourceView(view=view_names[source_id], kind=kind.value, path=str(file_path))
-                for source_id, kind, file_path, _ in resolved_sources
-            ),
-            sql=rewritten,
-            result_table=f"_result_{token}",
-            limit=limit,
-            spill_cap=spill_cap,
-            spill_path=str(spill_path),
-            # Bound the spill as it is written at the *remaining* session budget, so a session
-            # that already holds artifacts cannot over-write before registration rejects it.
-            spill_byte_ceiling=self.artifacts.spill_byte_ceiling(session.id),
-            require_complete=require_complete,
-            limits=self.data_plane.limits(timeout),
+        request = self._build_request(
+            session,
+            normalized,
+            references,
+            resolved,
+            limit,
+            spill_cap,
+            spill_path,
+            require_complete,
         )
+
         started = datetime.now(UTC)
         try:
-            # Materialize, preview, and spill each have their own deadline inside the worker.
-            outcome = self.data_plane.call(request, deadline_seconds=3 * timeout)
-        except DataPlaneError as exc:
-            # Never register a partial or over-limit spill: drop the file and audit the failure.
-            with contextlib.suppress(FileNotFoundError):
-                spill_path.unlink()
-            self._persist_failure(session, normalized, limit, source_ids, fingerprints, exc)
-            raise QueryExecutionError(str(exc)) from exc
-
-        columns: list[str] = outcome["columns"]
-        serial_rows: list[list[Any]] = outcome["rows"]
-        materialized = int(outcome["materialized"])
-        truncated = bool(outcome["truncated"])
-        spill_capped = bool(outcome["spill_capped"])
-        # Invariant relied on by clients: an incomplete result always has a truncated preview
-        # and (unless require_complete refused it) a published, capped artifact.
-        assert truncated or not spill_capped
-        if spill_capped and require_complete:
-            incomplete = QueryExecutionError(
-                f"query result exceeds max_spill_rows ({spill_cap}); refusing to produce a "
-                "partial result because require_complete was set. Aggregate or filter the "
-                "query, or raise AGENTIC_ANALYTICS_MAX_SPILL_ROWS."
+            outcome = self.data_plane.call(
+                request,
+                deadline_seconds=_WORKER_PHASES * self.settings.query_timeout_seconds,
             )
-            self._persist_failure(session, normalized, limit, source_ids, fingerprints, incomplete)
-            raise incomplete
-        artifact_rows = min(materialized, spill_cap)
-
-        artifact_id: str | None = None
-        artifact_ids: list[str] = []
-        if outcome["spilled"]:
-            try:
-                artifact = self.artifacts.register_file(
+            # Invariant relied on by clients: an incomplete result always has a truncated
+            # preview and (unless require_complete refused it) a published, capped artifact.
+            spill_capped = bool(outcome["spill_capped"])
+            assert bool(outcome["truncated"]) or not spill_capped
+            if spill_capped and require_complete:
+                raise QueryExecutionError(
+                    f"query result exceeds max_spill_rows ({spill_cap}); refusing to produce a "
+                    "partial result because require_complete was set. Aggregate or filter the "
+                    "query, or raise AGENTIC_ANALYTICS_MAX_SPILL_ROWS."
+                )
+            artifact_rows = min(int(outcome["materialized"]), spill_cap)
+            artifact_id = (
+                self._register_spill(
                     session.id,
                     execution_id,
                     spill_path,
-                    lineage={"change": "query_result_spill", "source_ids": source_ids},
-                    metadata={
-                        "format": "parquet",
-                        "preview_rows": len(serial_rows),
-                        "query_truncated": True,
-                        "spill_row_count": artifact_rows,
-                        "spill_truncated": spill_capped,
-                        "result_complete": not spill_capped,
-                        "max_spill_rows": spill_cap,
-                    },
+                    source_ids,
+                    preview_rows=len(outcome["rows"]),
+                    artifact_rows=artifact_rows,
+                    spill_capped=spill_capped,
+                    spill_cap=spill_cap,
                 )
-            except ArtifactLimitError as exc:
-                with contextlib.suppress(FileNotFoundError):
-                    spill_path.unlink()
-                self._persist_failure(session, normalized, limit, source_ids, fingerprints, exc)
-                raise QueryExecutionError(str(exc)) from exc
-            artifact_id = artifact.id
-            artifact_ids.append(artifact.id)
+                if outcome["spilled"]
+                else None
+            )
+        except (DataPlaneError, ArtifactLimitError, QueryExecutionError) as exc:
+            # Never register a partial or over-limit spill: drop the file and audit the failure
+            # under this query's own execution id.
+            with contextlib.suppress(FileNotFoundError):
+                spill_path.unlink()
+            self._persist_failure(
+                session, execution_id, started, normalized, limit, source_ids, fingerprints, exc
+            )
+            if isinstance(exc, QueryExecutionError):
+                raise
+            raise QueryExecutionError(str(exc)) from exc
 
         execution = ExecutionRecord(
             id=execution_id,
@@ -302,15 +268,122 @@ class QueryService:
             completed_at=datetime.now(UTC),
             runtime=self._runtime(),
             result_preview={
-                "columns": columns,
-                "rows": serial_rows,
+                "columns": outcome["columns"],
+                "rows": outcome["rows"],
                 "result_complete": not spill_capped,
                 "spill_truncated": spill_capped,
             },
-            truncated=truncated,
-            artifact_ids=artifact_ids,
+            truncated=bool(outcome["truncated"]),
+            artifact_ids=[artifact_id] if artifact_id is not None else [],
         )
         self.executions.add(execution)
+        return self._build_result(execution.id, outcome, artifact_id, artifact_rows, spill_cap)
+
+    def _resolve_sources(
+        self, session: AnalysisSession, source_ids: list[str]
+    ) -> list[_ResolvedSource]:
+        """Resolve each referenced source to its file and re-check its fingerprint."""
+
+        resolved: list[_ResolvedSource] = []
+        for source_id in source_ids:
+            source = self.sources.get(session.id, source_id)
+            if source.relative_path is None:
+                raise QueryRejected("URI/database sources are not supported by local query")
+            path = self.workspace.resolve_file(session.workspace_root, source.relative_path)
+            # Recompute the fingerprint at execution start so results are always attributable to
+            # the exact bytes queried; a source modified after inspection is rejected.
+            current = fingerprint_file(path)
+            if current.get("sha256") != source.fingerprint.get("sha256"):
+                raise QueryRejected(
+                    f"source {source_id} changed since inspection; re-inspect before querying"
+                )
+            resolved.append(_ResolvedSource(source_id, source.kind, str(path), current))
+        return resolved
+
+    @staticmethod
+    def _rewrite_references(
+        sql: str, references: list[tuple[int, int, str]], view_names: dict[str, str]
+    ) -> str:
+        """Replace each ``source('src_...')`` reference with its view name, last first."""
+
+        for start, end, source_id in reversed(references):
+            sql = sql[:start] + f'"{view_names[source_id]}"' + sql[end:]
+        return sql
+
+    def _build_request(
+        self,
+        session: AnalysisSession,
+        sql: str,
+        references: list[tuple[int, int, str]],
+        resolved: list[_ResolvedSource],
+        limit: int,
+        spill_cap: int,
+        spill_path: Path,
+        require_complete: bool,
+    ) -> QueryRequest:
+        # Unguessable per-execution view/table names cannot be shadowed by a caller CTE.
+        token = uuid4().hex
+        view_names = {
+            source.source_id: f"_src_{token}_{index}" for index, source in enumerate(resolved)
+        }
+        return QueryRequest(
+            sources=tuple(
+                SourceView(
+                    view=view_names[source.source_id], kind=source.kind.value, path=source.path
+                )
+                for source in resolved
+            ),
+            sql=self._rewrite_references(sql, references, view_names),
+            result_table=f"_result_{token}",
+            limit=limit,
+            spill_cap=spill_cap,
+            spill_path=str(spill_path),
+            # Bound the spill as it is written at the *remaining* session budget, so a session
+            # that already holds artifacts cannot over-write before registration rejects it.
+            spill_byte_ceiling=self.artifacts.spill_byte_ceiling(session.id),
+            require_complete=require_complete,
+            limits=self.data_plane.limits(self.settings.query_timeout_seconds),
+        )
+
+    def _register_spill(
+        self,
+        session_id: str,
+        execution_id: str,
+        spill_path: Path,
+        source_ids: list[str],
+        *,
+        preview_rows: int,
+        artifact_rows: int,
+        spill_capped: bool,
+        spill_cap: int,
+    ) -> str:
+        artifact = self.artifacts.register_file(
+            session_id,
+            execution_id,
+            spill_path,
+            lineage={"change": "query_result_spill", "source_ids": source_ids},
+            metadata={
+                "format": "parquet",
+                "preview_rows": preview_rows,
+                "query_truncated": True,
+                "spill_row_count": artifact_rows,
+                "spill_truncated": spill_capped,
+                "result_complete": not spill_capped,
+                "max_spill_rows": spill_cap,
+            },
+        )
+        return artifact.id
+
+    @staticmethod
+    def _build_result(
+        execution_id: str,
+        outcome: dict[str, Any],
+        artifact_id: str | None,
+        artifact_rows: int,
+        spill_cap: int,
+    ) -> dict[str, Any]:
+        rows: list[list[Any]] = outcome["rows"]
+        spill_capped = bool(outcome["spill_capped"])
         completeness_note = (
             f"Result exceeded max_spill_rows ({spill_cap}); the artifact holds only "
             f"{artifact_rows} rows, an arbitrary subset unless the query has a total "
@@ -319,18 +392,18 @@ class QueryService:
             else None
         )
         return {
-            "execution_id": execution.id,
-            "columns": columns,
-            "rows": serial_rows,
-            "row_count_returned": len(serial_rows),
-            "truncated": truncated,
+            "execution_id": execution_id,
+            "columns": outcome["columns"],
+            "rows": rows,
+            "row_count_returned": len(rows),
+            "truncated": bool(outcome["truncated"]),
             "artifact_id": artifact_id,
             # Full-result completeness, distinct from preview truncation.
             "result_complete": not spill_capped,
             "spill_truncated": spill_capped,
             "max_spill_rows": spill_cap,
             "artifact_row_count": artifact_rows if artifact_id is not None else None,
-            "result_row_count": None if spill_capped else materialized,
+            "result_row_count": None if spill_capped else int(outcome["materialized"]),
             "completeness_note": completeness_note,
             "source_attestation": SourceAttestation.ENFORCED.value,
         }
@@ -342,6 +415,8 @@ class QueryService:
     def _persist_failure(
         self,
         session: AnalysisSession,
+        execution_id: str,
+        started: datetime,
         sql: str,
         limit: int,
         source_ids: list[str],
@@ -355,12 +430,14 @@ class QueryService:
             # Report the worker-side error type (e.g. BinderException) and its category.
             error = {"type": exc.error_type, "category": exc.category, "message": str(exc)}
         record = ExecutionRecord(
+            id=execution_id,
             session_id=session.id,
             execution_type=ExecutionType.MANAGED_SQL,
             status=status,
             request={"sql": sql, "max_rows": limit},
             source_ids=source_ids,
             source_fingerprints=fingerprints,
+            started_at=started,
             completed_at=datetime.now(UTC),
             runtime=self._runtime(),
             error=error,
