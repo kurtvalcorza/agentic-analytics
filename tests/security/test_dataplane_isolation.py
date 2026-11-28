@@ -13,8 +13,10 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from _dataplane import profile_request
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
+from agentic_analytics.dataplane.requests import QueryRequest, SourceView
 from agentic_analytics.models import AnalysisSession, ExecutionStatus, SessionMode
 from agentic_analytics.runtime import Runtime
 from agentic_analytics.services.inspector import SourceInspectionError
@@ -63,7 +65,7 @@ def _fake(tmp_path: Path, script: str, **settings: Any) -> DataPlaneClient:
 
 
 def _call(client: DataPlaneClient, deadline: float = 30) -> dict[str, Any]:
-    return client.call("profile", {"limits": client.limits(deadline)}, deadline_seconds=deadline)
+    return client.call(profile_request(client, deadline), deadline_seconds=deadline)
 
 
 # --- containment of worker failures -----------------------------------------------------------
@@ -475,9 +477,7 @@ def test_worker_error_text_is_redacted_before_it_leaves_the_client(tmp_path: Pat
     client = _fake(tmp_path, script, allowed_workspace_roots=[workspace])
 
     with pytest.raises(DataPlaneError) as caught:
-        client.call(
-            "profile", {"limits": client.limits(5), "path": str(source)}, deadline_seconds=5
-        )
+        client.call(profile_request(client, 5, str(source)), deadline_seconds=5)
 
     public = str(caught.value)
     assert caught.value.category == "source_read"
@@ -494,11 +494,11 @@ def test_worker_that_never_reads_stdin_cannot_block_past_deadline(tmp_path: Path
     # The request is several times a pipe buffer (64 KiB on Linux) and the worker never reads
     # it, so a blocking write in the caller would hang forever.
     client = _fake(tmp_path, "import time\ntime.sleep(120)\n")
-    payload = {"limits": client.limits(1), "padding": "x" * (8 * 1024 * 1024)}
+    request = profile_request(client, 1, "/" + "x" * (8 * 1024 * 1024))
     started = time.monotonic()
 
     with pytest.raises(DataPlaneError) as caught:
-        client.call("profile", payload, deadline_seconds=1)
+        client.call(request, deadline_seconds=1)
 
     assert caught.value.category == "timeout"
     assert time.monotonic() - started < 10
@@ -553,17 +553,16 @@ def test_spill_write_failure_is_not_reported_as_source_read(tmp_path: Path) -> N
 
     with pytest.raises(DataPlaneError) as caught:
         client.call(
-            "query",
-            {
-                "sources": [{"view": "v", "kind": "parquet", "path": str(data)}],
-                "sql": 'SELECT * FROM "v"',
-                "result_table": "t",
-                "limit": 1,
-                "spill_cap": 1_000_000,
-                "spill_path": str(archive / "spill.parquet"),
-                "spill_byte_ceiling": 10 * 1024**3,
-                "limits": client.limits(120),
-            },
+            QueryRequest(
+                sources=(SourceView(view="v", kind="parquet", path=str(data)),),
+                sql='SELECT * FROM "v"',
+                result_table="t",
+                limit=1,
+                spill_cap=1_000_000,
+                spill_path=str(archive / "spill.parquet"),
+                spill_byte_ceiling=10 * 1024**3,
+                limits=client.limits(120),
+            ),
             deadline_seconds=120,
         )
 

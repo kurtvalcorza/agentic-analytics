@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
+from agentic_analytics.dataplane.requests import TableStatsRequest
 from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.models import (
     READABLE_SOURCE_KINDS,
@@ -37,19 +39,28 @@ class ValidationContext:
     # Isolated DuckDB worker (SEC-02); required by the checks that read source data.
     data_plane: DataPlaneClient | None = None
 
-    def table_stats(self, source: DataSource, path: Path, **request: Any) -> dict[str, Any]:
+    def table_stats(
+        self,
+        source: DataSource,
+        path: Path,
+        *,
+        null_counts: bool = False,
+        distinct: bool = False,
+        duplicate_keys: Sequence[str] = (),
+    ) -> dict[str, Any]:
         if self.data_plane is None:
             raise RuntimeError("data-reading validation checks require a data-plane client")
         timeout = self.data_plane.settings.data_plane_timeout_seconds
         try:
             return self.data_plane.call(
-                "table_stats",
-                {
-                    "path": str(path),
-                    "kind": source.kind.value,
-                    "limits": self.data_plane.limits(timeout),
-                    **request,
-                },
+                TableStatsRequest(
+                    path=str(path),
+                    kind=source.kind.value,
+                    limits=self.data_plane.limits(timeout),
+                    null_counts=null_counts,
+                    distinct=distinct,
+                    duplicate_keys=tuple(duplicate_keys),
+                ),
                 deadline_seconds=timeout,
             )
         except DataPlaneError as exc:

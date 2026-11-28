@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
+from agentic_analytics.dataplane.requests import QueryRequest, SourceView
 from agentic_analytics.ids import EntityType, new_id
 from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.models import (
@@ -214,26 +215,26 @@ class QueryService:
         # also truncates the preview, so a capped result is always spilled.
         spill_cap = max(self.settings.max_spill_rows, limit)
         timeout = self.settings.query_timeout_seconds
-        payload = {
-            "sources": [
-                {"view": view_names[source_id], "kind": kind.value, "path": file_path}
+        request = QueryRequest(
+            sources=tuple(
+                SourceView(view=view_names[source_id], kind=kind.value, path=str(file_path))
                 for source_id, kind, file_path, _ in resolved_sources
-            ],
-            "sql": rewritten,
-            "result_table": f"_result_{token}",
-            "limit": limit,
-            "spill_cap": spill_cap,
-            "spill_path": str(spill_path),
+            ),
+            sql=rewritten,
+            result_table=f"_result_{token}",
+            limit=limit,
+            spill_cap=spill_cap,
+            spill_path=str(spill_path),
             # Bound the spill as it is written at the *remaining* session budget, so a session
             # that already holds artifacts cannot over-write before registration rejects it.
-            "spill_byte_ceiling": self.artifacts.spill_byte_ceiling(session.id),
-            "require_complete": require_complete,
-            "limits": self.data_plane.limits(timeout),
-        }
+            spill_byte_ceiling=self.artifacts.spill_byte_ceiling(session.id),
+            require_complete=require_complete,
+            limits=self.data_plane.limits(timeout),
+        )
         started = datetime.now(UTC)
         try:
             # Materialize, preview, and spill each have their own deadline inside the worker.
-            outcome = self.data_plane.call("query", payload, deadline_seconds=3 * timeout)
+            outcome = self.data_plane.call(request, deadline_seconds=3 * timeout)
         except DataPlaneError as exc:
             # Never register a partial or over-limit spill: drop the file and audit the failure.
             with contextlib.suppress(FileNotFoundError):
