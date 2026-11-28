@@ -126,7 +126,7 @@ class DataPlaneClient:
     kill_grace_seconds = _KILL_GRACE_SECONDS
     # Ask the kernel to kill the worker when the server exits (Linux PR_SET_PDEATHSIG). The
     # worker starts its portable parent-polling watchdog only when the death signal could not
-    # be armed (macOS, Windows, a failed prctl, or this flag off); tests turn the flag off to
+    # be armed (macOS, a failed prctl, or this flag off); tests turn the flag off to
     # exercise the watchdog alone.
     parent_death_signal = True
 
@@ -226,17 +226,12 @@ class DataPlaneClient:
         # Coverage measurement settings only (no credentials), so test runs can measure the
         # worker the same way they measure the server.
         env.update({key: value for key, value in os.environ.items() if key.startswith("COVERAGE_")})
-        if os.name == "nt":  # pragma: no cover - Windows needs these to start Python
-            for name in ("SYSTEMROOT", "TEMP", "TMP"):
-                if name in os.environ:
-                    env[name] = os.environ[name]
         return env
 
     @staticmethod
     def _kill_group(pgid: int) -> None:
-        if os.name == "posix":
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pgid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
 
     def _kill(self, proc: subprocess.Popen[bytes]) -> None:
         self._kill_group(proc.pid)
@@ -263,7 +258,7 @@ class DataPlaneClient:
             stderr=subprocess.PIPE,
             cwd=workdir,
             env=self._environment(),
-            start_new_session=os.name == "posix",
+            start_new_session=True,
         )
         reaped = False
         try:

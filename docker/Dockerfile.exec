@@ -28,8 +28,8 @@ RUN python -m pip install --no-cache-dir --require-hashes --no-deps --only-binar
         -r /tmp/requirements-exec.txt \
     && rm /tmp/requirements-exec.txt
 
-# Fixed unprivileged identity. The backend always passes an explicit non-root --user (the
-# server's own uid:gid on POSIX hosts, this identity elsewhere) and refuses uid 0.
+# Fixed unprivileged identity for running the image by hand. The backend always passes an
+# explicit non-root --user (the server's own uid:gid, or docker_user) and refuses uid 0.
 RUN groupadd --gid 10001 analytics \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /tmp \
        --shell /usr/sbin/nologin analytics

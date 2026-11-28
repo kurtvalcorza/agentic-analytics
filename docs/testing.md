@@ -23,10 +23,11 @@ A number above 0 means the data-plane tests can run. 0 means the kernel has no L
 it is not in the kernel's LSM list), and every data-plane worker fails closed with
 `sandbox_unavailable`.
 
-**Windows.** Run the suite inside a WSL2 distribution. It has been run from a clone in the
-Linux filesystem (for example `~/src`); a checkout under `/mnt/c` is untested. The suite does not run natively on
-Windows, and `mypy src` there reports POSIX-only names (`os.killpg`, `resource.RLIMIT_*`)
-that are not errors on Linux.
+**Windows.** Native Windows is not supported: importing the package raises
+`UnsupportedPlatformError`. Run the suite inside a WSL2 distribution. It has been run from a
+clone in the Linux filesystem (for example `~/src`); a checkout under `/mnt/c` is untested.
+`ruff` works on Windows, but `mypy src` there reports POSIX-only names (`fcntl`,
+`os.killpg`, `resource.RLIMIT_*`) that are not errors on Linux.
 
 ## Steps
 

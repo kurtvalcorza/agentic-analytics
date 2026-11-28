@@ -39,9 +39,6 @@ from .output_quota import (
     read_capped,
 )
 
-# Fixed unprivileged identity baked into docker/Dockerfile.exec. Used whenever the host cannot
-# supply a non-root numeric identity (non-POSIX Docker Desktop hosts).
-DEFAULT_CONTAINER_USER = "10001:10001"
 _VERDICT_POLL_SECONDS = 0.2
 # The supervisor enforces the script's own timeout from the moment the script starts. The
 # server's backstop adds this much for container start-up and judgement, so slow start-up
@@ -95,10 +92,9 @@ class DockerBackend:
     def _user_args(self) -> list[str]:
         """Always pass an explicit, non-root container identity.
 
-        POSIX hosts reuse the server's own uid/gid so bind-mounted workspace writes keep the
-        caller's ownership. Hosts without a numeric identity use the image's fixed unprivileged
-        user. A root server is refused rather than silently running managed code as uid 0;
-        operators can opt into a specific identity with ``docker_user``.
+        The server's own uid/gid is reused so bind-mounted workspace writes keep the caller's
+        ownership. A root server is refused rather than silently running managed code as uid
+        0; operators can opt into a specific identity with ``docker_user``.
         """
 
         if self.user is not None:
@@ -108,17 +104,13 @@ class DockerBackend:
                     "refusing to run managed code as container root (docker_user uid 0)"
                 )
             return ["--user", self.user]
-        getuid = getattr(os, "getuid", None)
-        getgid = getattr(os, "getgid", None)
-        if os.name != "posix" or getuid is None or getgid is None:
-            return ["--user", DEFAULT_CONTAINER_USER]
-        if getuid() == 0:
+        if os.getuid() == 0:
             raise DockerExecutionError(
                 "refusing to run managed code as container root: the server is running as "
                 "root. Run it as an unprivileged user or set AGENTIC_ANALYTICS_DOCKER_USER "
                 "to a non-root 'uid:gid' that can write the workspace."
             )
-        return ["--user", f"{getuid()}:{getgid()}"]
+        return ["--user", f"{os.getuid()}:{os.getgid()}"]
 
     @staticmethod
     def _run(

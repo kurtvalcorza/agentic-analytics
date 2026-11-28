@@ -40,20 +40,11 @@ class SubprocessDevBackend:
 
     @staticmethod
     def _kill_tree(proc: subprocess.Popen[str]) -> None:
-        if os.name == "posix":
-            # The child leads its own session, so this reaches every descendant it spawned,
-            # including ones that outlive the direct child (the group persists while any
-            # member does, so its id cannot be reused by an unrelated process meanwhile).
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            with contextlib.suppress(OSError):
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True,
-                    check=False,
-                    timeout=30,
-                )
+        # The child leads its own session, so this reaches every descendant it spawned,
+        # including ones that outlive the direct child (the group persists while any
+        # member does, so its id cannot be reused by an unrelated process meanwhile).
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
         with contextlib.suppress(OSError):
             proc.kill()
 
@@ -77,8 +68,6 @@ class SubprocessDevBackend:
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
         }
-        if os.name == "nt":
-            env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
         runtime: dict[str, object] = {"backend": self.name, "conformant": False}
         excluded = (self.protected_state_root,) if self.protected_state_root else ()
         holder: list[subprocess.Popen[str]] = []
@@ -102,7 +91,7 @@ class SubprocessDevBackend:
             text=True,
             encoding="utf-8",
             errors="replace",
-            start_new_session=os.name == "posix",
+            start_new_session=True,
         )
         holder.append(proc)
         assert proc.stdout is not None and proc.stderr is not None

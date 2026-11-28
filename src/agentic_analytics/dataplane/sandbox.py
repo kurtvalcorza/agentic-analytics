@@ -22,12 +22,11 @@ itself runs. ``no_new_privs`` is set first, so a setuid binary cannot regain pri
   ``fcntl`` signal ownership, file metadata writes (mode, owner, times, extended attributes),
   kernel keyrings, and SysV and POSIX message-queue IPC. See ``seccomp_program``.
 * **Parent-death binding.** On Linux the worker asks the kernel for ``SIGKILL`` when its parent
-  thread exits (``PR_SET_PDEATHSIG``). Where that is unavailable (macOS, Windows, or a failed
-  ``prctl``), a watchdog thread polls the parent instead (POSIX: ``getppid`` changes once the
-  worker is orphaned; Windows: a handle wait on the parent process), so an orphaned worker
-  exits within about a quarter second.
+  thread exits (``PR_SET_PDEATHSIG``). Where that is unavailable (macOS or a failed
+  ``prctl``), a watchdog thread polls the parent instead (``getppid`` changes once the
+  worker is orphaned), so an orphaned worker exits within about a quarter second.
 
-Landlock and seccomp are not available on macOS or Windows (Windows uses the watchdog only).
+Landlock and seccomp are not available on macOS. Native Windows is not supported (C14).
 ``data_plane_sandbox`` selects the behaviour: ``auto`` (default) enforces both on Linux and
 fails closed when the kernel lacks either, and runs without confinement elsewhere; ``required``
 fails closed on every platform without them; ``off`` disables confinement explicitly.
@@ -701,17 +700,6 @@ def _watch_posix(parent_pid: int) -> None:
         time.sleep(_PARENT_POLL_SECONDS)
 
 
-def _watch_windows(parent_pid: int) -> None:  # pragma: no cover - exercised on Windows only
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-    synchronize = 0x00100000
-    handle = kernel32.OpenProcess(synchronize, False, parent_pid)
-    if not handle:
-        _orphaned()
-    infinite = 0xFFFFFFFF
-    kernel32.WaitForSingleObject(handle, infinite)
-    _orphaned()
-
-
 def bind_to_parent(parent_pid: int | None, *, pdeathsig: bool = True) -> bool:
     """Make this process exit when ``parent_pid`` exits (see the module docstring).
 
@@ -736,12 +724,11 @@ def start_parent_watchdog(parent_pid: int | None) -> None:
 
     if not parent_pid or parent_pid <= 0:
         return
-    target = _watch_windows if os.name == "nt" else _watch_posix
     # A small stack: the worker's address-space limit is budgeted for DuckDB, not for this.
     previous = threading.stack_size(256 * 1024)
     try:
         threading.Thread(
-            target=target, args=(parent_pid,), name="parent-watchdog", daemon=True
+            target=_watch_posix, args=(parent_pid,), name="parent-watchdog", daemon=True
         ).start()
     finally:
         threading.stack_size(previous)
