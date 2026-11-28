@@ -52,6 +52,9 @@ class _FailingBackend:
     def execute(self, session, script_path, timeout_seconds, *, readonly_paths=()):
         raise RuntimeError("backend unavailable")
 
+    def rollback_outputs(self, result, script_path) -> None:
+        return None
+
     def close_session(self, session_id: str) -> None:
         return None
 

@@ -10,8 +10,8 @@ from agentic_analytics.layout import INTERNAL_DIR_NAME
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
 from agentic_analytics.procutil import drain_bounded, kill_tree
 
-from .base import BackendResult
-from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard
+from .base import BackendResult, Outcome
+from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard, disk_breach_outcome
 
 
 class SubprocessDevBackend:
@@ -114,34 +114,32 @@ class SubprocessDevBackend:
         kill_tree(proc)
         for thread in threads:
             thread.join(timeout=10)
-        stdout = "".join(out_buffer)
-        stderr = "".join(err_buffer)
-        resource_limit: str | None = None
-        exit_code: int | None = proc.returncode
         # Catch writers that finished before the first poll, then reclaim their output.
         if guard.final_check() is not None:
-            guard.reclaim()
-            status = ExecutionStatus.FAILED
-            stderr = f"execution terminated: {guard.reason}"
-            resource_limit = "disk"
-            runtime["resource_limit"] = "disk"
-            runtime["retained_output_bytes"] = guard.retained_bytes
+            outcome = disk_breach_outcome(guard, exit_code=proc.returncode)
         elif timed_out:
-            status = ExecutionStatus.TIMED_OUT
-            stderr = stderr or f"execution exceeded {timeout_seconds} seconds"
-            exit_code = None
+            outcome = Outcome(
+                status=ExecutionStatus.TIMED_OUT,
+                stderr_fallback=f"execution exceeded {timeout_seconds} seconds",
+            )
         else:
-            status = ExecutionStatus.SUCCEEDED if proc.returncode == 0 else ExecutionStatus.FAILED
-        return BackendResult(
-            status=status,
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=exit_code,
+            outcome = Outcome(
+                status=ExecutionStatus.SUCCEEDED
+                if proc.returncode == 0
+                else ExecutionStatus.FAILED,
+                exit_code=proc.returncode,
+            )
+        return outcome.result(
+            stdout="".join(out_buffer),
+            stderr="".join(err_buffer),
             runtime=runtime,
             stdout_truncated=stdout_truncated.is_set(),
             stderr_truncated=stderr_truncated.is_set(),
-            resource_limit=resource_limit,
         )
+
+    def rollback_outputs(self, result: BackendResult, script_path: Path) -> None:
+        # Host-native runs write the workspace directly; nothing was copied in to undo.
+        del result, script_path
 
     def close_session(self, session_id: str) -> None:
         del session_id

@@ -39,6 +39,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agentic_analytics import limits
+from agentic_analytics.models import ExecutionStatus
+
+from .base import Outcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,3 +253,16 @@ class WorkspaceDiskGuard:
             if reason is not None and self._record(reason):
                 self.on_breach(reason)
                 return
+
+
+def disk_breach_outcome(guard: WorkspaceDiskGuard, *, exit_code: int | None = None) -> Outcome:
+    """Reclaim what the workload created and report the breach (shared by both backends)."""
+
+    guard.reclaim()
+    return Outcome(
+        status=ExecutionStatus.FAILED,
+        exit_code=exit_code,
+        stderr=f"execution terminated: {guard.reason}",
+        resource_limit="disk",
+        runtime={"resource_limit": "disk", "retained_output_bytes": guard.retained_bytes},
+    )
