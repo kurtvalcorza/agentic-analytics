@@ -7,6 +7,8 @@ from agentic_analytics.models import AnalysisSession, SessionMode
 from agentic_analytics.runtime import Runtime
 from agentic_analytics.settings import Settings
 
+pytestmark = pytest.mark.docker
+
 
 def test_docker_execution_isolates_host_secrets_network_and_other_sessions(
     tmp_path: Path, monkeypatch

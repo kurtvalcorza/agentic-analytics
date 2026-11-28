@@ -6,6 +6,8 @@ from agentic_analytics.models import AnalysisSession, SessionMode
 from agentic_analytics.runtime import Runtime
 from agentic_analytics.settings import Settings
 
+pytestmark = pytest.mark.docker
+
 
 def _runtime(tmp_path: Path, workspace: Path, *, timeout: int = 5) -> Runtime:
     return Runtime.create(

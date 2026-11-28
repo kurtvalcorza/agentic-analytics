@@ -119,10 +119,12 @@ def test_run_pins_files_created_while_watching(tmp_path: Path) -> None:
         (tmp_path / "sub").mkdir()
         (tmp_path / "sub" / "late.csv").write_text("late")
         deadline = time.monotonic() + 5
-        while len(watcher.pinned) < 1 and time.monotonic() < deadline:
+        while not watcher.pinned and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert len(watcher.pinned) == 1
-        assert os.readlink(f"/proc/self/fd/{watcher.pinned[0]}").endswith("late.csv")
+        # The new directory's scan and its inotify event can both see late.csv, so it may be
+        # pinned twice (a spare descriptor, as before C9); what matters is which files are held.
+        pinned = {os.readlink(f"/proc/self/fd/{fd}") for fd in list(watcher.pinned)}
+        assert pinned == {str(tmp_path / "sub" / "late.csv")}
     finally:
         watcher.stop.set()
         thread.join(5)
