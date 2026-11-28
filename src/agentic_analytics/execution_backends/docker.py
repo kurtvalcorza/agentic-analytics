@@ -21,8 +21,8 @@ from agentic_analytics.layout import INTERNAL_DIR_NAME
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
 from agentic_analytics.procutil import drain_bounded
 
-from .base import BackendResult
-from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard
+from .base import BackendResult, Outcome
+from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard, disk_breach_outcome
 from .output_quota import (
     CONTAINER_OUTPUT_DIR,
     OUTPUT_DIR_NAME,
@@ -38,6 +38,7 @@ from .output_quota import (
     parse_verdict,
     quota_threshold,
     read_capped,
+    remove_outputs,
 )
 
 _VERDICT_POLL_SECONDS = 0.2
@@ -411,26 +412,16 @@ class DockerBackend:
         out_thread.start()
         err_thread.start()
 
-        # Docker keeps an attached container's streams open until the container exits, so
-        # completion of the managed script is observed through the supervisor's verdict file.
         # The container stays alive (blocked on stdin) until outputs have been copied out.
-        outcome: dict[str, Any] = {"status": ExecutionStatus.FAILED}
+        outcome = Outcome(status=ExecutionStatus.FAILED)
         try:
             with contextlib.suppress(OSError):
                 proc.stdin.write(key + "\n")
                 proc.stdin.flush()
-            verdict_ready = False
             with guard:
-                deadline = time.monotonic() + timeout_seconds + _SERVER_GRACE_SECONDS
-                while time.monotonic() < deadline:
-                    if proc.poll() is not None:
-                        break  # the container died before reporting
-                    probe = self._exec(container, ["test", "-f", VERDICT_PATH])
-                    if probe == 0:
-                        verdict_ready = True
-                        break
-                    time.sleep(_VERDICT_POLL_SECONDS)
-                timed_out = not verdict_ready and proc.poll() is None
+                timed_out = self._await_verdict(
+                    proc, container, timeout_seconds + _SERVER_GRACE_SECONDS
+                )
                 if timed_out:
                     kill_container()
             outcome = self._judge(
@@ -456,20 +447,34 @@ class DockerBackend:
             self._run(["rm", "-f", container], timeout=30)
             out_thread.join(timeout=10)
             err_thread.join(timeout=10)
-        stderr = outcome.get("stderr")
-        if stderr is None and not err_buffer:
-            stderr = outcome.get("stderr_default")
-        return BackendResult(
-            status=outcome["status"],
+        return outcome.result(
             stdout="".join(out_buffer),
-            stderr="".join(err_buffer) if stderr is None else stderr,
-            exit_code=outcome.get("exit_code"),
-            runtime=outcome.get("runtime", runtime),
+            stderr="".join(err_buffer),
+            runtime=runtime,
             stdout_truncated=stdout_truncated.is_set(),
             stderr_truncated=stderr_truncated.is_set(),
-            resource_limit=outcome.get("resource_limit"),
-            output_paths=outcome.get("output_paths", ()),
         )
+
+    def _await_verdict(self, proc: subprocess.Popen[str], container: str, seconds: float) -> bool:
+        """Wait for the supervisor's verdict file; return True when the run timed out.
+
+        Docker keeps an attached container's streams open until the container exits, so the
+        managed script's completion is observed through the verdict file instead.
+        """
+
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return False  # the container died before reporting
+            if self._exec(container, ["test", "-f", VERDICT_PATH]) == 0:
+                return False
+            time.sleep(_VERDICT_POLL_SECONDS)
+        return proc.poll() is None
+
+    def rollback_outputs(self, result: BackendResult, script_path: Path) -> None:
+        # Copied-out outputs that cannot be registered are removed, and the earlier outputs
+        # they replaced are put back from the run's restore directory.
+        remove_outputs(result.output_paths, script_path.parent / RESTORE_DIR_NAME)
 
     def _judge(
         self,
@@ -482,74 +487,59 @@ class DockerBackend:
         timed_out: bool,
         runtime: dict[str, Any],
         restore_dir: Path,
-    ) -> dict[str, Any]:
+    ) -> Outcome:
         """Decide the run's outcome while its container (and tmpfs) is still alive."""
 
+        timed_out_text = f"execution exceeded {timeout_seconds} seconds"
         if guard.final_check() is not None:
-            guard.reclaim()
-            return {
-                "status": ExecutionStatus.FAILED,
-                "stderr": f"execution terminated: {guard.reason}",
-                "runtime": {
-                    **runtime,
-                    "resource_limit": "disk",
-                    "retained_output_bytes": guard.retained_bytes,
-                },
-                "resource_limit": "disk",
-            }
+            return disk_breach_outcome(guard)
         if timed_out:
-            return {
-                "status": ExecutionStatus.TIMED_OUT,
-                "stderr_default": f"execution exceeded {timeout_seconds} seconds",
-            }
+            return Outcome(status=ExecutionStatus.TIMED_OUT, stderr_fallback=timed_out_text)
         raw = self._exec_output(container, ["head", "-c", str(VERDICT_MAX_BYTES), VERDICT_PATH])
         verdict = parse_verdict(raw, key) if raw is not None else None
         if verdict is None:
             # The container died early, or the verdict is missing or forged: fail closed.
-            return {
-                "status": ExecutionStatus.FAILED,
-                "stderr": "managed execution ended without a valid supervisor verdict",
-            }
+            return Outcome(
+                status=ExecutionStatus.FAILED,
+                stderr="managed execution ended without a valid supervisor verdict",
+            )
         runtime["output_min_free_bytes"] = verdict.min_free_bytes
         if verdict.timed_out:
-            return {
-                "status": ExecutionStatus.TIMED_OUT,
-                "stderr_default": (f"execution exceeded {timeout_seconds} seconds"),
-            }
+            return Outcome(status=ExecutionStatus.TIMED_OUT, stderr_fallback=timed_out_text)
         if verdict.others_remaining:
-            return {
-                "status": ExecutionStatus.FAILED,
-                "stderr": "execution terminated: processes outlived the script and could "
+            return Outcome(
+                status=ExecutionStatus.FAILED,
+                stderr="execution terminated: processes outlived the script and could "
                 "not be stopped; outputs were discarded",
-            }
+            )
         if verdict.quota_exhausted:
-            return {
-                "status": ExecutionStatus.FAILED,
-                "stderr": (
+            return Outcome(
+                status=ExecutionStatus.FAILED,
+                stderr=(
                     "execution terminated: outputs/ reached its quota of "
                     f"{self.output_quota_bytes} bytes; partial outputs were discarded"
                 ),
-                "exit_code": verdict.exit_code,
-                "runtime": {**runtime, "resource_limit": "disk", "retained_output_bytes": 0},
-                "resource_limit": "disk",
-            }
+                exit_code=verdict.exit_code,
+                runtime={"resource_limit": "disk", "retained_output_bytes": 0},
+                resource_limit="disk",
+            )
         failure, created = self._copy_out(container, workspace, readonly_paths, restore_dir)
         if failure is not None:
-            return {
-                "status": ExecutionStatus.FAILED,
-                "stderr": f"execution terminated: {failure}",
-                "exit_code": verdict.exit_code,
-                "runtime": {**runtime, "resource_limit": "output_archive"},
-                "resource_limit": "output_archive",
-            }
+            return Outcome(
+                status=ExecutionStatus.FAILED,
+                stderr=f"execution terminated: {failure}",
+                exit_code=verdict.exit_code,
+                runtime={"resource_limit": "output_archive"},
+                resource_limit="output_archive",
+            )
         # A failed script's outputs are still copied out, as before SEC-01, so a caller can
         # inspect partial work; they are never reported as a success.
         status = ExecutionStatus.SUCCEEDED if verdict.exit_code == 0 else ExecutionStatus.FAILED
-        return {
-            "status": status,
-            "exit_code": verdict.exit_code,
-            "output_paths": tuple(str(path) for path in created),
-        }
+        return Outcome(
+            status=status,
+            exit_code=verdict.exit_code,
+            output_paths=tuple(str(path) for path in created),
+        )
 
     def _copy_out(
         self,

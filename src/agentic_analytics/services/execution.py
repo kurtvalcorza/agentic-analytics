@@ -8,10 +8,6 @@ from typing import Any
 
 from agentic_analytics.execution_backends import ExecutionBackend
 from agentic_analytics.execution_backends.base import BackendResult
-from agentic_analytics.execution_backends.output_quota import (
-    RESTORE_DIR_NAME,
-    remove_outputs,
-)
 from agentic_analytics.ids import EntityType, new_id
 from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.layout import scratch_dir
@@ -131,9 +127,9 @@ class ExecutionService:
                         )
                 except Exception as exc:
                     if result is not None:
-                        # Copied-out outputs that cannot be registered are not kept, and the
-                        # earlier outputs they replaced are put back.
-                        remove_outputs(result.output_paths, script_path.parent / RESTORE_DIR_NAME)
+                        # Outputs the backend copied in that cannot be registered are not
+                        # kept; how to undo them is the backend's business (C12).
+                        self.backend.rollback_outputs(result, script_path)
                     # Registration failures happen after code has already changed files.
                     # Preserve their audit record and any artifacts published before failure.
                     self._persist_backend_failure(
