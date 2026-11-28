@@ -29,6 +29,22 @@ dev = [
   "ruff>=0.12,<1",
 ]
 
+[dependency-groups]
+# Packages installed into the managed-execution image (docker/Dockerfile.exec), which exports
+# this group from uv.lock. Locking them here keeps the server and the sandbox on the same
+# versions and puts the image's packages in the supply-chain scan (D1). The floors are the
+# versions the image was last tested with, all with CPython 3.15 manylinux wheels.
+exec = [
+  "duckdb>=2.0.0,<3",
+  "matplotlib>=3.11.2,<4",
+  "numpy>=2.5.2,<3",
+  "pandas>=3.0.6,<4",
+  "pyarrow>=26.0.0,<27",
+  "scikit-learn>=1.9.1,<2",
+  "scipy>=1.18.1,<2",
+  "statsmodels>=0.15.0,<1",
+]
+
 [project.scripts]
 agentic-analytics = "agentic_analytics.server:main"
 
