@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import contextlib
-import os
-import signal
 import subprocess
 import sys
 import threading
@@ -11,9 +8,10 @@ from pathlib import Path
 from agentic_analytics import limits
 from agentic_analytics.layout import INTERNAL_DIR_NAME
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
+from agentic_analytics.procutil import drain_bounded, kill_tree
 
 from .base import BackendResult
-from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard, drain_bounded
+from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard
 
 
 class SubprocessDevBackend:
@@ -37,16 +35,6 @@ class SubprocessDevBackend:
         self.max_output_chars = max_output_chars
         self.disk_limits = disk_limits or DiskLimits()
         self.protected_state_root = protected_state_root
-
-    @staticmethod
-    def _kill_tree(proc: subprocess.Popen[str]) -> None:
-        # The child leads its own session, so this reaches every descendant it spawned,
-        # including ones that outlive the direct child (the group persists while any
-        # member does, so its id cannot be reused by an unrelated process meanwhile).
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        with contextlib.suppress(OSError):
-            proc.kill()
 
     def execute(
         self,
@@ -74,7 +62,7 @@ class SubprocessDevBackend:
 
         def on_breach(_: str) -> None:
             if holder:
-                self._kill_tree(holder[0])
+                kill_tree(holder[0])
 
         try:
             guard = WorkspaceDiskGuard(
@@ -118,10 +106,12 @@ class SubprocessDevBackend:
                 proc.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                self._kill_tree(proc)
+                kill_tree(proc)
                 proc.wait(timeout=30)
-        # A surviving grandchild could hold the pipes open; reap the whole group regardless.
-        self._kill_tree(proc)
+        # A surviving descendant could hold the pipes open, so the group is swept even after
+        # the leader is reaped. This reaches every descendant, including ones that closed
+        # their pipes; the group id stays reserved while any member is alive.
+        kill_tree(proc)
         for thread in threads:
             thread.join(timeout=10)
         stdout = "".join(out_buffer)

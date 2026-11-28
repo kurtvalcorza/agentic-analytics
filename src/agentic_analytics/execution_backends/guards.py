@@ -2,8 +2,6 @@
 
 These bound what the *server host* can be made to absorb while managed code runs:
 
-* :func:`drain_bounded` reads a child stream into a capped buffer while continuing to drain,
-  so a verbose child cannot exhaust server memory.
 * :class:`WorkspaceDiskGuard` watches the writable workspace during execution and reports a
   breach as soon as new output exceeds the configured byte/entry budget or host free space
   falls below a reserve, so the backend can kill the workload *before* the host filesystem is
@@ -39,28 +37,8 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
 
 from agentic_analytics import limits
-
-
-def drain_bounded(
-    stream: IO[str],
-    buffer: list[str],
-    max_chars: int,
-    truncated: threading.Event | None = None,
-) -> None:
-    """Read ``stream`` into ``buffer`` keeping at most ``max_chars``; keep draining the rest."""
-
-    total = 0
-    for chunk in iter(lambda: stream.read(65536), ""):
-        if len(chunk) > max_chars - total and truncated is not None:
-            truncated.set()
-        if total < max_chars:
-            take = chunk[: max_chars - total]
-            buffer.append(take)
-            total += len(take)
-    stream.close()
 
 
 @dataclass(frozen=True, slots=True)

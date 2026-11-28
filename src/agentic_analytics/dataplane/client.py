@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from agentic_analytics.layout import archive_dir, dataplane_scratch_dir
+from agentic_analytics.procutil import drain_bounded, kill_group, kill_tree
 from agentic_analytics.settings import Settings
 
 from .requests import EngineLimits, WorkerRequest
@@ -102,18 +103,6 @@ def redact_paths(message: str, files: list[str], roots: list[str]) -> str:
         if original and original not in {"/", os.sep}:
             message = message.replace(original, replacements[original])
     return message
-
-
-def _read_bounded(
-    stream: IO[bytes], buffer: bytearray, limit: int, overflow: threading.Event
-) -> None:
-    for chunk in iter(lambda: stream.read(65536), b""):
-        if len(buffer) + len(chunk) > limit:
-            overflow.set()
-            buffer.extend(chunk[: max(0, limit - len(buffer))])
-            continue  # keep draining so the worker never blocks on a full pipe
-        buffer.extend(chunk)
-    stream.close()
 
 
 def _write_request(stream: IO[bytes], request: bytes) -> None:
@@ -225,16 +214,6 @@ class DataPlaneClient:
         env.update({key: value for key, value in os.environ.items() if key.startswith("COVERAGE_")})
         return env
 
-    @staticmethod
-    def _kill_group(pgid: int) -> None:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(pgid, signal.SIGKILL)
-
-    def _kill(self, proc: subprocess.Popen[bytes]) -> None:
-        self._kill_group(proc.pid)
-        with contextlib.suppress(OSError):
-            proc.kill()
-
     def _run_worker(
         self, workdir: Path, request: bytes, deadline_seconds: float
     ) -> tuple[int | None, bytes, bool, bool]:
@@ -260,12 +239,12 @@ class DataPlaneClient:
         reaped = False
         try:
             assert proc.stdin and proc.stdout and proc.stderr
-            out = bytearray()
-            err = bytearray()
+            out: list[bytes] = []
+            err: list[bytes] = []
             out_overflow = threading.Event()
             readers = [
                 threading.Thread(
-                    target=_read_bounded,
+                    target=drain_bounded,
                     args=(
                         proc.stdout,
                         out,
@@ -273,10 +252,7 @@ class DataPlaneClient:
                         out_overflow,
                     ),
                 ),
-                threading.Thread(
-                    target=_read_bounded,
-                    args=(proc.stderr, err, _MAX_STDERR_BYTES, threading.Event()),
-                ),
+                threading.Thread(target=drain_bounded, args=(proc.stderr, err, _MAX_STDERR_BYTES)),
             ]
             # The request is written from its own thread, so a worker that never reads stdin
             # cannot block the server on a full pipe: the deadline below still applies, and
@@ -289,7 +265,7 @@ class DataPlaneClient:
                 proc.wait(timeout=deadline_seconds + self.kill_grace_seconds)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                self._kill(proc)  # leader not reaped yet: its group id is still ours
+                kill_tree(proc)  # leader not reaped yet: its group id is still ours
             proc.wait()
             reaped = True
             writer.join(timeout=5)
@@ -297,13 +273,13 @@ class DataPlaneClient:
                 reader.join(timeout=5)
             if any(thread.is_alive() for thread in (*readers, writer)):
                 # A descendant still holds the pipes, so the group still exists; kill it.
-                self._kill_group(proc.pid)
+                kill_group(proc.pid)
                 for thread in (*readers, writer):
                     thread.join(timeout=5)
-            return proc.returncode, bytes(out), out_overflow.is_set(), timed_out
+            return proc.returncode, b"".join(out), out_overflow.is_set(), timed_out
         finally:
             if not reaped:
-                self._kill(proc)
+                kill_tree(proc)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=30)
 

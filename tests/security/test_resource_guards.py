@@ -10,6 +10,7 @@ from typing import Any
 import _processes
 import pytest
 
+from agentic_analytics import procutil
 from agentic_analytics.execution_backends import guards
 from agentic_analytics.execution_backends.guards import DiskLimits, WorkspaceDiskGuard
 from agentic_analytics.models import AnalysisSession, ExecutionStatus, SessionMode
@@ -143,7 +144,7 @@ def test_drain_bounded_keeps_draining_past_cap() -> None:
     buffer: list[str] = []
     truncated = threading.Event()
 
-    guards.drain_bounded(stream, buffer, 1000, truncated)
+    procutil.drain_bounded(stream, buffer, 1000, truncated)
 
     assert "".join(buffer) == "z" * 1000
     assert truncated.is_set()

@@ -19,9 +19,10 @@ from uuid import uuid4
 from agentic_analytics import limits
 from agentic_analytics.layout import INTERNAL_DIR_NAME
 from agentic_analytics.models import AnalysisSession, ExecutionStatus
+from agentic_analytics.procutil import drain_bounded
 
 from .base import BackendResult
-from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard, drain_bounded
+from .guards import DiskGuardError, DiskLimits, WorkspaceDiskGuard
 from .output_quota import (
     CONTAINER_OUTPUT_DIR,
     OUTPUT_DIR_NAME,
