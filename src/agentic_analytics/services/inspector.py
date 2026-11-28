@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
+from agentic_analytics.dataplane.requests import ProfileRequest
 from agentic_analytics.integrity import fingerprint_file
 from agentic_analytics.models import (
     READABLE_SOURCE_SUFFIXES,
@@ -86,14 +87,13 @@ class InspectorService:
 
         timeout = self.settings.data_plane_timeout_seconds
         outcome = self.data_plane.call(
-            "profile",
-            {
-                "path": str(path),
-                "kind": kind.value,
-                "sample_limit": min(max(sample_rows, 1), self.settings.max_sample_rows),
-                "max_profile_columns": self.settings.max_profile_columns,
-                "limits": self.data_plane.limits(timeout),
-            },
+            ProfileRequest(
+                path=str(path),
+                kind=kind.value,
+                sample_limit=min(max(sample_rows, 1), self.settings.max_sample_rows),
+                max_profile_columns=self.settings.max_profile_columns,
+                limits=self.data_plane.limits(timeout),
+            ),
             deadline_seconds=timeout,
         )
         return outcome["schema"], outcome["profile"]

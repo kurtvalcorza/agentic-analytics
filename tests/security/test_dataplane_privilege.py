@@ -21,12 +21,14 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import _processes
 import pytest
+from _dataplane import profile_request
 
 from agentic_analytics.dataplane import DataPlaneClient, DataPlaneError
+from agentic_analytics.dataplane.requests import QueryRequest, SourceView
 from agentic_analytics.dataplane.sandbox import landlock_abi
 from agentic_analytics.settings import Settings
 
@@ -49,7 +51,7 @@ import agentic_analytics.dataplane.sandbox as sandbox
 
 def attack(request):
     import duckdb
-    targets = request["attack"]
+    targets = json.loads(os.environ["AGENTIC_ANALYTICS_TEST_ATTACK"])
     outcome = {}
 
     def attempt(name, action):
@@ -215,8 +217,17 @@ runpy.run_module("agentic_analytics.dataplane.worker", run_name="__main__")
 
 
 class _CompromisedWorker(DataPlaneClient):
+    # The attack's targets reach the worker through its environment: the request itself is
+    # typed and carries no extra fields (C10).
+    attack_targets: ClassVar[dict[str, str]] = {}
+
     def worker_command(self) -> list[str]:
         return [sys.executable, "-I", "-c", textwrap.dedent(_COMPROMISED_WORKER)]
+
+    def _environment(self) -> dict[str, str]:  # type: ignore[override]
+        env = DataPlaneClient._environment()
+        env["AGENTIC_ANALYTICS_TEST_ATTACK"] = json.dumps(self.attack_targets)
+        return env
 
 
 def _attack(tmp_path: Path, **settings: Any) -> tuple[dict[str, str], dict[str, Path]]:
@@ -263,13 +274,8 @@ def _attack(tmp_path: Path, **settings: Any) -> tuple[dict[str, str], dict[str, 
             "metadata_file": metadata_file,
         }
         client = _CompromisedWorker(Settings(state_dir=tmp_path / "state", **settings))
-        payload = {
-            "limits": client.limits(30),
-            "path": str(source),
-            "kind": "csv",
-            "attack": {key: str(value) for key, value in targets.items()},
-        }
-        outcome = client.call("profile", payload, deadline_seconds=30)
+        client.attack_targets = {key: str(value) for key, value in targets.items()}
+        outcome = client.call(profile_request(client, 30, str(source)), deadline_seconds=30)
         received = {"unix": False, "udp": False, "tcp": False}
         with contextlib.suppress(BlockingIOError):
             unix_listener.accept()[0].close()
@@ -387,10 +393,10 @@ def test_read_root_covering_a_protected_root_fails_closed(tmp_path: Path) -> Non
     client = DataPlaneClient(
         Settings(state_dir=tmp_path / "state", allowed_workspace_roots=[Path(sys.prefix)])
     )
-    policy = client.sandbox_policy({}, tmp_path)
+    policy = client.sandbox_policy(profile_request(client, 10), tmp_path)
     assert os.path.realpath(sys.prefix) in policy.protected_roots
     with pytest.raises(DataPlaneError) as caught:
-        client.call("profile", {"limits": client.limits(10)}, deadline_seconds=10)
+        client.call(profile_request(client, 10), deadline_seconds=10)
     assert caught.value.category == "sandbox_unavailable"
     message = str(caught.value)
     assert sys.prefix not in message and str(tmp_path) not in message
@@ -439,7 +445,7 @@ def test_worker_reports_unavailable_sandbox_as_a_classified_failure(tmp_path: Pa
 
     client = _NoLandlock(Settings(state_dir=tmp_path / "state"))
     with pytest.raises(DataPlaneError) as caught:
-        client.call("profile", {"limits": client.limits(10)}, deadline_seconds=10)
+        client.call(profile_request(client, 10), deadline_seconds=10)
     assert caught.value.category == "sandbox_unavailable"
 
 
@@ -449,6 +455,7 @@ _PARENT = """
 import json, subprocess, sys
 from pathlib import Path
 from agentic_analytics.dataplane import client as client_module
+from agentic_analytics.dataplane.requests import QueryRequest
 from agentic_analytics.settings import Settings
 
 state, pid_file, pdeathsig = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] == "1"
@@ -464,17 +471,18 @@ client = client_module.DataPlaneClient(Settings(state_dir=state))
 client.parent_death_signal = pdeathsig
 spill = state / "archive" / "spill.parquet"
 spill.parent.mkdir(parents=True)
-payload = {
-    "limits": client.limits(600),
-    "sources": [],
-    "spill_path": str(spill),
-    "result_table": "r",
-    "limit": 1,
-    "spill_cap": 1,
+request = QueryRequest(
+    limits=client.limits(600),
+    sources=(),
+    spill_path=str(spill),
+    spill_byte_ceiling=1,
+    result_table="r",
+    limit=1,
+    spill_cap=1,
     # Long enough to outlive the test by minutes if nothing ends the worker.
-    "sql": "SELECT count(*) FROM range(100000000000000) t(x) WHERE x % 7 = 3",
-}
-client.call("query", payload, deadline_seconds=600)
+    sql="SELECT count(*) FROM range(100000000000000) t(x) WHERE x % 7 = 3",
+)
+client.call(request, deadline_seconds=600)
 """
 
 
@@ -544,13 +552,20 @@ def test_policy_grants_only_the_operation_paths(tmp_path: Path) -> None:
 
     client = DataPlaneClient(Settings(state_dir=tmp_path / "state"))
     spill = tmp_path / "archive" / "s" / "e" / "query-result.parquet"
-    policy = client.sandbox_policy(
-        {
-            "sources": [{"path": "/data/a.csv"}, {"path": "/data/b.parquet"}],
-            "spill_path": str(spill),
-        },
-        tmp_path / "scratch",
+    request = QueryRequest(
+        sources=(
+            SourceView(view="a", kind="csv", path="/data/a.csv"),
+            SourceView(view="b", kind="parquet", path="/data/b.parquet"),
+        ),
+        sql="SELECT 1",
+        result_table="r",
+        limit=1,
+        spill_cap=1,
+        spill_path=str(spill),
+        spill_byte_ceiling=1,
+        limits=client.limits(10),
     )
+    policy = client.sandbox_policy(request, tmp_path / "scratch")
     assert policy.read_files == ("/data/a.csv", "/data/b.parquet")
     assert policy.write_dirs == (str(tmp_path / "scratch"), str(spill.parent))
     assert json.loads(json.dumps(policy.to_json())) == policy.to_json()
@@ -566,9 +581,8 @@ def test_symlink_swapped_in_for_an_authorized_source_fails_closed(tmp_path: Path
     swapped = tmp_path / "data.csv"
     swapped.symlink_to(secret)
     client = DataPlaneClient(Settings(state_dir=tmp_path / "state"))
-    payload = {"limits": client.limits(10), "path": str(swapped), "kind": "csv"}
     with pytest.raises(DataPlaneError) as caught:
-        client.call("profile", payload, deadline_seconds=10)
+        client.call(profile_request(client, 10, str(swapped)), deadline_seconds=10)
     assert caught.value.category == "sandbox_unavailable"
     assert "hunter2" not in str(caught.value)
 
@@ -582,17 +596,11 @@ def test_source_under_a_symlinked_parent_directory_fails_closed(tmp_path: Path) 
     (real / "data.csv").write_text("value\n1\n", encoding="utf-8")
     (tmp_path / "link").symlink_to(real, target_is_directory=True)
     client = DataPlaneClient(Settings(state_dir=tmp_path / "state"))
-    direct = {
-        "limits": client.limits(10),
-        "path": str(real / "data.csv"),
-        "kind": "csv",
-        "sample_limit": 5,
-        "max_profile_columns": 10,
-    }
-    assert client.call("profile", direct, deadline_seconds=10)["profile"]
-    through_link = {**direct, "path": str(tmp_path / "link" / "data.csv")}
+    direct = profile_request(client, 10, str(real / "data.csv"))
+    assert client.call(direct, deadline_seconds=10)["profile"]
+    through_link = profile_request(client, 10, str(tmp_path / "link" / "data.csv"))
     with pytest.raises(DataPlaneError) as caught:
-        client.call("profile", through_link, deadline_seconds=10)
+        client.call(through_link, deadline_seconds=10)
     assert caught.value.category == "sandbox_unavailable"
 
 

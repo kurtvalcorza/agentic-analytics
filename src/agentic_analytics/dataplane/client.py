@@ -28,12 +28,14 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import IO, Any
 
 from agentic_analytics.layout import archive_dir, dataplane_scratch_dir
 from agentic_analytics.settings import Settings
 
+from .requests import EngineLimits, WorkerRequest
 from .sandbox import SandboxPolicy
 
 _log = logging.getLogger(__name__)
@@ -135,17 +137,17 @@ class DataPlaneClient:
         self.work_root = dataplane_scratch_dir(settings.state_dir.resolve(strict=False))
         self._swept = False
 
-    def limits(self, timeout_seconds: float) -> dict[str, Any]:
+    def limits(self, timeout_seconds: float) -> EngineLimits:
         """Engine limits shared by every operation."""
 
-        return {
-            "timeout_seconds": timeout_seconds,
-            "memory_limit": self.settings.query_memory_limit,
-            "preview_bytes": self.settings.max_result_preview_bytes,
-            "cell_chars": self.settings.max_result_cell_chars,
-            "threads": self.settings.data_plane_threads,
-            "max_temp_bytes": self.settings.data_plane_max_temp_bytes,
-        }
+        return EngineLimits(
+            timeout_seconds=timeout_seconds,
+            memory_limit=self.settings.query_memory_limit,
+            preview_bytes=self.settings.max_result_preview_bytes,
+            cell_chars=self.settings.max_result_cell_chars,
+            threads=self.settings.data_plane_threads,
+            max_temp_bytes=self.settings.data_plane_max_temp_bytes,
+        )
 
     def _os_limits(self, deadline_seconds: float) -> dict[str, Any]:
         threads = self.settings.data_plane_threads
@@ -157,23 +159,18 @@ class DataPlaneClient:
             "max_open_files": 256,
         }
 
-    def sandbox_policy(self, payload: dict[str, Any], workdir: Path) -> SandboxPolicy:
+    def sandbox_policy(self, request: WorkerRequest, workdir: Path) -> SandboxPolicy:
         """Least-privilege filesystem policy for one operation.
 
-        Read: the operation's authorized source files only. Write: the private scratch
-        directory, and for queries the per-execution archive directory that receives the spill.
+        Built only from the request's declared paths (C10). Read: its authorized source files.
+        Write: the private scratch directory plus the request's own output directories (for a
+        query, the per-execution archive directory that receives the spill).
         """
 
-        read_files = [str(item["path"]) for item in payload.get("sources", ())]
-        if "path" in payload:
-            read_files.append(str(payload["path"]))
-        write_dirs = [str(workdir)]
-        if payload.get("spill_path"):
-            write_dirs.append(str(Path(payload["spill_path"]).parent))
         return SandboxPolicy(
             mode=self.settings.data_plane_sandbox,
-            read_files=tuple(read_files),
-            write_dirs=tuple(write_dirs),
+            read_files=request.read_paths(),
+            write_dirs=(str(workdir), *request.write_dirs()),
             protected_roots=self.protected_roots(),
         )
 
@@ -324,8 +321,10 @@ class DataPlaneClient:
                     if entry.is_dir() and entry.stat().st_mtime < cutoff:
                         shutil.rmtree(entry, ignore_errors=True)
 
-    def call(self, op: str, payload: dict[str, Any], *, deadline_seconds: float) -> dict[str, Any]:
+    def call(self, request: WorkerRequest, *, deadline_seconds: float) -> dict[str, Any]:
         """Run one operation in a fresh worker and return its result or raise DataPlaneError."""
+
+        op = request.op
 
         self.work_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not self._swept:
@@ -333,21 +332,22 @@ class DataPlaneClient:
             self._swept = True
         workdir = Path(tempfile.mkdtemp(prefix=f"{op}-", dir=self.work_root))
         # Collected before the scratch temp_directory is added: it sits under workdir, a root.
-        request_files = _absolute_strings(payload)
+        request_files = _absolute_strings(request.to_json())
         try:
-            payload = dict(payload)
-            payload["limits"] = {**payload["limits"], "temp_directory": str(workdir / "duckdb")}
-            request = json.dumps(
+            request = request.with_limits(
+                replace(request.limits, temp_directory=str(workdir / "duckdb"))
+            )
+            envelope = json.dumps(
                 {
                     "op": op,
-                    "payload": payload,
+                    "payload": request.to_json(),
                     "os_limits": self._os_limits(deadline_seconds),
-                    "sandbox": self.sandbox_policy(payload, workdir).to_json(),
+                    "sandbox": self.sandbox_policy(request, workdir).to_json(),
                     "parent": {"pid": os.getpid(), "pdeathsig": self.parent_death_signal},
                 }
             ).encode("utf-8")
             returncode, out, out_overflow, timed_out = self._run_worker(
-                workdir, request, deadline_seconds
+                workdir, envelope, deadline_seconds
             )
             if timed_out:
                 raise DataPlaneError(

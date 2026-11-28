@@ -10,15 +10,17 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
 from .preview import cell_bound_expr, json_value, sql_identifier
+from .requests import EngineLimits, ProfileRequest, QueryRequest, TableStatsRequest
+
+__all__ = ["OPERATIONS", "EngineLimits"]
 
 # The preview is streamed one row at a time so no more than a single (already cell-capped) row
 # is ever materialized in Python before the byte budget is re-checked.
@@ -45,31 +47,6 @@ class OutputWriteError(RuntimeError):
     Raised in place of DuckDB's IOException for the write phase so an output/resource failure
     is never reported as an unreadable source.
     """
-
-
-@dataclass(frozen=True, slots=True)
-class EngineLimits:
-    timeout_seconds: float
-    memory_limit: str
-    preview_bytes: int
-    cell_chars: int
-    threads: int | None = None
-    temp_directory: str | None = None
-    max_temp_bytes: int | None = None
-
-    @classmethod
-    def from_json(cls, value: dict[str, Any]) -> EngineLimits:
-        return cls(
-            timeout_seconds=float(value["timeout_seconds"]),
-            memory_limit=str(value["memory_limit"]),
-            preview_bytes=int(value["preview_bytes"]),
-            cell_chars=int(value["cell_chars"]),
-            threads=None if value.get("threads") is None else int(value["threads"]),
-            temp_directory=value.get("temp_directory"),
-            max_temp_bytes=(
-                None if value.get("max_temp_bytes") is None else int(value["max_temp_bytes"])
-            ),
-        )
 
 
 def sql_string(value: str) -> str:
@@ -315,24 +292,21 @@ def write_spill_bounded(
         )
 
 
-def run_query(request: dict[str, Any]) -> dict[str, Any]:
+def run_query(request: QueryRequest) -> dict[str, Any]:
     """Materialize, preview, and optionally spill one already-validated, rewritten query."""
 
-    limits = EngineLimits.from_json(request["limits"])
-    sources: list[dict[str, str]] = request["sources"]
-    spill_path = Path(request["spill_path"])
-    result_table = request["result_table"]
-    limit = int(request["limit"])
-    spill_cap = int(request["spill_cap"])
+    limits = request.limits
+    spill_path = Path(request.spill_path)
+    result_table = request.result_table
+    limit = request.limit
+    spill_cap = request.spill_cap
     connection = open_connection(limits)
     try:
-        secure_connection(
-            connection, [item["path"] for item in sources] + [str(spill_path)], limits
-        )
-        for item in sources:
+        secure_connection(connection, [*request.read_paths(), str(spill_path)], limits)
+        for source in request.sources:
             connection.execute(
-                f'CREATE TEMP VIEW "{item["view"]}" AS SELECT * FROM '
-                f"{reader_sql(item['kind'], item['path'])}"
+                f'CREATE TEMP VIEW "{source.view}" AS SELECT * FROM '
+                f"{reader_sql(source.kind, source.path)}"
             )
         # Materialize the full result ONCE, bounded by a row cap and the interrupt timer, so the
         # preview and the spilled artifact are the same evaluation (deterministic even for
@@ -340,7 +314,7 @@ def run_query(request: dict[str, Any]) -> dict[str, Any]:
         with deadline(connection, limits.timeout_seconds):
             connection.execute(
                 f'CREATE TEMP TABLE "{result_table}" AS '
-                f"SELECT * FROM ({request['sql']}) AS _q LIMIT {spill_cap + 1}"
+                f"SELECT * FROM ({request.sql}) AS _q LIMIT {spill_cap + 1}"
             )
             materialized = scalar_int(connection, f'SELECT count(*) FROM "{result_table}"')
         projection, cell_cap, column_truncated = preview_projection(
@@ -356,7 +330,7 @@ def run_query(request: dict[str, Any]) -> dict[str, Any]:
         truncated = materialized > limit or preview_truncated or column_truncated
         spill_capped = materialized > spill_cap
         spilled = False
-        if truncated and not (spill_capped and request.get("require_complete")):
+        if truncated and not (spill_capped and request.require_complete):
             # The table holds spill_cap + 1 rows only to detect overflow; the artifact carries
             # exactly the advertised row budget.
             write_spill_bounded(
@@ -364,7 +338,7 @@ def run_query(request: dict[str, Any]) -> dict[str, Any]:
                 f'COPY (SELECT * FROM "{result_table}" LIMIT {spill_cap}) '
                 f"TO {sql_string(str(spill_path))} (FORMAT PARQUET, COMPRESSION ZSTD)",
                 spill_path,
-                int(request["spill_byte_ceiling"]),
+                request.spill_byte_ceiling,
                 limits,
             )
             spilled = True
@@ -446,14 +420,14 @@ def _sample(
     return sample, truncated
 
 
-def profile_source(request: dict[str, Any]) -> dict[str, Any]:
+def profile_source(request: ProfileRequest) -> dict[str, Any]:
     """Schema, row/null/duplicate counts, and a bounded sample, in as few scans as possible."""
 
-    limits = EngineLimits.from_json(request["limits"])
-    path = request["path"]
-    relation = reader_sql(request["kind"], path)
-    sample_limit = int(request["sample_limit"])
-    max_profile_columns = int(request["max_profile_columns"])
+    limits = request.limits
+    path = request.path
+    relation = reader_sql(request.kind, path)
+    sample_limit = request.sample_limit
+    max_profile_columns = request.max_profile_columns
     connection = open_connection(limits)
     try:
         secure_connection(connection, [path], limits)
@@ -511,12 +485,12 @@ def profile_source(request: dict[str, Any]) -> dict[str, Any]:
 # --- validation statistics ----------------------------------------------------------------
 
 
-def table_stats(request: dict[str, Any]) -> dict[str, Any]:
+def table_stats(request: TableStatsRequest) -> dict[str, Any]:
     """Counts used by the duplicate and missingness validators, in bounded scans."""
 
-    limits = EngineLimits.from_json(request["limits"])
-    path = request["path"]
-    relation = reader_sql(request["kind"], path)
+    limits = request.limits
+    path = request.path
+    relation = reader_sql(request.kind, path)
     connection = open_connection(limits)
     try:
         secure_connection(connection, [path], limits)
@@ -525,7 +499,7 @@ def table_stats(request: dict[str, Any]) -> dict[str, Any]:
             cursor = connection.execute(f"SELECT * FROM {relation} LIMIT 0")
             columns = [str(item[0]) for item in cursor.description or []]
             result["columns"] = columns
-            if request.get("null_counts"):
+            if request.null_counts:
                 parts = ["count(*)"] + [
                     f"count(*) FILTER (WHERE {sql_identifier(column)} IS NULL)"
                     for column in columns
@@ -536,11 +510,11 @@ def table_stats(request: dict[str, Any]) -> dict[str, Any]:
                 result["null_counts"] = dict(zip(columns, values[1:], strict=True))
             else:
                 result["total"] = scalar_int(connection, f"SELECT count(*) FROM {relation}")
-            if request.get("distinct"):
+            if request.distinct:
                 result["distinct"] = scalar_int(
                     connection, f"SELECT count(*) FROM (SELECT DISTINCT * FROM {relation})"
                 )
-            keys = [str(key) for key in request.get("duplicate_keys") or []]
+            keys = list(request.duplicate_keys)
             unknown = [key for key in keys if key not in columns]
             if unknown:
                 # Report by name rather than letting DuckDB's binder error (which quotes the
@@ -560,8 +534,9 @@ def table_stats(request: dict[str, Any]) -> dict[str, Any]:
         connection.close()
 
 
-OPERATIONS = {
-    "query": run_query,
-    "profile": profile_source,
-    "table_stats": table_stats,
+# Keyed by the request types' ``op``; the worker decodes each request before dispatch.
+OPERATIONS: dict[str, Callable[[Any], dict[str, Any]]] = {
+    QueryRequest.op: run_query,
+    ProfileRequest.op: profile_source,
+    TableStatsRequest.op: table_stats,
 }

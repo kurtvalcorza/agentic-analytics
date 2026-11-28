@@ -153,14 +153,16 @@ def test_inspector_caps_cells_before_fetching_from_duckdb(tmp_path: Path, monkey
     from agentic_analytics.dataplane import engine
 
     timeout = service.settings.data_plane_timeout_seconds
+    from agentic_analytics.dataplane.requests import ProfileRequest
+
     profile = engine.profile_source(
-        {
-            "path": str(workspace / "large.parquet"),
-            "kind": "parquet",
-            "sample_limit": 20,
-            "max_profile_columns": service.settings.max_profile_columns,
-            "limits": service.data_plane.limits(timeout),
-        }
+        ProfileRequest(
+            path=str(workspace / "large.parquet"),
+            kind="parquet",
+            sample_limit=20,
+            max_profile_columns=service.settings.max_profile_columns,
+            limits=service.data_plane.limits(timeout),
+        )
     )["profile"]
     assert fetched and all(len(cell) == 65 for cell in fetched[0])
     assert all(len(cell) == 64 for cell in profile["sample"][0].values())

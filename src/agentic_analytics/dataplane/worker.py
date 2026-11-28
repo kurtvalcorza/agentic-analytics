@@ -27,6 +27,7 @@ import signal
 import sys
 from typing import Any
 
+from . import requests as wire
 from . import sandbox
 
 _MAX_REQUEST_BYTES = 16 * 1024 * 1024
@@ -114,6 +115,7 @@ _FIXED_MESSAGES = {
         "temporary spill, data_plane_max_file_bytes per file, or a full disk); the operation "
         "needed more temporary or output space than allowed"
     ),
+    "invalid_request": "data-plane worker rejected a malformed request",
     "sandbox_unavailable": (
         "data-plane worker could not confine itself (it needs Linux Landlock and seccomp, a "
         "supported CPU architecture, authorized sources that are still regular files, and no "
@@ -162,10 +164,25 @@ def main() -> int:
     if not death_signal_armed:
         sandbox.start_parent_watchdog(parent_pid)
     try:
+        # Validated before dispatch (C10): a malformed request never reaches DuckDB.
+        decoded = wire.decode_request(request.get("op"), request.get("payload"))
+    except wire.RequestError as exc:
+        sys.stderr.write(f"invalid_request: {exc}\n"[:_MAX_MESSAGE_CHARS])
+        sys.stderr.flush()
+        _respond(
+            {
+                "error": {
+                    "category": "invalid_request",
+                    "type": type(exc).__name__,
+                    "message": _FIXED_MESSAGES["invalid_request"],
+                }
+            }
+        )
+        return 2
+    try:
         from .engine import OPERATIONS
 
-        operation = OPERATIONS[request["op"]]
-        result = operation(request["payload"])
+        result = OPERATIONS[decoded.op](decoded)
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise

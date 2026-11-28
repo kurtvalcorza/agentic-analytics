@@ -308,7 +308,7 @@ def test_query_bounds_nested_cells_before_fetch(tmp_path: Path, expression: str)
         connection.execute(f"CREATE TABLE nested_result AS SELECT {expression} AS nested")
         from agentic_analytics.dataplane import engine
 
-        limits = engine.EngineLimits.from_json(query.data_plane.limits(30))
+        limits = query.data_plane.limits(30)
         projection, cap, _ = engine.preview_projection(connection, "nested_result", limits)
         raw = connection.execute(f"SELECT {projection} FROM nested_result").fetchone()
         assert raw is not None and isinstance(raw[0], str)
