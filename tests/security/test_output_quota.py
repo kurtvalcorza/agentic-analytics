@@ -27,7 +27,15 @@ from agentic_analytics.models import AnalysisSession, ExecutionStatus, SessionMo
 from agentic_analytics.runtime import Runtime
 from agentic_analytics.settings import Settings
 
-docker = pytest.mark.skipif(os.name != "posix", reason="Docker integration runs on Linux CI")
+_posix = pytest.mark.skipif(os.name != "posix", reason="Docker integration runs on Linux CI")
+
+
+def docker(test: Any) -> Any:
+    """Mark a test that runs the real Docker backend (skipped without the image)."""
+
+    return pytest.mark.docker(_posix(test))
+
+
 QUOTA = 1024 * 1024
 
 

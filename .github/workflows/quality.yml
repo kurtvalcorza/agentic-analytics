@@ -52,6 +52,8 @@ jobs:
         env:
           # Fail instead of skipping every test if this runner has no Landlock.
           AGENTIC_ANALYTICS_TEST_REQUIRE_SANDBOX: "1"
+          # Fail instead of skipping the Docker tests if the image built above is missing.
+          AGENTIC_ANALYTICS_TEST_REQUIRE_DOCKER: "1"
         run: >-
           uv run --frozen pytest --cov=agentic_analytics --cov-report=term-missing
           --cov-fail-under=85

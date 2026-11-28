@@ -126,6 +126,8 @@ uv run mypy src
 uv run pytest --cov=agentic_analytics --cov-fail-under=85
 ```
 
+The full suite needs Linux (or WSL2) with Landlock, Docker, and the `agentic-analytics-exec:test` image. [Running the tests](docs/testing.md) covers the setup and what is skipped when part of it is missing.
+
 Without uv, `python -m pip install -e '.[dev]'` installs from the version ranges in `pyproject.toml` instead of the lockfile.
 
 Run the MCP server over stdio:

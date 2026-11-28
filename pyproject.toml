@@ -38,6 +38,9 @@ packages = ["src/agentic_analytics"]
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
+markers = [
+  "docker: needs a running Docker daemon and the agentic-analytics-exec:test image",
+]
 
 [tool.ruff]
 target-version = "py312"
