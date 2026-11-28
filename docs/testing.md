@@ -2,7 +2,9 @@
 
 The suite tests two OS-level boundaries: the confined DuckDB data-plane worker (Landlock,
 seccomp, rlimits) and the Docker execution backend. Both need Linux, so run the full suite
-on Linux or in WSL2. CI runs the same steps (`.github/workflows/quality.yml`).
+on Linux or in WSL2. CI runs the same steps (`.github/workflows/quality.yml`) on Python 3.12
+and 3.15, the oldest and newest supported versions; the required `quality` check passes only
+when both do.
 
 ## What you need
 
@@ -32,11 +34,11 @@ clone in the Linux filesystem (for example `~/src`); a checkout under `/mnt/c` i
 ## Steps
 
 ```bash
-uv sync --frozen --extra dev --python 3.12
+uv sync --frozen --extra dev --python 3.12   # or 3.15
 docker build -t agentic-analytics-exec:test -f docker/Dockerfile.exec .
 uv run --frozen ruff check .
 uv run --frozen ruff format --check .
-uv run --frozen mypy src
+uv run --frozen mypy --python-version 3.12 src   # match the version you synced
 uv run --frozen pytest --cov=agentic_analytics --cov-report=term-missing --cov-fail-under=85
 ```
 
