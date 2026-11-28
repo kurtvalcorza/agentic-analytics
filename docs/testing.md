@@ -42,7 +42,8 @@ uv run --frozen pytest --cov=agentic_analytics --cov-report=term-missing --cov-f
 The full run takes about 2–3 minutes. The first Docker test in a run is the slowest, because
 it starts a cold container that imports pandas and matplotlib.
 
-Rebuild the image whenever `docker/Dockerfile.exec` changes. The supervisor that runs inside
+Rebuild the image whenever `docker/Dockerfile.exec` or `uv.lock` changes; the image installs
+the `exec` dependency group from the lockfile. The supervisor that runs inside
 the container (`execution_backends/supervisor.py`) is mounted from your checkout on every run,
 so changing it needs no rebuild.
 

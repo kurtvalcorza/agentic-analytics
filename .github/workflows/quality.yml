@@ -69,13 +69,13 @@ jobs:
           version: "0.11.32"
       - name: Verify lockfile matches pyproject
         run: uv lock --check
-      - name: Dependency vulnerability scan (locked runtime + dev dependencies)
+      - name: Dependency vulnerability scan (locked runtime, dev and exec-image dependencies)
         run: |
-          uv export --frozen --extra dev --no-emit-project --no-hashes \
+          uv export --frozen --extra dev --group exec --no-emit-project --no-hashes \
             --format requirements-txt -o requirements.lock.txt
           uvx pip-audit==2.10.1 -r requirements.lock.txt --disable-pip --no-deps --strict
       - name: Generate SBOM
-        run: uv export --frozen --format cyclonedx1.5 -o sbom.cdx.json
+        run: uv export --frozen --all-groups --format cyclonedx1.5 -o sbom.cdx.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom

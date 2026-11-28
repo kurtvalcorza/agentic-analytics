@@ -116,7 +116,7 @@ The remaining hardening work is tracked in the security-hardening RFC (issue #10
 
 Requires Python 3.12+.
 
-CI installs exactly the reviewed `uv.lock` (`uv sync --frozen`), pins GitHub Actions and the sandbox base image by digest, and runs a dependency vulnerability scan plus SBOM generation. It enforces `ruff format` and a test coverage floor of 85%. Dependabot updates only `uv.lock` (grouped weekly); raising a version range in `pyproject.toml` is a deliberate change. To reproduce locally:
+CI installs exactly the reviewed `uv.lock` (`uv sync --frozen`), pins GitHub Actions and the sandbox base image by digest, and runs a dependency vulnerability scan plus SBOM generation. The sandbox image installs its Python packages from the same `uv.lock` (the `exec` dependency group), with hashes, so the server and the sandbox run the same versions and the scan covers both. It enforces `ruff format` and a test coverage floor of 85%. Dependabot updates only `uv.lock` (grouped weekly); raising a version range in `pyproject.toml` is a deliberate change. To reproduce locally:
 
 ```bash
 uv sync --frozen --extra dev
