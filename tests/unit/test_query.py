@@ -92,6 +92,19 @@ def test_query_persists_failed_execution_record(tmp_path: Path) -> None:
     assert failed.error is not None
 
 
+def test_failed_query_is_audited_under_its_own_execution_id(tmp_path: Path) -> None:
+    # C8: the failure record carries the id the query reserved (and named its archive
+    # directory after) and the time it started, not a fresh id and the failure time.
+    session, source, query, executions, _, _ = _services(tmp_path, max_query_rows=100)
+    with pytest.raises(QueryExecutionError):
+        query.execute(session, f"SELECT missing_column FROM source('{source.id}')")
+
+    [failed] = executions.list(session.id)
+    assert query.artifacts.archive_base(session.id, failed.id).is_dir()
+    assert failed.completed_at is not None and failed.started_at < failed.completed_at
+    assert failed.error is not None and failed.error["category"] == "sql"
+
+
 def test_query_spills_oversized_low_row_result(tmp_path: Path) -> None:
     session, source, query, _, _, artifacts = _services(tmp_path, max_query_rows=100)
     # A single very large cell must still spill and be trimmed in the preview, even though the
