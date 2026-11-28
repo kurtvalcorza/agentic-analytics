@@ -11,8 +11,15 @@ permissions:
 # Third-party actions are pinned to full commit SHAs (tag in the trailing comment) so a moved
 # tag cannot change what runs in CI. Dependabot proposes reviewed SHA bumps.
 jobs:
-  quality:
+  tests:
+    # Every supported Python: the oldest (requires-python) and the newest. The execution image
+    # pins its own Python in docker/Dockerfile.exec; this matrix covers the server side.
+    name: tests (${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.15"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -23,16 +30,19 @@ jobs:
           enable-cache: true
       - name: Install (frozen lockfile)
         # --frozen fails instead of re-resolving, so CI tests exactly the reviewed uv.lock.
-        run: uv sync --frozen --extra dev --python 3.12
+        run: uv sync --frozen --extra dev --python ${{ matrix.python }}
       - name: Ruff
         run: uv run --frozen ruff check .
       - name: Ruff format
         run: uv run --frozen ruff format --check .
       - name: Mypy
-        run: uv run --frozen mypy src
+        # Check against the interpreter under test, not only the configured floor.
+        run: uv run --frozen mypy --python-version ${{ matrix.python }} src
       - name: Build execution image
         run: docker build -t agentic-analytics-exec:test -f docker/Dockerfile.exec .
       - name: Scan execution image (OS packages and installed Python libraries)
+        # The image is identical on every matrix leg, so it is scanned once.
+        if: matrix.python == '3.12'
         # Severity policy: report HIGH and CRITICAL; fail the build on any CRITICAL finding
         # that has a fixed version available. Trivy runs from an image pinned by digest.
         env:
@@ -57,6 +67,18 @@ jobs:
         run: >-
           uv run --frozen pytest --cov=agentic_analytics --cov-report=term-missing
           --cov-fail-under=85
+
+  quality:
+    # The required status check for main. It passes only when every matrix leg of `tests`
+    # passed, so adding or removing a Python version does not change the ruleset.
+    if: always()
+    needs: [tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every Python version passed
+        env:
+          RESULT: ${{ needs.tests.result }}
+        run: test "$RESULT" = success
 
   supply-chain:
     runs-on: ubuntu-latest

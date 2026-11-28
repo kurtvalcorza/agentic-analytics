@@ -209,6 +209,10 @@ class _RulesetAttr(ctypes.Structure):
 
 
 class _PathBeneathAttr(ctypes.Structure):
+    # The kernel's struct landlock_path_beneath_attr is packed: 12 bytes, parent_fd at offset 8.
+    # With _pack_, Python 3.14+ wants the layout named explicitly ("gcc-sysv" refuses _pack_);
+    # "ms" keeps the packed layout and is ignored by older Pythons.
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = (("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32))
 

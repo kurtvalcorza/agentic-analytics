@@ -720,3 +720,23 @@ def test_seccomp_program_decisions_for_each_supported_architecture(machine: str)
     assert decide("clone3") == 0x00050000 | errno.ENOSYS
     assert _run_filter(program, arch, 9999) == allow  # the default
     assert _run_filter(program, 0x40000003, numbers["fcntl"]) == 0x80000000  # i386: killed
+
+
+def test_landlock_path_beneath_attr_matches_the_kernel_packed_layout() -> None:
+    import ctypes
+    import warnings
+
+    from agentic_analytics.dataplane import sandbox as dataplane_sandbox
+
+    attr = dataplane_sandbox._PathBeneathAttr
+    assert ctypes.sizeof(attr) == 12
+    assert attr.allowed_access.offset == 0
+    assert attr.parent_fd.offset == 8
+    # Redefining the struct must not warn: an implicit packed layout is deprecated in 3.14+.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        type(
+            "_Copy",
+            (ctypes.Structure,),
+            {"_layout_": attr._layout_, "_pack_": attr._pack_, "_fields_": attr._fields_},
+        )
