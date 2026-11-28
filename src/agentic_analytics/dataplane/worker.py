@@ -15,9 +15,6 @@ Limits applied on POSIX before any data is read:
 * ``RLIMIT_NOFILE``: open file descriptors.
 * ``RLIMIT_CORE``: no core dumps of potentially sensitive data.
 
-On hosts without the ``resource`` module (Windows) the worker still provides crash, hang, and
-memory-fault containment through process separation, but not OS resource limits.
-
 After the limits, and still before DuckDB is imported, the worker binds its lifetime to the
 server and confines itself (Landlock on Linux); see :mod:`agentic_analytics.dataplane.sandbox`.
 """

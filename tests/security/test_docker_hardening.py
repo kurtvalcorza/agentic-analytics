@@ -7,7 +7,6 @@ import pytest
 
 from agentic_analytics.execution_backends import docker as docker_module
 from agentic_analytics.execution_backends.docker import (
-    DEFAULT_CONTAINER_USER,
     DockerBackend,
     DockerExecutionError,
 )
@@ -45,15 +44,6 @@ def test_explicit_uid_zero_and_malformed_users_are_refused() -> None:
         DockerBackend("img", user="0:0")._user_args()
     with pytest.raises(ValueError):
         DockerBackend("img", user="root")
-
-
-def test_non_posix_hosts_use_fixed_unprivileged_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(docker_module.os, "name", "nt")
-
-    assert DockerBackend("img")._user_args() == ["--user", DEFAULT_CONTAINER_USER]
-    assert not DEFAULT_CONTAINER_USER.startswith("0:")
 
 
 def test_settings_reject_malformed_docker_user(tmp_path: Path) -> None:

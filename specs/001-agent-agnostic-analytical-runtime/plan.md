@@ -12,7 +12,7 @@ Build a local-first MCP analytical runtime whose durable interfaces are host-neu
 **Primary Dependencies**: MCP Python SDK, Pydantic v2, DuckDB, PyArrow, pandas or Polars for interoperability, Docker CLI/SDK abstraction, Typer for local admin/conformance CLI, pytest  
 **Storage**: Append-oriented JSON/JSONL session records plus content-addressed artifact metadata for v1; repository interfaces allow later SQLite migration  
 **Testing**: pytest, JSON Schema validation, protocol-level MCP tests, sandbox/security scenario tests  
-**Target Platform**: macOS/Linux/Windows developer workstations with Docker-compatible execution for strict mode  
+**Target Platform**: Linux and macOS developer workstations (Windows through WSL2; native Windows is unsupported since C14, 2026-11-28) with Docker-compatible execution for strict mode  
 **Project Type**: Python package + MCP server + optional host adapters  
 **Performance Goals**: bounded tool responses; interactive metadata operations for ordinary datasets; query 1 GB Parquet without model-context serialization  
 **Constraints**: agent agnostic; server-side sandbox controls; source data local by default; no private chain-of-thought dependency  

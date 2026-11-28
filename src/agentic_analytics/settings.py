@@ -168,6 +168,6 @@ class Settings(BaseSettings):
         # Server state (records, archived artifacts, request scripts) may contain sensitive
         # analytical data, so it is private to the server's user regardless of umask.
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if os.name == "posix" and self.state_dir.stat().st_uid == os.getuid():
+        if self.state_dir.stat().st_uid == os.getuid():
             self.state_dir.chmod(0o700)
         self.workspace_base_dir.mkdir(parents=True, exist_ok=True)

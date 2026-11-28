@@ -149,10 +149,10 @@ def read_capped(stream: IO[bytes], sink: IO[bytes], cap: int) -> bool:
 def member_parts(name: str) -> tuple[str, ...]:
     """Validate one archive member name under POSIX *and* Windows rules; return its parts.
 
-    The archive comes from untrusted code and the host may be Windows, so a name is accepted
-    only if it is a plain relative path on both: no backslashes, colons or drive letters, UNC
-    or device prefixes, reserved device names, trailing dots or spaces, control characters,
-    ``..`` components, or absolute forms.
+    The archive comes from untrusted code and the outputs may later be copied to any host, so
+    a name is accepted only if it is a plain relative path on both: no backslashes, colons or
+    drive letters, UNC or device prefixes, reserved device names, trailing dots or spaces,
+    control characters, ``..`` components, or absolute forms.
     """
 
     if not name or "\x00" in name:
@@ -257,8 +257,7 @@ def _check_destination(
         except FileNotFoundError:
             return
         last = index == len(parts) - 1
-        reparse: int = getattr(info, "st_reparse_tag", 0)  # Windows junctions
-        if stat.S_ISLNK(info.st_mode) or reparse:
+        if stat.S_ISLNK(info.st_mode):
             raise OutputArchiveError(f"refusing to write through a link: {current}")
         if not last or is_dir:
             if not stat.S_ISDIR(info.st_mode):
@@ -314,46 +313,24 @@ def _move_in(
 
     target = destination.joinpath(*parts)
     backup = backups / str(len(replaced))
-    if os.name == "posix":
-        parent = _open_parent_posix(destination, parts, created)
+    parent = _open_parent_posix(destination, parts, created)
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
         try:
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
-            try:
-                fd = os.open(parts[-1], flags, dir_fd=parent)
-            except FileNotFoundError:
-                existed = False
-            else:
-                existed = True
-                with os.fdopen(fd, "rb") as handle:
-                    # Checked on the open descriptor, so a swap after validation changes nothing.
-                    info = os.fstat(handle.fileno())
-                    _refuse_unsafe_file(info, protected_ids, target)
-                    _keep_earlier(handle, info, backup)
-                replaced.append((target, backup))
-            os.replace(staged, parts[-1], dst_dir_fd=parent)
-        finally:
-            os.close(parent)
-    else:  # pragma: no cover - exercised on Windows hosts only
-        for depth in range(1, len(parts)):
-            directory = destination.joinpath(*parts[:depth])
-            if not directory.exists():
-                directory.mkdir()
-                created.append(directory)
-        if not _contained(destination, target):
-            raise OutputArchiveError(f"output path escapes outputs/: {'/'.join(parts)}")
-        try:
-            info = target.lstat()
+            fd = os.open(parts[-1], flags, dir_fd=parent)
         except FileNotFoundError:
             existed = False
         else:
             existed = True
-            if getattr(info, "st_reparse_tag", 0):
-                raise OutputArchiveError(f"refusing to write through a link: {target}")
-            _refuse_unsafe_file(info, protected_ids, target)
-            with open(target, "rb") as handle:
+            with os.fdopen(fd, "rb") as handle:
+                # Checked on the open descriptor, so a swap after validation changes nothing.
+                info = os.fstat(handle.fileno())
+                _refuse_unsafe_file(info, protected_ids, target)
                 _keep_earlier(handle, info, backup)
             replaced.append((target, backup))
-        os.replace(staged, target)
+        os.replace(staged, parts[-1], dst_dir_fd=parent)
+    finally:
+        os.close(parent)
     if not existed:
         created.append(target)
 
